@@ -7,7 +7,10 @@
 //! transcript here). A turn runs on its own task, so the state machine is
 //! back to Idle as soon as the transcript is ready and dictation keeps
 //! working while agents run. Replies wait in a FIFO and are spoken when the
-//! daemon is Idle.
+//! daemon is Idle and no recording captures (its system track would pick
+//! them up). A reply the session produces on its own, with no whisrs turn
+//! running (a background command finished and the agent went on), is spoken
+//! the same way.
 //!
 //! The runtime is harness-neutral: it calls [`Driver`] and never names a
 //! harness outside [`AgentRuntime::new`].
@@ -17,6 +20,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,8 +31,8 @@ use tracing::{debug, error, info, warn};
 use whisrs::agent::claude::ClaudeDriver;
 use whisrs::agent::store::{self, AgentRecord, AgentStore};
 use whisrs::agent::{
-    resolve_agents, spoken, Agent, AgentAction, AgentInfo, AgentPhase, Driver, Harness, SessionRef,
-    TurnIo, TurnOutcome, TurnRequest, TurnUpdate,
+    resolve_agents, spoken, Agent, AgentAction, AgentInfo, AgentPhase, Driver, Harness, HookEvent,
+    SessionRef, TurnIo, TurnOutcome, TurnRequest, TurnUpdate, TurnUpdates, STILL_WORKING,
 };
 use whisrs::audio::capture::AudioCaptureHandle;
 use whisrs::audio::feedback;
@@ -44,11 +48,6 @@ use crate::pipeline::{
 #[cfg(feature = "recording")]
 use crate::recording::{refuse_while_recording, DictationStart};
 use crate::speak::{speak_text, stop_read_aloud, tts_backend, SpeakAttempt, SpeakOrigin};
-
-/// The refusal for a press while that agent's turn runs. Spoken and
-/// notified where it happens, so the hotkey dispatcher does not notify it a
-/// second time ([`error_already_notified`]).
-const STILL_WORKING: &str = "Still working on the last one.";
 
 /// How long a hook event no turn claimed is kept: a first turn's `Stop` can
 /// arrive before `claude agents` has told us its session id.
@@ -74,8 +73,11 @@ struct RunningTurn {
     /// When it started: only hook events that arrived later can be its own.
     started: Instant,
     task: tokio::task::JoinHandle<()>,
-    /// Hook payloads for the driver.
-    hooks: mpsc::UnboundedSender<serde_json::Value>,
+    /// Hook events for the driver.
+    hooks: mpsc::UnboundedSender<HookEvent>,
+    /// The newest session ids the turn reported, and its stop flag
+    /// ([`TurnUpdates::stop`]).
+    updates: TurnUpdates,
 }
 
 /// What the runtime holds per agent at run time (the persisted part is the
@@ -83,6 +85,9 @@ struct RunningTurn {
 struct Slot {
     phase: AgentPhase,
     turn: Option<RunningTurn>,
+    /// The raw text of the last reply delivered, so a late `Stop` for a turn
+    /// that already ended on a poll is not spoken twice.
+    last_reply: Option<String>,
 }
 
 impl Default for Slot {
@@ -90,6 +95,7 @@ impl Default for Slot {
         Self {
             phase: AgentPhase::Idle,
             turn: None,
+            last_reply: None,
         }
     }
 }
@@ -97,8 +103,8 @@ impl Default for Slot {
 struct Inner {
     store: AgentStore,
     slots: HashMap<String, Slot>,
-    /// Hook events no running turn matched yet, with when they arrived.
-    unclaimed: VecDeque<(Instant, serde_json::Value)>,
+    /// Hook events no running turn matched yet.
+    unclaimed: VecDeque<HookEvent>,
     next_generation: u64,
 }
 
@@ -118,8 +124,14 @@ pub(crate) struct AgentRuntime {
     /// Replies and notices waiting for the daemon to be Idle.
     utterances: std::sync::Mutex<VecDeque<Utterance>>,
     utterance_ready: Notify,
+    /// The utterance being spoken, until its playback ends.
+    playing: std::sync::Mutex<Option<Utterance>>,
     /// TTS is enabled: utterances are queued at all.
     speak: bool,
+    /// Numbers `agents.json` snapshots; the newest written one is kept in
+    /// `saved_seq`, so a write that lost the race to a newer one is skipped.
+    save_seq: AtomicU64,
+    saved_seq: Arc<std::sync::Mutex<u64>>,
 }
 
 impl AgentRuntime {
@@ -186,7 +198,10 @@ impl AgentRuntime {
             }),
             utterances: std::sync::Mutex::new(VecDeque::new()),
             utterance_ready: Notify::new(),
+            playing: std::sync::Mutex::new(None),
             speak: config.tts.as_ref().is_some_and(|t| t.enabled),
+            save_seq: AtomicU64::new(0),
+            saved_seq: Arc::new(std::sync::Mutex::new(0)),
         }
     }
 
@@ -204,7 +219,10 @@ impl AgentRuntime {
             }),
             utterances: std::sync::Mutex::new(VecDeque::new()),
             utterance_ready: Notify::new(),
+            playing: std::sync::Mutex::new(None),
             speak: false,
+            save_seq: AtomicU64::new(0),
+            saved_seq: Arc::new(std::sync::Mutex::new(0)),
         }
     }
 
@@ -235,22 +253,45 @@ impl AgentRuntime {
         )
     }
 
+    /// Write a snapshot of the store off the async runtime (the write
+    /// fsyncs). Snapshots are numbered and a write older than the newest
+    /// one on disk is skipped, so the file always ends at the newest state.
     fn save(&self, inner: &Inner) {
-        if let Err(e) = store::save(&self.store_path, &inner.store) {
-            warn!("agents: cannot write {}: {e:#}", self.store_path.display());
-        }
+        let seq = self.save_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let snapshot = inner.store.clone();
+        let path = self.store_path.clone();
+        let saved = Arc::clone(&self.saved_seq);
+        tokio::task::spawn_blocking(move || {
+            let mut last = saved.lock().unwrap_or_else(|e| e.into_inner());
+            if *last >= seq {
+                return;
+            }
+            match store::save(&path, &snapshot) {
+                Ok(()) => *last = seq,
+                Err(e) => warn!("agents: cannot write {}: {e:#}", path.display()),
+            }
+        });
     }
 
-    /// Queue `text` to be spoken when the daemon is Idle (TTS on only).
+    /// Queue `text` to be spoken when the daemon is Idle (TTS on only). A
+    /// still-working refusal already queued or playing for this agent is
+    /// not queued again.
     fn say(&self, agent: &str, text: String) {
         if !self.speak {
             return;
         }
+        let utterance = Utterance {
+            agent: agent.to_string(),
+            text,
+        };
         if let Ok(mut queue) = self.utterances.lock() {
-            queue.push_back(Utterance {
-                agent: agent.to_string(),
-                text,
-            });
+            if utterance.text == STILL_WORKING
+                && (queue.contains(&utterance) || self.is_playing(&utterance))
+            {
+                debug!("agent '{agent}': the still-working notice is already queued or playing");
+                return;
+            }
+            queue.push_back(utterance);
         }
         self.utterance_ready.notify_one();
     }
@@ -269,6 +310,41 @@ impl AgentRuntime {
         self.utterances.lock().is_ok_and(|q| !q.is_empty())
     }
 
+    fn set_playing(&self, utterance: Option<Utterance>) {
+        *self.playing.lock().unwrap_or_else(|e| e.into_inner()) = utterance;
+    }
+
+    fn is_playing(&self, utterance: &Utterance) -> bool {
+        self.playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            == Some(utterance)
+    }
+
+    /// Drop every queued reply and notice (`whisrs cancel` while one plays).
+    pub(crate) fn drop_queued(&self) {
+        let dropped = self
+            .utterances
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q).len())
+            .unwrap_or(0);
+        if dropped > 0 {
+            info!("agents: cancel dropped {dropped} queued reply(s)");
+        }
+    }
+
+    /// The spoken line for a failed turn, naming the agent when there are
+    /// several.
+    fn error_line(&self, agent: &Agent, message: &str) -> String {
+        let line = spoken::spoken_error(message);
+        if self.agents.len() > 1 {
+            format!("{}: {line}", agent.name)
+        } else {
+            line
+        }
+    }
+
     /// The row `whisrs agent` shows for `agent`.
     fn info(inner: &Inner, agent: &Agent) -> AgentInfo {
         let phase = inner
@@ -276,10 +352,8 @@ impl AgentRuntime {
             .get(&agent.name)
             .map(|s| s.phase)
             .unwrap_or(AgentPhase::Idle);
-        let session = inner
-            .store
-            .agents
-            .get(&agent.name)
+        let record = inner.store.agents.get(&agent.name);
+        let session = record
             .and_then(|r| r.session_id.as_deref())
             .map(|id| id.chars().take(8).collect());
         AgentInfo {
@@ -287,12 +361,52 @@ impl AgentRuntime {
             harness: agent.harness.to_string(),
             phase,
             session,
+            bg_id: record.and_then(|r| r.bg_id.clone()),
         }
     }
 
+    /// The session of `agent` when no whisrs turn runs and it has one: what
+    /// [`Driver::session_phase`] is asked about.
+    fn idle_session(inner: &Inner, agent: &Agent) -> Option<SessionRef> {
+        if inner
+            .slots
+            .get(&agent.name)
+            .is_some_and(|s| s.turn.is_some())
+        {
+            return None;
+        }
+        let session = inner.store.agents.get(&agent.name)?.session();
+        session.bg_id.is_some().then_some(session)
+    }
+
+    /// Every agent's row. An agent with no whisrs turn running is shown as
+    /// its harness sees it, so a session working on its own reads `working`.
     async fn list(&self) -> Vec<AgentInfo> {
-        let inner = self.inner.lock().await;
-        self.agents.iter().map(|a| Self::info(&inner, a)).collect()
+        let (mut rows, probes) = {
+            let inner = self.inner.lock().await;
+            let rows: Vec<AgentInfo> = self.agents.iter().map(|a| Self::info(&inner, a)).collect();
+            let probes: Vec<(usize, Arc<Agent>, SessionRef)> = self
+                .agents
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| Self::idle_session(&inner, a).map(|s| (i, Arc::clone(a), s)))
+                .collect();
+            (rows, probes)
+        };
+        for (i, agent, session) in probes {
+            match self
+                .driver(agent.harness)
+                .session_phase(&agent, &session)
+                .await
+            {
+                Ok(phase) => rows[i].phase = phase,
+                Err(e) => debug!(
+                    "agent '{}': cannot tell what its session does: {e}",
+                    agent.name
+                ),
+            }
+        }
+        rows
     }
 
     async fn phase(&self, name: &str) -> AgentPhase {
@@ -302,6 +416,16 @@ impl AgentRuntime {
             .get(name)
             .map(|s| s.phase)
             .unwrap_or(AgentPhase::Idle)
+    }
+}
+
+/// A session for the log: its id, else the bg id of a launch whose session
+/// id was not looked up yet, else none.
+fn describe(session: &SessionRef) -> String {
+    match (&session.session_id, &session.bg_id) {
+        (Some(id), _) => format!("session {id}"),
+        (None, Some(bg)) => format!("session bg {bg}"),
+        (None, None) => "a new session".to_string(),
     }
 }
 
@@ -359,9 +483,9 @@ pub(crate) async fn start_background(
         let session = record.session();
         let started_at = record.turn_started_at.unwrap_or(record.updated_at);
         info!(
-            "agent '{}': a turn was running before the restart; watching session {} again",
+            "agent '{}': a turn was running before the restart; watching {} again",
             agent.name,
-            session.session_id.as_deref().unwrap_or("?")
+            describe(&session)
         );
         let request = TurnRequest {
             text: String::new(),
@@ -378,21 +502,74 @@ pub(crate) async fn start_background(
     }
 }
 
-/// Speak queued replies and notices one at a time, each once the daemon is
-/// Idle. Watches the state channel like `hook_dispatch_loop`.
+/// Whether a queued reply or notice may be spoken now: the daemon is Idle
+/// (no dictation, command or read-aloud) and no recording is capturing (a
+/// meeting recording does not touch the dictation state, and a reply would
+/// play mid-call and land on its system track).
+fn may_speak(state: State, capturing: bool) -> bool {
+    state == State::Idle && !capturing
+}
+
+/// What holds agent utterances besides the dictation state: a recording
+/// that captures (feature `recording`).
+struct RecordingHold {
+    #[cfg(feature = "recording")]
+    status_rx: tokio::sync::watch::Receiver<whisrs::recording::RecordingStatus>,
+}
+
+impl RecordingHold {
+    fn new(_context: &DaemonContext) -> Self {
+        Self {
+            #[cfg(feature = "recording")]
+            status_rx: _context.recording.subscribe(),
+        }
+    }
+
+    fn capturing(&self, _context: &DaemonContext) -> bool {
+        #[cfg(feature = "recording")]
+        return _context.recording.is_capturing();
+        #[cfg(not(feature = "recording"))]
+        false
+    }
+
+    /// Resolves when the recording status may have changed (never without
+    /// the feature).
+    async fn changed(&mut self) {
+        #[cfg(feature = "recording")]
+        if self.status_rx.changed().await.is_ok() {
+            return;
+        }
+        std::future::pending::<()>().await
+    }
+}
+
+/// Speak queued replies and notices one at a time, each once
+/// [`may_speak`]. Watches the state channel like `hook_dispatch_loop`, and
+/// the recording status.
 async fn utterance_loop(
     context: Arc<DaemonContext>,
     daemon_state: Arc<Mutex<DaemonState>>,
     mut state_rx: tokio::sync::watch::Receiver<State>,
 ) {
+    let mut hold = RecordingHold::new(&context);
     loop {
         if !context.agents.has_utterances() {
             context.agents.utterance_ready.notified().await;
             continue;
         }
-        if *state_rx.borrow_and_update() != State::Idle {
-            if state_rx.changed().await.is_err() {
-                return;
+        let state = *state_rx.borrow_and_update();
+        let capturing = hold.capturing(&context);
+        if !may_speak(state, capturing) {
+            if capturing {
+                debug!("agents: a recording is capturing; replies wait until it stops");
+            }
+            tokio::select! {
+                changed = state_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = hold.changed() => {}
             }
             continue;
         }
@@ -411,6 +588,7 @@ async fn utterance_loop(
             utterance.agent,
             utterance.text.len()
         );
+        context.agents.set_playing(Some(utterance.clone()));
         match speak_text(
             Arc::clone(&daemon_state),
             Arc::clone(&context),
@@ -422,15 +600,27 @@ async fn utterance_loop(
         {
             SpeakAttempt::NotIdle(_) => {
                 // Something started first: wait for Idle again.
+                context.agents.set_playing(None);
                 context.agents.requeue_front(utterance);
                 if state_rx.changed().await.is_err() {
                     return;
                 }
             }
             SpeakAttempt::Ran(Response::Error { message }) => {
+                context.agents.set_playing(None);
                 warn!("agent '{}': reply not spoken: {message}", utterance.agent);
             }
-            SpeakAttempt::Ran(_) => {}
+            SpeakAttempt::Ran(_) => {
+                // It counts as playing until the playback ends.
+                let ended = state_rx
+                    .wait_for(|s| !matches!(s, State::Speaking | State::Synthesizing))
+                    .await
+                    .is_ok();
+                context.agents.set_playing(None);
+                if !ended {
+                    return;
+                }
+            }
         }
     }
 }
@@ -517,67 +707,157 @@ async fn agent_row(context: &DaemonContext, agent: &Agent) -> Response {
     }
 }
 
-/// `{"cmd":"agent-event"}`: route a hook payload to the running turn whose
-/// stored session it belongs to, or keep it briefly for a turn that does not
-/// know its session id yet.
+/// Who a hook event belongs to.
+enum EventOwner {
+    /// The running turn of this agent.
+    Turn(String, mpsc::UnboundedSender<HookEvent>),
+    /// This agent's stored session, with no whisrs turn running.
+    Idle(Arc<Agent>),
+}
+
+/// `{"cmd":"agent-event"}`: route a hook event to the running turn whose
+/// stored session it belongs to; speak the reply a session produced on its
+/// own (no turn running); or keep it briefly for a turn that does not know
+/// its session id yet.
 pub(crate) async fn handle_agent_event(context: &DaemonContext, payload: serde_json::Value) {
     let rt = &context.agents;
     if !rt.is_enabled() {
         debug!("agent-event ignored: no agents configured");
         return;
     }
+    let event = HookEvent::now(payload);
     let mut inner = rt.inner.lock().await;
-    let mut target = None;
+    let mut owner = None;
     for agent in &rt.agents {
-        let Some(turn) = inner.slots.get(&agent.name).and_then(|s| s.turn.as_ref()) else {
-            continue;
-        };
         let Some(record) = inner.store.agents.get(&agent.name) else {
             continue;
         };
-        if rt
+        if !rt
             .driver(agent.harness)
-            .hook_matches(&payload, &record.session())
+            .hook_matches(&event.payload, &record.session())
         {
-            target = Some((agent.name.clone(), turn.hooks.clone()));
-            break;
+            continue;
         }
+        owner = Some(
+            match inner.slots.get(&agent.name).and_then(|s| s.turn.as_ref()) {
+                Some(turn) => EventOwner::Turn(agent.name.clone(), turn.hooks.clone()),
+                None => EventOwner::Idle(Arc::clone(agent)),
+            },
+        );
+        break;
     }
-    match target {
-        Some((name, hooks)) => {
+    match owner {
+        Some(EventOwner::Turn(name, hooks)) => {
             debug!("agent '{name}': hook event routed");
-            let _ = hooks.send(payload);
+            let _ = hooks.send(event);
+        }
+        Some(EventOwner::Idle(agent)) => {
+            let Some(raw) = rt.driver(agent.harness).idle_reply(&event.payload) else {
+                debug!(
+                    "agent '{}': hook event with no turn running ignored",
+                    agent.name
+                );
+                return;
+            };
+            let slot = inner.slots.entry(agent.name.clone()).or_default();
+            // Compared as spoken: the transcript's text of a turn that ended
+            // on a poll can differ from the hook's in whitespace.
+            let repeat = slot
+                .last_reply
+                .as_deref()
+                .is_some_and(|last| spoken::spoken_reply(last) == spoken::spoken_reply(&raw));
+            if repeat {
+                debug!(
+                    "agent '{}': the Stop of a turn that already ended; not spoken twice",
+                    agent.name
+                );
+                return;
+            }
+            slot.last_reply = Some(raw.clone());
+            drop(inner);
+            info!("agent '{}': the session replied on its own", agent.name);
+            deliver_reply(context, &agent, &raw);
         }
         None => {
-            let now = Instant::now();
+            let now = event.received;
             inner
                 .unclaimed
-                .retain(|(at, _)| now.duration_since(*at) < UNCLAIMED_TTL);
+                .retain(|e| now.duration_since(e.received) < UNCLAIMED_TTL);
             if inner.unclaimed.len() >= UNCLAIMED_MAX {
                 inner.unclaimed.pop_front();
             }
             debug!("agent-event: no running turn matches yet; kept for a moment");
-            inner.unclaimed.push_back((now, payload));
+            inner.unclaimed.push_back(event);
         }
     }
+}
+
+/// Speak and show an agent's reply (raw final message).
+fn deliver_reply(context: &DaemonContext, agent: &Agent, raw: &str) {
+    let text = spoken::spoken_reply(raw);
+    info!(
+        "agent '{}': reply ({} chars, {} spoken)",
+        agent.name,
+        raw.chars().count(),
+        text.chars().count()
+    );
+    if context.notify {
+        send_notification_for(
+            "whisrs",
+            &format!("{}: {text}", agent.name),
+            REPLY_NOTIFICATION_MS,
+        );
+    }
+    context.agents.say(&agent.name, text);
 }
 
 // ---------------------------------------------------------------------------
 // Turns
 // ---------------------------------------------------------------------------
 
-/// Start a turn for `agent`. Refused while its turn is working; a turn that
-/// waits for the user (needs-you) is replaced, so answering it by voice is
-/// one press.
+/// Start a turn for `agent`. Refused while its turn is working, and while
+/// its session works on its own outside a whisrs turn (stopping it would
+/// lose that work); a turn that waits for the user (needs-you) is replaced,
+/// so answering it by voice is one press.
 async fn start_turn(
     context: &Arc<DaemonContext>,
     agent: &Arc<Agent>,
     text: String,
 ) -> Result<(), String> {
     let rt = &context.agents;
+    let idle_session = {
+        let inner = rt.inner.lock().await;
+        if let Some(slot) = inner.slots.get(&agent.name) {
+            if slot.turn.is_some() && slot.phase != AgentPhase::NeedsYou {
+                return Err(STILL_WORKING.to_string());
+            }
+        }
+        AgentRuntime::idle_session(&inner, agent)
+    };
+    if let Some(session) = idle_session {
+        match rt
+            .driver(agent.harness)
+            .session_phase(agent, &session)
+            .await
+        {
+            Ok(AgentPhase::Working) => {
+                info!(
+                    "agent '{}': its session is working on its own; not stopped for a new turn",
+                    agent.name
+                );
+                return Err(STILL_WORKING.to_string());
+            }
+            Ok(_) => {}
+            Err(e) => debug!(
+                "agent '{}': cannot tell what its session does: {e}",
+                agent.name
+            ),
+        }
+    }
     let mut inner = rt.inner.lock().await;
     let slot = inner.slots.entry(agent.name.clone()).or_default();
-    if let Some(turn) = &slot.turn {
+    let mut replaced = None;
+    if slot.turn.is_some() {
         if slot.phase != AgentPhase::NeedsYou {
             return Err(STILL_WORKING.to_string());
         }
@@ -585,11 +865,16 @@ async fn start_turn(
             "agent '{}': a new turn answers the one waiting for you",
             agent.name
         );
-        turn.task.abort();
-        slot.turn = None;
+        if let Some(turn) = slot.turn.take() {
+            replaced = turn.updates.stop();
+            turn.task.abort();
+        }
     }
     let now = Utc::now();
     let record = record_mut(&mut inner, agent);
+    if let Some(latest) = replaced {
+        record.set_session(&latest);
+    }
     record.turn_running = true;
     record.turn_started_at = Some(now);
     record.updated_at = now;
@@ -599,10 +884,7 @@ async fn start_turn(
         "agent '{}': starting a turn ({} chars) in {}",
         agent.name,
         text.chars().count(),
-        match &session.session_id {
-            Some(id) => format!("session {id}"),
-            None => "a new session".to_string(),
-        }
+        describe(&session)
     );
     let request = TurnRequest {
         text,
@@ -632,6 +914,7 @@ fn spawn_turn(
     let generation = inner.next_generation;
     inner.next_generation += 1;
     let (hooks_tx, hooks_rx) = mpsc::unbounded_channel();
+    let (updates, updates_rx) = TurnUpdates::channel();
     let started = Instant::now();
     // Events this session sent before the turn started belong to an earlier
     // turn (or one the session ran on its own, like a follow-up after a
@@ -639,9 +922,13 @@ fn spawn_turn(
     forward_unclaimed(context, inner, &agent, &session, &hooks_tx, started);
     let ctx = Arc::clone(context);
     let task_agent = Arc::clone(&agent);
+    let io = TurnIo {
+        hooks: hooks_rx,
+        updates: updates.clone(),
+    };
     let task = tokio::spawn(async move {
         run_turn_task(
-            ctx, task_agent, generation, session, request, hooks_rx, rewatch,
+            ctx, task_agent, generation, session, request, io, updates_rx, rewatch,
         )
         .await;
     });
@@ -652,6 +939,7 @@ fn spawn_turn(
         started,
         task,
         hooks: hooks_tx,
+        updates,
     });
 }
 
@@ -663,7 +951,7 @@ fn forward_unclaimed(
     inner: &mut Inner,
     agent: &Agent,
     session: &SessionRef,
-    hooks: &mpsc::UnboundedSender<serde_json::Value>,
+    hooks: &mpsc::UnboundedSender<HookEvent>,
     since: Instant,
 ) {
     if session.session_id.is_none() || inner.unclaimed.is_empty() {
@@ -681,28 +969,28 @@ fn forward_unclaimed(
             agent.name
         );
     }
-    for payload in fresh {
+    for event in fresh {
         debug!("agent '{}': delivering an early hook event", agent.name);
-        let _ = hooks.send(payload);
+        let _ = hooks.send(event);
     }
 }
 
 /// Remove the events `belongs` accepts from `events`: those that arrived at
-/// or after `since` are returned in order, older ones are counted and
-/// dropped. Everything else stays.
+/// or after `since` are returned in order (with when they arrived, for the
+/// driver), older ones are counted and dropped. Everything else stays.
 fn take_session_events(
-    events: &mut VecDeque<(Instant, serde_json::Value)>,
+    events: &mut VecDeque<HookEvent>,
     belongs: impl Fn(&serde_json::Value) -> bool,
     since: Instant,
-) -> (Vec<serde_json::Value>, usize) {
+) -> (Vec<HookEvent>, usize) {
     let mut fresh = Vec::new();
     let mut stale = 0;
     let mut kept = VecDeque::new();
-    for (at, payload) in events.drain(..) {
-        if !belongs(&payload) {
-            kept.push_back((at, payload));
-        } else if at >= since {
-            fresh.push(payload);
+    for event in events.drain(..) {
+        if !belongs(&event.payload) {
+            kept.push_back(event);
+        } else if event.received >= since {
+            fresh.push(event);
         } else {
             stale += 1;
         }
@@ -711,21 +999,18 @@ fn take_session_events(
     (fresh, stale)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_task(
     context: Arc<DaemonContext>,
     agent: Arc<Agent>,
     generation: u64,
     session: SessionRef,
     request: TurnRequest,
-    hooks: mpsc::UnboundedReceiver<serde_json::Value>,
+    io: TurnIo,
+    mut updates_rx: mpsc::UnboundedReceiver<TurnUpdate>,
     rewatch: bool,
 ) {
     let driver = context.agents.driver(agent.harness);
-    let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
-    let io = TurnIo {
-        hooks,
-        updates: updates_tx,
-    };
     let turn = async {
         if rewatch {
             driver.rewatch(&agent, session, request, io).await
@@ -814,6 +1099,9 @@ async fn finish_turn(
         if let Some(slot) = inner.slots.get_mut(&agent.name) {
             slot.turn = None;
             slot.phase = AgentPhase::Idle;
+            if let TurnOutcome::Reply(raw) = &outcome {
+                slot.last_reply = Some(raw.clone());
+            }
         }
         let record = record_mut(&mut inner, agent);
         record.turn_running = false;
@@ -823,28 +1111,17 @@ async fn finish_turn(
     }
     match outcome {
         TurnOutcome::Reply(raw) => {
-            let text = spoken::spoken_reply(&raw);
-            info!(
-                "agent '{}': turn done ({} chars, {} spoken)",
-                agent.name,
-                raw.chars().count(),
-                text.chars().count()
-            );
-            if context.notify {
-                send_notification_for(
-                    "whisrs",
-                    &format!("{}: {text}", agent.name),
-                    REPLY_NOTIFICATION_MS,
-                );
-            }
-            rt.say(&agent.name, text);
+            info!("agent '{}': turn done", agent.name);
+            deliver_reply(context, agent, &raw);
         }
         TurnOutcome::Failed(message) => {
-            // Driver messages name the agent already.
+            // Driver messages name the agent already. Spoken too, so the
+            // error is heard with notifications off.
             error!("{message}");
             if context.notify_error() {
                 send_notification_for("whisrs", &message, REPLY_NOTIFICATION_MS);
             }
+            rt.say(&agent.name, rt.error_line(agent, &message));
         }
     }
 }
@@ -877,19 +1154,29 @@ async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     Ok(())
 }
 
-/// Stop the running turn and keep the session.
+/// Stop the running turn and keep the session. With no whisrs turn
+/// running, stop the session's own work, if it does any.
 async fn stop_turn(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     let rt = &context.agents;
     let session = {
         let mut inner = rt.inner.lock().await;
         let Some(turn) = inner.slots.get_mut(&agent.name).and_then(|s| s.turn.take()) else {
-            return Err(format!("no turn is running for '{}'", agent.name));
+            let idle_session = AgentRuntime::idle_session(&inner, agent);
+            drop(inner);
+            return stop_idle_session(context, agent, idle_session).await;
         };
+        // Marked stopped first: a launch still running stops what it starts
+        // itself, and the ids it reported already (a bg id whose session id
+        // is still being looked up) are stopped here.
+        let latest = turn.updates.stop();
         turn.task.abort();
         if let Some(slot) = inner.slots.get_mut(&agent.name) {
             slot.phase = AgentPhase::Idle;
         }
         let record = record_mut(&mut inner, agent);
+        if let Some(latest) = latest {
+            record.set_session(&latest);
+        }
         record.turn_running = false;
         record.turn_started_at = None;
         record.updated_at = Utc::now();
@@ -905,6 +1192,38 @@ async fn stop_turn(context: &DaemonContext, agent: &Agent) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+/// `--stop` with no whisrs turn running: stop the session when it works on
+/// its own (what `whisrs agent` shows as working), else report that nothing
+/// runs.
+async fn stop_idle_session(
+    context: &DaemonContext,
+    agent: &Agent,
+    session: Option<SessionRef>,
+) -> Result<(), String> {
+    let nothing = || format!("no turn is running for '{}'", agent.name);
+    let Some(session) = session else {
+        return Err(nothing());
+    };
+    let driver = context.agents.driver(agent.harness);
+    match driver.session_phase(agent, &session).await {
+        Ok(AgentPhase::Working | AgentPhase::NeedsYou) => {
+            info!(
+                "agent '{}': stopping the work its session does on its own",
+                agent.name
+            );
+            driver
+                .stop(agent, &session)
+                .await
+                .map_err(|e| format!("stopping the session failed: {e}"))
+        }
+        Ok(AgentPhase::Idle) => Err(nothing()),
+        Err(e) => Err(format!(
+            "{}; cannot tell whether its session works: {e}",
+            nothing()
+        )),
+    }
 }
 
 /// Speak and notify the still-working refusal.
@@ -1158,19 +1477,105 @@ mod tests {
         let t0 = Instant::now();
         let start = t0 + Duration::from_secs(5);
         let ev = |sid: &str, n: u32| serde_json::json!({"session_id": sid, "n": n});
+        let at = |received: Instant, payload| HookEvent { received, payload };
         let mut events: VecDeque<_> = [
-            (t0, ev("ours", 1)),
-            (t0, ev("other", 2)),
-            (start, ev("ours", 3)),
-            (start + Duration::from_secs(1), ev("ours", 4)),
+            at(t0, ev("ours", 1)),
+            at(t0, ev("other", 2)),
+            at(start, ev("ours", 3)),
+            at(start + Duration::from_secs(1), ev("ours", 4)),
         ]
         .into_iter()
         .collect();
         let (fresh, stale) = take_session_events(&mut events, |p| p["session_id"] == "ours", start);
-        assert_eq!(fresh, vec![ev("ours", 3), ev("ours", 4)]);
+        let payloads: Vec<_> = fresh.iter().map(|e| e.payload.clone()).collect();
+        assert_eq!(payloads, vec![ev("ours", 3), ev("ours", 4)]);
+        // The arrival time travels with the event, for the driver.
+        assert_eq!(fresh[1].received, start + Duration::from_secs(1));
         assert_eq!(stale, 1);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, ev("other", 2));
+        assert_eq!(events[0].payload, ev("other", 2));
+    }
+
+    /// Replies wait while a recording captures, even with the daemon Idle,
+    /// and while dictation, a command or a read-aloud runs.
+    #[test]
+    fn replies_wait_for_idle_and_no_recording() {
+        assert!(may_speak(State::Idle, false));
+        assert!(!may_speak(State::Idle, true));
+        for state in [
+            State::Recording,
+            State::Transcribing,
+            State::Synthesizing,
+            State::Speaking,
+        ] {
+            assert!(!may_speak(state, false), "{state:?}");
+            assert!(!may_speak(state, true), "{state:?}");
+        }
+    }
+
+    /// One still-working notice at a time: not queued again while one is
+    /// queued or playing. Other utterances are never deduplicated.
+    #[test]
+    fn the_still_working_notice_is_not_queued_twice() {
+        let mut rt = AgentRuntime::disabled();
+        rt.speak = true;
+        rt.say("a", STILL_WORKING.into());
+        rt.say("a", STILL_WORKING.into());
+        rt.say("b", STILL_WORKING.into());
+        rt.say("a", "Done.".into());
+        rt.say("a", "Done.".into());
+        let queued: Vec<_> = std::iter::from_fn(|| rt.next_utterance())
+            .map(|u| format!("{}:{}", u.agent, u.text))
+            .collect();
+        assert_eq!(
+            queued,
+            [
+                format!("a:{STILL_WORKING}"),
+                format!("b:{STILL_WORKING}"),
+                "a:Done.".to_string(),
+                "a:Done.".to_string()
+            ]
+        );
+        // Playing counts too, until its playback ends.
+        rt.set_playing(Some(Utterance {
+            agent: "a".into(),
+            text: STILL_WORKING.into(),
+        }));
+        rt.say("a", STILL_WORKING.into());
+        assert!(!rt.has_utterances());
+        rt.set_playing(None);
+        rt.say("a", STILL_WORKING.into());
+        assert!(rt.has_utterances());
+        // `whisrs cancel` while a reply plays drops the rest.
+        rt.say("b", "Another reply.".into());
+        rt.drop_queued();
+        assert!(!rt.has_utterances());
+    }
+
+    #[test]
+    fn errors_are_spoken_short_and_name_the_agent_when_there_are_several() {
+        let mut rt = AgentRuntime::disabled();
+        let agent = |name: &str| Agent {
+            name: name.into(),
+            hotkey: None,
+            harness: Harness::Claude,
+            dir: PathBuf::from("/proj"),
+            permissions: whisrs::agent::Permissions::Auto,
+            command: "claude".into(),
+            args: Vec::new(),
+            instruction: String::new(),
+        };
+        let message = "Agent 'jarvis': That turn was interrupted, say it again.";
+        rt.agents = vec![Arc::new(agent("jarvis"))];
+        assert_eq!(
+            rt.error_line(&agent("jarvis"), message),
+            "That turn was interrupted, say it again."
+        );
+        rt.agents.push(Arc::new(agent("friday")));
+        assert_eq!(
+            rt.error_line(&agent("jarvis"), message),
+            "jarvis: That turn was interrupted, say it again."
+        );
     }
 
     #[test]

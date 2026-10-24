@@ -12,14 +12,15 @@
 //! ([`claude::ClaudeDriver`]); a process-per-turn driver (phase 2: OpenCode,
 //! Codex, Copilot) spawns one child per turn with `kill_on_drop`, reads the
 //! session id and the final message from its JSON output, and returns when
-//! the child exits. The runtime only ever calls [`Driver::run_turn`],
-//! [`Driver::rewatch`], [`Driver::stop`] and [`Driver::hook_matches`].
+//! the child exits. The runtime only ever calls the [`Driver`] methods.
 
 pub mod claude;
 pub mod spoken;
 pub mod store;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -358,7 +359,16 @@ pub struct AgentInfo {
     /// The first eight characters of the session id, once there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The id of the background process running the session (Claude: the
+    /// id `claude attach`, `claude logs` and `claude stop` take), once known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_id: Option<String>,
 }
+
+/// The refusal for a turn while the agent is still working: its own turn,
+/// or work its session does on its own (a follow-up after a background
+/// command). Spoken and notified.
+pub const STILL_WORKING: &str = "Still working on the last one.";
 
 // ---------------------------------------------------------------------------
 // Driver abstraction
@@ -412,13 +422,101 @@ pub enum TurnOutcome {
     Failed(String),
 }
 
+/// A hook payload as the runtime routes it, with when the daemon received
+/// it: a driver that just restarted a session's process can tell the old
+/// process's events (received before the launch) from the new one's.
+#[derive(Debug, Clone)]
+pub struct HookEvent {
+    pub received: Instant,
+    pub payload: serde_json::Value,
+}
+
+impl HookEvent {
+    /// An event received now.
+    pub fn now(payload: serde_json::Value) -> Self {
+        Self {
+            received: Instant::now(),
+            payload,
+        }
+    }
+}
+
+/// What a running turn and the runtime share outside the update channel,
+/// under one lock.
+#[derive(Debug, Default)]
+struct TurnShared {
+    /// The newest session ids the turn reported.
+    latest: Option<SessionRef>,
+    /// The runtime stopped the turn (`--stop`).
+    stopped: bool,
+}
+
+/// Where a running turn reports progress. A session change is also kept
+/// here synchronously, so `--stop` reads the newest ids even before the
+/// runtime applied the update (a bg id whose session id is still being
+/// looked up); and a launch that finishes after the stop learns of it
+/// ([`TurnUpdates::report_session`]) and stops what it started.
+#[derive(Debug, Clone)]
+pub struct TurnUpdates {
+    tx: mpsc::UnboundedSender<TurnUpdate>,
+    shared: Arc<Mutex<TurnShared>>,
+}
+
+impl TurnUpdates {
+    /// A handle and the receiver the runtime applies updates from.
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<TurnUpdate>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                shared: Arc::new(Mutex::new(TurnShared::default())),
+            },
+            rx,
+        )
+    }
+
+    fn shared(&self) -> std::sync::MutexGuard<'_, TurnShared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Report progress. A [`TurnUpdate::Session`] is also kept as the
+    /// newest ids.
+    pub fn send(&self, update: TurnUpdate) {
+        if let TurnUpdate::Session(session) = &update {
+            self.shared().latest = Some(session.clone());
+        }
+        let _ = self.tx.send(update);
+    }
+
+    /// Report new session ids and tell whether the turn was stopped
+    /// meanwhile, in one step with [`TurnUpdates::stop`]: either the stop
+    /// sees these ids, or this returns `true` and the caller stops the
+    /// session it just started.
+    pub fn report_session(&self, session: SessionRef) -> bool {
+        let stopped = {
+            let mut shared = self.shared();
+            shared.latest = Some(session.clone());
+            shared.stopped
+        };
+        let _ = self.tx.send(TurnUpdate::Session(session));
+        stopped
+    }
+
+    /// Mark the turn stopped and return the newest ids it reported.
+    pub fn stop(&self) -> Option<SessionRef> {
+        let mut shared = self.shared();
+        shared.stopped = true;
+        shared.latest.clone()
+    }
+}
+
 /// The channels between a running turn and the runtime.
 pub struct TurnIo {
-    /// Hook payloads the runtime routed to this turn
+    /// Hook events the runtime routed to this turn
     /// ([`Driver::hook_matches`]).
-    pub hooks: mpsc::UnboundedReceiver<serde_json::Value>,
+    pub hooks: mpsc::UnboundedReceiver<HookEvent>,
     /// Progress for the runtime to record and announce.
-    pub updates: mpsc::UnboundedSender<TurnUpdate>,
+    pub updates: TurnUpdates,
 }
 
 /// A coding-agent harness. One implementation per harness; adding one must
@@ -454,6 +552,23 @@ pub trait Driver: Send + Sync {
     /// Whether a hook payload (`whisrs agent-hook`) belongs to `session`.
     /// Matched by stored ids only, never by name.
     fn hook_matches(&self, payload: &serde_json::Value, session: &SessionRef) -> bool;
+
+    /// What `session` does while no whisrs turn runs: `Working` when the
+    /// harness shows it running on its own (a follow-up after a background
+    /// command, or the user typing in it), `NeedsYou` when that work waits
+    /// for a prompt, else `Idle`. A new turn is refused while it works, so
+    /// the work is not stopped for it. A process-per-turn driver has no
+    /// session between turns and answers `Idle`.
+    async fn session_phase(
+        &self,
+        agent: &Agent,
+        session: &SessionRef,
+    ) -> Result<AgentPhase, String>;
+
+    /// The final message in a hook payload that arrives while no whisrs
+    /// turn runs: the session finished work it did on its own, and the
+    /// runtime speaks it like a reply. `None` for any other event.
+    fn idle_reply(&self, payload: &serde_json::Value) -> Option<String>;
 }
 
 #[cfg(test)]
@@ -621,14 +736,47 @@ reply_instruction = "Be terse."
             harness: "claude".into(),
             phase: AgentPhase::NeedsYou,
             session: Some("cc7a37cf".into()),
+            bg_id: Some("cc7a37cf".into()),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert_eq!(
             json,
-            r#"{"name":"jarvis","harness":"claude","phase":"needs-you","session":"cc7a37cf"}"#
+            r#"{"name":"jarvis","harness":"claude","phase":"needs-you","session":"cc7a37cf","bg_id":"cc7a37cf"}"#
         );
+        // An older daemon's row (no bg id) still parses.
+        let old: AgentInfo = serde_json::from_str(
+            r#"{"name":"jarvis","harness":"claude","phase":"idle","session":"cc7a37cf"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.bg_id, None);
         assert_eq!(serde_json::from_str::<AgentInfo>(&json).unwrap(), info);
         assert_eq!(AgentPhase::NeedsYou.to_string(), "needs-you");
+    }
+
+    /// `--stop` and a launch that finishes meanwhile agree in one step:
+    /// either the stop sees the new ids, or the launch learns it was
+    /// stopped.
+    #[test]
+    fn a_stop_and_a_late_launch_never_both_miss_the_session() {
+        let session = SessionRef {
+            session_id: None,
+            bg_id: Some("cc7a37cf".into()),
+            transcript_path: None,
+        };
+        // The launch reports first: the stop gets the bg id.
+        let (updates, mut rx) = TurnUpdates::channel();
+        assert!(!updates.report_session(session.clone()));
+        assert_eq!(updates.stop(), Some(session.clone()));
+        assert_eq!(rx.try_recv().unwrap(), TurnUpdate::Session(session.clone()));
+        // The stop comes first: the launch is told to stop what it started.
+        let (updates, _rx) = TurnUpdates::channel();
+        assert_eq!(updates.stop(), None);
+        assert!(updates.report_session(session.clone()));
+        // Plain sends keep the newest ids too.
+        let (updates, _rx) = TurnUpdates::channel();
+        updates.send(TurnUpdate::Session(session.clone()));
+        updates.send(TurnUpdate::Working);
+        assert_eq!(updates.stop(), Some(session));
     }
 
     #[test]

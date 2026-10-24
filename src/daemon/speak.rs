@@ -169,6 +169,32 @@ pub(crate) fn stop_read_aloud(ds: &mut DaemonState, context: &DaemonContext) -> 
     new_state
 }
 
+/// Whether the read-aloud in progress speaks an agent's reply or notice
+/// (not the selection or `speak --text`).
+pub(crate) fn agent_playback(ds: &DaemonState) -> bool {
+    matches!(
+        ds.state_machine.state(),
+        State::Speaking | State::Synthesizing
+    ) && ds.tts_stop.is_some()
+        && ds.tts_origin == Some(SpeakOrigin::Agent)
+}
+
+/// Stop an agent reply or notice that is playing, so a dictation or command
+/// press goes ahead instead of being refused for it. A selection read-aloud
+/// is left alone. `true` when one was stopped. The caller holds the lock.
+pub(crate) fn stop_agent_playback(
+    ds: &mut DaemonState,
+    context: &DaemonContext,
+    reason: &str,
+) -> bool {
+    if !agent_playback(ds) {
+        return false;
+    }
+    stop_read_aloud(ds, context);
+    info!("{reason}: stopped an agent reply to go ahead");
+    true
+}
+
 /// What is being spoken, for the log and the progress toast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpeakOrigin {
@@ -218,6 +244,7 @@ pub(crate) async fn speak_text(
         }
         let _ = ds.state_machine.transition(Action::SpeakStart);
         ds.tts_stop = Some(Arc::clone(&stop));
+        ds.tts_origin = Some(origin);
         let _ = context.state_tx.send(ds.state_machine.state());
     }
 

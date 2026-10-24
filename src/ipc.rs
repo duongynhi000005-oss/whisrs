@@ -826,12 +826,13 @@ mod tests {
                 harness: "claude".to_string(),
                 phase: AgentPhase::Working,
                 session: Some("cc7a37cf".to_string()),
+                bg_id: Some("cc7a37cf".to_string()),
             }],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             json,
-            r#"{"status":"agents","agents":[{"name":"jarvis","harness":"claude","phase":"working","session":"cc7a37cf"}]}"#
+            r#"{"status":"agents","agents":[{"name":"jarvis","harness":"claude","phase":"working","session":"cc7a37cf","bg_id":"cc7a37cf"}]}"#
         );
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Response::Agents { agents } if agents.len() == 1));

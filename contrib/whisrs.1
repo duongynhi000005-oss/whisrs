@@ -128,7 +128,9 @@ list the agents with their harness, state
 .BR working ,
 or
 .BR needs\-you )
-and short session id. With
+and the session's background id (the id
+.B claude attach
+takes). With
 .IR NAME ,
 record a voice instruction for that agent (the same as its hotkey; run again
 to stop) and send it to the agent's session; the reply is spoken through
@@ -145,8 +147,8 @@ forgets the session (with
 .BR \-\-text ,
 starts a new one with it).
 .B \-\-stop
-stops the running turn and keeps the session. whisrs only ever touches
-sessions it started.
+stops the running turn (or work the session does on its own) and keeps the
+session. whisrs only ever touches sessions it started.
 .TP
 .B status
 Query the dictation state (for a recording, see

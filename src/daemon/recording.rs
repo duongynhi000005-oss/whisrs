@@ -464,6 +464,12 @@ impl RecordingRuntime {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).status()
     }
 
+    /// The recording status, for a task that waits for a recording to stop
+    /// (agent replies are held while one captures).
+    pub(crate) fn subscribe(&self) -> watch::Receiver<RecordingStatus> {
+        self.status_tx.subscribe()
+    }
+
     /// Whether a recording is in progress. Reads the view, never the session
     /// lock, so it answers at once while a start or stop holds that lock for
     /// seconds opening or closing devices. A start counts once its devices

@@ -171,7 +171,9 @@ pub(crate) async fn handle_command_mode(
     context: Arc<DaemonContext>,
 ) -> Response {
     let current_state = {
-        let ds = daemon_state.lock().await;
+        let mut ds = daemon_state.lock().await;
+        // An agent reply playing is stopped, not a reason to refuse.
+        crate::speak::stop_agent_playback(&mut ds, &context, "command mode");
         ds.state_machine.state()
     };
 
@@ -572,7 +574,9 @@ pub(crate) async fn handle_llm_command(
     name: String,
 ) -> Response {
     let current_state = {
-        let ds = daemon_state.lock().await;
+        let mut ds = daemon_state.lock().await;
+        // An agent reply playing is stopped, not a reason to refuse.
+        crate::speak::stop_agent_playback(&mut ds, &context, "llm-command");
         ds.state_machine.state()
     };
 

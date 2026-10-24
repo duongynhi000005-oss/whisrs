@@ -304,10 +304,17 @@ Agent mode: `[[agents]]` entries (`name`, `hotkey`, `harness` = `claude`, `dir`,
 `auto|bypass|ask`, `command`, `args`, `reply_instruction`; `agent::resolve_agents` validates and
 skips bad entries, shared by `Config::validate` and the runtime). With none, nothing runs and no file
 is written. A voice turn records like command mode's instruction (`BatchOrigin::Agent`), then the
-turn runs on its own task; replies queue in a FIFO spoken when the state is Idle. The Claude driver
-starts `claude --bg` sessions with `--settings` hooks (`Stop`, `Notification`) that run `whisrs
-agent-hook --socket <sock>`; the next turn is `claude stop` + `claude --bg --resume <id> -- <text>`
-with no other flag (any flag starts a copy). Only stored ids are ever passed to `claude`.
+turn runs on its own task; replies queue in a FIFO spoken when the state is Idle and no recording
+captures (`may_speak`), errors too (`spoken::spoken_error`). A dictation toggle or command press stops
+an agent reply (`speak::stop_agent_playback`, by `DaemonState::tts_origin`), never a selection
+read-aloud. The Claude driver starts `claude --bg` sessions with `--settings` hooks (`Stop`,
+`Notification`) that run `whisrs agent-hook --socket <sock>`; under a systemd service the `--bg`
+launch runs in its own `systemd-run --user --scope` (Claude Code's background service must not
+live in the whisrs unit). The next turn is refused while `claude agents` lists the session
+`working`, else `claude stop` + `claude --bg --resume <id> -- <text>` with no other flag (any flag
+starts a copy); only a `Stop` received after that launch ends it. A `Stop` with no turn running is
+the session's own reply and is spoken. The child gets the daemon's env minus
+`claude::PARENT_SESSION_VARS` and `WHISRS_*`. Only stored ids are ever passed to `claude`.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 

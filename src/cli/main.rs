@@ -114,7 +114,7 @@ enum SubCmd {
         /// Forget the session; with --text, start a new one with it
         #[arg(long)]
         new: bool,
-        /// Stop the running turn and keep the session
+        /// Stop the running turn (or the session's own work) and keep the session
         #[arg(long, conflicts_with_all = ["text", "new"])]
         stop: bool,
     },
@@ -617,7 +617,9 @@ fn agent_command(
     })
 }
 
-/// `whisrs agent` rows: name, harness, state, short session id.
+/// `whisrs agent` rows: name, harness, state, and the session's background
+/// id (what `claude attach`, `claude logs` and `claude stop` take). An older
+/// daemon sends no bg id; its short session id is shown then.
 fn print_agents(agents: &[whisrs::agent::AgentInfo], use_color: bool) {
     use whisrs::agent::AgentPhase;
     if agents.is_empty() {
@@ -647,9 +649,13 @@ fn print_agents(agents: &[whisrs::agent::AgentInfo], use_color: bool) {
         } else {
             format!("{phase:<9}")
         };
-        let session = agent.session.as_deref().unwrap_or("-");
+        let id = agent
+            .bg_id
+            .as_deref()
+            .or(agent.session.as_deref())
+            .unwrap_or("-");
         println!(
-            "{:<name_width$}  {:<harness_width$}  {phase}  {session}",
+            "{:<name_width$}  {:<harness_width$}  {phase}  {id}",
             agent.name, agent.harness
         );
     }

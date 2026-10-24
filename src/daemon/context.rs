@@ -13,6 +13,7 @@ use whisrs::{Config, State};
 use crate::agent::AgentRuntime;
 #[cfg(feature = "recording")]
 use crate::recording::RecordingRuntime;
+use crate::speak::SpeakOrigin;
 
 /// Context saved when command mode starts recording.
 pub(crate) struct CommandModeContext {
@@ -85,6 +86,9 @@ pub(crate) struct DaemonState {
     /// read-aloud is active is decided by the `Synthesizing`/`Speaking` states,
     /// not by this flag.
     pub(crate) tts_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// What the read-aloud owning `tts_stop` speaks. Set with it; only
+    /// meaningful while `tts_stop` is set.
+    pub(crate) tts_origin: Option<SpeakOrigin>,
 }
 
 impl DaemonState {
@@ -102,6 +106,7 @@ impl DaemonState {
             agent_recording: None,
             llm_instruction_overrides: std::collections::HashMap::new(),
             tts_stop: None,
+            tts_origin: None,
         }
     }
 

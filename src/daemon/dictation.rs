@@ -26,6 +26,9 @@ pub(crate) async fn handle_toggle(
     language: Option<String>,
 ) -> Response {
     let mut ds = daemon_state.lock().await;
+    // An agent reply playing does not block dictation: it is stopped and
+    // the toggle goes ahead (a selection read-aloud still refuses it).
+    crate::speak::stop_agent_playback(&mut ds, &context, "toggle");
     let current_state = ds.state_machine.state();
 
     match current_state {
@@ -380,6 +383,11 @@ pub(crate) async fn handle_cancel(
     context: Arc<DaemonContext>,
 ) -> Response {
     let mut ds = daemon_state.lock().await;
+
+    // Cancelling an agent reply also drops the replies queued after it.
+    if crate::speak::agent_playback(&ds) {
+        context.agents.drop_queued();
+    }
 
     // Stop any in-progress TTS playback regardless of recording state.
     let stopped_tts = if let Some(stop) = ds.tts_stop.take() {

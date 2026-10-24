@@ -24,7 +24,11 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 
 - `permissions` is harness-neutral and mapped per driver. No warning for `bypass`: the user
   chose it. Claude: `auto` → `--permission-mode auto`, `bypass` → `--permission-mode
-  bypassPermissions`, `ask` → no flag.
+  bypassPermissions`, `ask` → `--permission-mode default`. `ask` passes the flag rather than
+  none: without it a session starts in the user's `permissions.defaultMode`, which may be
+  `auto`, and `ask` would not ask.
+- `permissions`, `args` and `reply_instruction` are fixed when a session starts (a resume
+  passes no flag, see below), so a change applies from the next `--new`.
 - Validation warns (and skips the entry) on a missing/duplicate name, unknown harness or
   missing dir; a hotkey clash is reported like the `[[llm_commands]]` clashes. Agents with
   `[tts] enabled = false` get one warning: replies arrive as notifications only.
@@ -35,7 +39,7 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 
 | CLI | IPC |
 |---|---|
-| `whisrs agent` (list: name, harness, idle/working/needs-you, short session id) | `{"cmd":"agent","action":"list"}` → `Response::Agents` |
+| `whisrs agent` (list: name, harness, idle/working/needs-you, bg id) | `{"cmd":"agent","action":"list"}` → `Response::Agents` |
 | `whisrs agent <name>` (voice turn; same as the hotkey) | `{"cmd":"agent","action":"toggle","name":"…"}` |
 | `whisrs agent <name> --text "…"` (typed turn) | `{"cmd":"agent","action":"send","name":"…","text":"…"}` |
 | `whisrs agent <name> --new [--text "…"]` (forget the session; with text, start a new one) | `"action":"reset"` / `"send"` + `"new":true` |
@@ -48,11 +52,16 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 - `agent-hook` reads the hook JSON on stdin, forwards it, and always exits 0 within two
   seconds, even when the daemon is down. It never blocks the harness.
 - The CLI stays a thin client. All logic is in the daemon.
+- The list shows the bg id (what `claude attach`, `claude logs` and `claude stop` take; the
+  row also carries the short session id). An agent with no whisrs turn running is shown as
+  `claude agents` sees its session, so a session working on its own reads `working`.
+- `--stop` with no whisrs turn running stops the session when it works on its own.
 
 ## Turn flow
 
 1. **Toggle while Idle:** if this agent has a turn running, refuse with a short spoken and
-   notified "Still working on the last one." Otherwise record exactly like command mode's
+   notified "Still working on the last one." (never queued twice while one is queued or
+   playing). Otherwise record exactly like command mode's
    instruction recording (overlay, cues, both streaming and batch paths), with the agent as
    the sink instead of the LLM rewrite. No selection capture. An empty transcript ends
    quietly with a notification.
@@ -62,36 +71,88 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
    answering the agent's question is one press).
 4. **Transcript ready:** start the turn on a spawned task. The state machine returns to Idle
    at once; dictation keeps working while the agent runs.
-5. **Turn ends:** reply text → spoken text (below) → spoken when the daemon is Idle (a FIFO
-   of pending replies, drained by watching the state channel like `hook_dispatch_loop`) and
-   shown as a notification when `[general] notify` is on. Errors always notify.
+5. **Turn ends:** reply text → spoken text (below) → spoken when the daemon is Idle and no
+   recording captures (a FIFO of pending replies, drained by watching the state channel like
+   `hook_dispatch_loop` and the recording status), and shown as a notification when
+   `[general] notify` is on. A meeting recording does not touch the dictation state, so the
+   capture is checked on its own: a reply would play mid-call and land on the system track.
+   Held replies are spoken once the recording stops. Errors are spoken too, as a short line
+   (the message's first sentence, `spoken_error`; prefixed with the agent's name when several
+   are configured), and notified per `[general] notify`, so they are heard with
+   notifications off.
 6. Several agents can run turns at once. Only one recording exists at a time.
+7. **Replies the session produces on its own:** a `Stop` for one of our sessions that arrives
+   with no whisrs turn running (a background command finished and Claude went on by itself,
+   or the user typed in the session) is spoken like a reply, same FIFO and hold rules. A
+   repeat of the last reply (the hook of a turn that already ended on a poll) is not spoken
+   twice. Before a new turn, `claude agents` is asked: a session `working` on its own is not
+   `claude stop`-ped; the turn is refused with "Still working on the last one." Measured on
+   2.1.301: the listed state stays `working` (`status: busy`) for as long as a background
+   task runs, after the turn's own reply, so a long-running background task (a dev server)
+   refuses turns until it ends or the session is stopped (`--stop`).
+8. **Dictation and commands cut agent playback:** while an agent reply or notice plays, a
+   dictation toggle, `command` or an `[[llm_commands]]` press stops it and goes ahead.
+   A selection read-aloud (and `speak --text`) still refuses them, as before.
+   `whisrs cancel` while an agent reply plays also drops the replies queued after it.
 
 ## Claude Code driver (verified on 2.1.301)
 
-- **Environment:** inherit the daemon's environment minus what a parent Claude session sets:
-  `CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_PROJECT_DIR`,
-  `CLAUDE_JOB_DIR`, `AI_AGENT`. Keep `CLAUDE_CONFIG_DIR`. cwd = `dir`.
+- **Environment:** inherit the daemon's environment minus an explicit denylist of what a
+  parent Claude session sets (`PARENT_SESSION_VARS`): `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
+  `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`,
+  `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_SSE_PORT`,
+  `CLAUDE_CODE_EXECPATH`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_PROJECT_DIR`,
+  `CLAUDE_JOB_DIR`, `AI_AGENT`, plus whisrs's own `WHISRS_*` keys. Everything else passes,
+  Claude Code's own configuration included (`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `CLAUDE_CODE_USE_*`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, ...). cwd = `dir`.
+- **Its own scope under systemd:** the first `claude --bg` starts Claude Code's background
+  service (`claude daemon run --origin transient`), which hosts every background session,
+  the user's own included. Measured: started from a whisrsd in a unit with the default
+  `KillMode=control-group`, the service and its sessions sat in the unit's cgroup and died
+  with it on stop. So when whisrsd runs as a service (`INVOCATION_ID`, or a `.service`
+  cgroup), `--bg` launches run under `systemd-run --user --scope --quiet --collect --`
+  (environment, cwd and pipes kept); a missing `systemd-run`, or one that cannot reach the
+  user manager, falls back to a direct spawn. `claude agents` and `claude stop` never start
+  the service (measured) and run directly.
 - **First turn:** `claude --bg --name whisrs-<agent> --permission-mode <m>
-  --append-system-prompt <instruction> --settings <hooks json> [args…] "<text>"`.
-  Prefer `--session-id <uuid>` so the session id is known up front (verify it works with
-  `--bg`); otherwise read it from `claude agents --json --all` by the bg id that `--bg`
-  prints (`backgrounded · <id>`). The appended prompt is recorded on the first request and
+  --append-system-prompt <instruction> --settings <hooks json> [args…] -- "<text>"`.
+  `--session-id` is ignored with `--bg` (measured on 2.1.301: "--bg manages the session id;
+  ignoring --session-id"), so the session id is read from `claude agents --json --all` by
+  the bg id that `--bg` prints (`backgrounded · <id>`). The bg id is reported and persisted
+  the moment it is read, before that lookup, so `--stop` and a restart know it. The launch
+  runs on a task of its own: a `--stop` that lands while it runs is recorded, and the launch
+  stops the session it started. The appended prompt is recorded on the first request and
   reused on every resume (`--system-prompt-snapshot` defaults to on), so it is passed once.
 - **Hooks json:** `Stop` and `Notification` → `<abs path of whisrs> agent-hook`, short
   timeout. Passed with `--settings`, so only whisrs-started sessions have them; the user's
   own settings are untouched.
-- **Next turn:** if the bg process is still alive, `claude stop <bg id>`, then `claude --bg
-  --resume <session id> "<text>"`. It keeps the session id and the saved options
-  (`--remote-control`, `--settings`). If the output says it started a copy, record the copy's
-  session id and log it.
+- **Next turn:** refused while the session is listed `working` (above). Otherwise, if the bg
+  process is still alive, `claude stop <bg id>`, then `claude --bg --resume <session id> --
+  "<text>"` with no other flag: it "wakes" the session in place with its saved options
+  (`--settings` hooks, `--remote-control`, `--model`...), while any flag passed with
+  `--resume` makes Claude Code start a copy, which comes back without the hooks (measured).
+  A resume of a session that is still running (not stopped first) also starts a copy. If the
+  output names another bg id anyway, record the copy's ids and log it.
 - **Turn end:** the `Stop` event whose `session_id` matches carries `last_assistant_message`
-  and `transcript_path`. A `Notification` for a permission prompt marks the agent
-  needs-you and speaks a short notice (for example "Waiting for your approval to use Bash");
-  ignore idle notifications. A voice turn while needs-you is sent normally (stop + resume).
+  and `transcript_path`. Hook events carry when the daemon received them; for a resumed
+  turn only a `Stop` received after the resume launch was spawned counts (the old process is
+  stopped first, so anything earlier is its own). A turn watched again after a restart
+  takes every event. A `Notification` for a permission prompt marks the agent needs-you and
+  speaks a short notice (for example "Waiting for your approval to use Bash"); ignore idle
+  notifications. A voice turn while needs-you is sent normally (stop + resume).
 - **Fallback poll** while a turn runs, every ten seconds: `claude agents --json --all`, our
-  bg id only. `done` without a Stop event → last assistant text from the transcript JSONL.
-  Gone or exited → error "the session ended". `blocked` → needs-you.
+  bg id only. The process decides first: an exited entry keeps its last state, so no `pid`
+  → the turn ended ("the session ended before replying", or the reply from the transcript
+  when its last state was `done`); not listed → "the session ended" and the session is
+  forgotten. `done` waits two seconds for the Stop hook (hook events are still handled
+  meanwhile), then reads the last assistant text since the turn started from the transcript
+  JSONL; `done` with no text for three polls in a row ends the turn with "That turn was
+  interrupted, say it again." (a restart that landed between the stop and the resume).
+  `blocked` → needs-you. A watch that knows only the bg id learns the session id here.
+  Measured: Claude Code restarts a session whose process was killed about ten seconds later
+  ("automatically restarted after its process exited unexpectedly") and the turn goes on;
+  whisrs has ended the turn with an error by then, and the session's own `Stop` is spoken
+  as a reply it produced on its own.
 - **Stop:** `claude stop <bg id>`.
 - **Untrusted dir:** `--bg` refuses a directory never trusted in Claude Code. Detect it and
   notify "Open <dir> in Claude Code once and accept the trust prompt."
@@ -117,13 +178,16 @@ harness without one):
 
 whisrs never trusts the model to comply (users run different models, some small):
 
-- Take the last `<spoken>…</spoken>`. Without one, take the whole reply and keep its first
-  two sentences.
+- Take the last complete `<spoken>…</spoken>` pair: each closing tag pairs with the last
+  opening tag before it, so a tag the reply mentions after its block is not one. Only
+  without a complete pair does a block cut off at the end count. Without any, take the whole
+  reply and keep its first two sentences.
 - Sanitize: drop fenced code; inline code of more than three words dropped, shorter kept as
   words; `[text](url)` → text; bare URLs and file paths dropped; markdown markers, list
   bullets and table rows stripped; whitespace collapsed.
 - Cap at 400 characters on a sentence boundary, so every TTS backend takes it in one request.
-- Empty after all that → "Done."
+- Nothing speakable after all that (no letter or digit, `<spoken>https://x.io!</spoken>`)
+  → "Done."
 - Pure functions in `src/agent/spoken.rs`, unit tested.
 
 ## State and persistence
@@ -131,9 +195,11 @@ whisrs never trusts the model to comply (users run different models, some small)
 - `src/daemon/agent.rs` owns an agent runtime in `DaemonContext` behind its own lock, outside
   `DaemonState`. The state machine only gains the agent recording sink.
 - `$XDG_DATA_HOME/whisrs/agents.json` (0600): per agent `harness`, `dir`, `session_id`,
-  `bg_id`, `transcript_path`, `turn_running`, `updated_at`. Written on every change. At
-  startup an agent with `turn_running` is watched again (poll), so a reply that lands after a
-  daemon restart is still spoken. A changed `harness` or `dir` starts a fresh session.
+  `bg_id`, `transcript_path`, `turn_running`, `updated_at`. Written on every change, off the
+  async runtime (`spawn_blocking`, numbered snapshots so the newest always lands last), as is
+  every transcript read. At startup an agent with `turn_running` is watched again (poll), so
+  a reply that lands after a daemon restart is still spoken. A changed `harness` or `dir`
+  starts a fresh session.
 - Daemon shutdown leaves agent sessions running; they belong to the harness.
 
 ## Layout

@@ -429,6 +429,8 @@ response_format = "wav"     # audio format requested from the API
 #                                #   has no ~/.local/bin)
 # args = ["--model", "sonnet"]   # optional: extra arguments for the first turn of a session
 # reply_instruction = "..."      # optional: replaces the built-in voice instruction
+#                                #   (permissions, args and reply_instruction apply from
+#                                #   the next new session: whisrs agent <name> --new)
 
 # Recording (optional). Records your mic and the system audio as two tracks,
 # then transcribes them after you stop. Every key is optional; see "Recording"
@@ -613,11 +615,11 @@ dir = "~/Projects/whisrs"
 ```
 
 ```
-whisrs agent                       # list the agents: name, harness, idle | working | needs-you, session
+whisrs agent                       # list the agents: name, harness, idle | working | needs-you, bg id
 whisrs agent jarvis                # record a voice turn (same as the hotkey; press again to stop)
 whisrs agent jarvis --text "..."   # send a typed turn (`--text -` reads stdin)
 whisrs agent jarvis --new          # forget the session; with --text, start a new one with it
-whisrs agent jarvis --stop         # stop the running turn and keep the session
+whisrs agent jarvis --stop         # stop the running turn (or the session's own work) and keep the session
 ```
 
 What you need:
@@ -636,12 +638,28 @@ How a turn goes:
   cues, the silence auto-stop, and every transcription backend. Dictation is
   back to normal as soon as the transcript is ready, while the agent works.
 - The reply is spoken when whisrs is idle. A reply that arrives while you
-  dictate waits for the dictation to finish. Several replies queue up.
+  dictate waits for the dictation to finish, and one that arrives during a
+  `whisrs recording` waits until the recording stops (it would play into the
+  call and land on the recording). Several replies queue up.
 - Pressing the agent's hotkey while a reply plays stops it and starts
-  recording, so answering the agent is one press.
+  recording, so answering the agent is one press. A dictation toggle,
+  `whisrs command` or an `[[llm_commands]]` hotkey also stops an agent reply
+  and goes ahead (a selection read-aloud still has to finish or be cancelled
+  first). `whisrs cancel` while a reply plays also drops the replies queued
+  after it.
 - A press while that agent is still working is refused with a short "Still
   working on the last one." Other agents can run at the same time; only one
   recording exists at a time.
+- The session can also work on its own: when a command it started in the
+  background finishes, Claude Code goes on without you. Its reply is spoken
+  like any other, and while it works `whisrs agent` shows it as working and a
+  new turn is refused rather than stopping that work. Claude Code counts a
+  session as working for as long as one of its background commands runs, so a
+  long-running one (a dev server) keeps refusing turns until it ends; `whisrs
+  agent <name> --stop` stops it.
+- When a turn fails (the session ended, `claude` was not found, the folder is
+  not trusted), whisrs says so in a short sentence and, with `[general] notify`
+  on, shows the full message as a notification.
 - When the agent waits for a permission prompt, `whisrs agent` shows it as
   needs-you and whisrs says so ("Waiting for your approval to use Bash."). The
   next turn you send replaces the waiting one. To approve the prompt itself,
@@ -665,11 +683,13 @@ is left, it says "Done."
 
 `permissions` and `args` are passed when a session starts. A later turn resumes
 the session with the options it was started with, so a change applies from the
-next new session (`whisrs agent <name> --new`).
+next new session (`whisrs agent <name> --new`). The same goes for
+`reply_instruction`: the session keeps the instruction it started with.
 
 Sessions. Each agent's session is a Claude Code background session named
 `whisrs-<name>`: it shows up in `claude agents`, and `claude attach <id>` opens it
-(the id is the one `whisrs agent` shows). whisrs keeps its session ids in
+(`<id>` is the background id `whisrs agent` shows, which `claude logs` and
+`claude stop` take too). whisrs keeps its session ids in
 `~/.local/share/whisrs/agents.json` and only ever stops, resumes or reads
 sessions it started, by those ids; your other sessions are never touched.
 Sessions outlive the daemon: a turn that is still running when `whisrsd`
@@ -685,10 +705,22 @@ runs, whisrs also checks `claude agents` every ten seconds, which covers a
 missed hook.
 
 `claude` runs in the agent's `dir` with the daemon's environment, minus the
-variables a parent Claude Code session sets (so a daemon started from inside
-one works) and whisrs's own `WHISRS_*` keys. If no Claude Code background
-service is running yet, the first `claude --bg` starts one, and it keeps that
-environment for every background session it hosts until it exits.
+variables a parent Claude Code session sets for the processes it runs
+(`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`,
+`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`,
+`CLAUDE_CODE_SSE_PORT`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_PID`, `CLAUDE_EFFORT`,
+`CLAUDE_PROJECT_DIR`, `CLAUDE_JOB_DIR`, `AI_AGENT`, so a daemon started from
+inside a session works) and whisrs's own `WHISRS_*` keys. Everything else is
+passed on, Claude Code's own settings included (`CLAUDE_CONFIG_DIR`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, ...). If no Claude Code
+background service is running yet, the first `claude --bg` starts one, and it
+keeps that environment for every background session it hosts until it exits.
+That service hosts your own background sessions too, so when `whisrsd` runs as
+a systemd service, whisrs starts `claude --bg` in a scope of its own
+(`systemd-run --user --scope`): restarting or stopping `whisrs.service` then
+leaves the service and every session running. Without `systemd-run` it starts
+`claude` directly.
 
 ## Choosing the microphone
 

@@ -3,15 +3,19 @@
 //! The voice instruction asks the model to end with a `<spoken>` reply, but
 //! users run different models, some small, so nothing here trusts it:
 //!
-//! 1. Take the last `<spoken>...</spoken>`. Without one, take the whole reply
-//!    and keep its first two sentences.
+//! 1. Take the last complete `<spoken>...</spoken>` pair (a tag mentioned
+//!    in the text after it does not count). Without one, take the whole
+//!    reply and keep its first two sentences.
 //! 2. Sanitize: fenced code dropped; inline code of more than three words
 //!    dropped, shorter kept as words; `[text](url)` becomes the text; bare
 //!    URLs and file paths dropped; markdown markers, list bullets and table
 //!    rows stripped; whitespace collapsed.
 //! 3. Cap at [`MAX_SPOKEN_CHARS`] on a sentence boundary, so every TTS
 //!    backend takes it in one request.
-//! 4. Empty after all that: [`EMPTY_REPLY`].
+//! 4. Nothing speakable after all that (no letter or digit left):
+//!    [`EMPTY_REPLY`].
+//!
+//! [`spoken_error`] does the same for a failed turn's error message.
 //!
 //! Pure functions, no I/O.
 
@@ -24,6 +28,9 @@ pub const MAX_SPOKEN_CHARS: usize = 400;
 
 /// What is spoken when nothing speakable is left.
 pub const EMPTY_REPLY: &str = "Done.";
+
+/// What is spoken for an error with nothing speakable in it.
+pub const ERROR_FALLBACK: &str = "The agent turn failed.";
 
 /// Sentences kept from a reply without a `<spoken>` block.
 const FALLBACK_SENTENCES: usize = 2;
@@ -38,32 +45,68 @@ pub fn spoken_reply(reply: &str) -> String {
         None => first_sentences(&sanitize(&strip_spoken_tags(reply)), FALLBACK_SENTENCES),
     };
     let capped = cap_on_sentence(&text, MAX_SPOKEN_CHARS);
-    if capped.trim().is_empty() {
-        EMPTY_REPLY.to_string()
-    } else {
+    if speakable(&capped) {
         capped
+    } else {
+        EMPTY_REPLY.to_string()
+    }
+}
+
+/// Whether `text` has anything to say: a letter or a digit, not only the
+/// punctuation a dropped URL or path left behind.
+fn speakable(text: &str) -> bool {
+    text.chars().any(char::is_alphanumeric)
+}
+
+/// The short line spoken for a failed turn: the first sentence of the error
+/// message, without its `Agent '<name>': ` prefix, sanitized like a reply
+/// (paths, URLs and markup dropped) and capitalized.
+pub fn spoken_error(message: &str) -> String {
+    let body = message
+        .strip_prefix("Agent '")
+        .and_then(|rest| rest.split_once("': "))
+        .map_or(message, |(_, rest)| rest);
+    let line = first_sentences(&sanitize(body), 1);
+    let line = cap_on_sentence(&line, MAX_SPOKEN_CHARS);
+    if !speakable(&line) {
+        return ERROR_FALLBACK.to_string();
+    }
+    let mut chars = line.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => ERROR_FALLBACK.to_string(),
     }
 }
 
 const OPEN_TAG: &str = "<spoken>";
 const CLOSE_TAG: &str = "</spoken>";
 
-/// The content of the last `<spoken>...</spoken>` block (tags matched
-/// ASCII-case-insensitively). A last opening tag never closed (a truncated
-/// reply) yields everything after it. `None` without an opening tag.
+/// The content of the last complete `<spoken>...</spoken>` pair (tags
+/// matched ASCII-case-insensitively): each closing tag pairs with the last
+/// opening tag before it, so a tag the reply mentions after its block
+/// (`I used the <spoken> tag`) is not taken for one. Without a complete
+/// pair, a block opened after the last closing tag and never closed (a
+/// truncated reply) yields everything after its first opening tag. `None`
+/// without either.
 pub fn last_spoken_block(reply: &str) -> Option<&str> {
     // ASCII lowercasing keeps every byte offset valid in `reply`.
     let lower = reply.to_ascii_lowercase();
-    let open = lower.rfind(OPEN_TAG)?;
-    let start = open + OPEN_TAG.len();
-    match lower[start..].find(CLOSE_TAG) {
-        Some(len) => Some(&reply[start..start + len]),
-        None => {
-            // An opening tag after the last close is a truncated block; an
-            // opening tag whose close comes later cannot happen (rfind).
-            Some(&reply[start..])
+    let mut last_pair = None;
+    // Where the text after the previous closing tag starts.
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(CLOSE_TAG) {
+        let close = from + rel;
+        if let Some(open) = lower[from..close].rfind(OPEN_TAG) {
+            let start = from + open + OPEN_TAG.len();
+            last_pair = Some(&reply[start..close]);
         }
+        from = close + CLOSE_TAG.len();
     }
+    if last_pair.is_some() {
+        return last_pair;
+    }
+    let open = lower[from..].find(OPEN_TAG)?;
+    Some(&reply[from + open + OPEN_TAG.len()..])
 }
 
 /// `reply` without any `<spoken>` or `</spoken>` tag.
@@ -301,7 +344,7 @@ fn tidy(text: &str) -> String {
     static EMPTY_BRACKETS: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\(\s*\)|\[\s*\]").unwrap());
     static DOUBLED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([.,;:!?])[.,;:]+").unwrap());
-    static LEADING_PUNCT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\s.,;:]+").unwrap());
+    static LEADING_PUNCT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\s.,;:!?]+").unwrap());
 
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let s = EMPTY_BRACKETS.replace_all(&collapsed, "");
@@ -573,5 +616,71 @@ mod tests {
     #[test]
     fn a_reply_with_no_tags_and_stray_closing_tag() {
         assert_eq!(spoken_reply("All good.</spoken> Next."), "All good. Next.");
+    }
+
+    /// A tag the reply mentions after its block is not a block.
+    #[test]
+    fn the_last_complete_pair_wins_over_a_later_mention() {
+        let reply = "<spoken>I fixed it.</spoken>\nI wrapped the reply in a <spoken> tag.";
+        assert_eq!(last_spoken_block(reply), Some("I fixed it."));
+        assert_eq!(spoken_reply(reply), "I fixed it.");
+        let reply = "<spoken>Fixed.</spoken> Close it with </spoken> like this.";
+        assert_eq!(spoken_reply(reply), "Fixed.");
+        // Each close pairs with the nearest open before it.
+        assert_eq!(
+            last_spoken_block("<spoken>draft <spoken>final</spoken>"),
+            Some("final")
+        );
+        // Only a truncated block: everything after its first tag, the
+        // mentioned tag stripped.
+        assert_eq!(
+            spoken_reply("notes <spoken>It builds. I used the <spoken> tag"),
+            "It builds. I used the tag."
+        );
+        // A truncated block after a complete one does not win.
+        assert_eq!(
+            spoken_reply("<spoken>Done with it.</spoken> more <spoken>cut off"),
+            "Done with it."
+        );
+    }
+
+    /// Punctuation a dropped URL leaves behind is nothing to say.
+    #[test]
+    fn leftover_punctuation_says_done() {
+        assert_eq!(spoken_reply("<spoken>https://x.io!</spoken>"), EMPTY_REPLY);
+        assert_eq!(spoken_reply("<spoken>/a/b?</spoken>"), EMPTY_REPLY);
+        assert_eq!(
+            spoken_reply("<spoken>https://x.io! Then it built.</spoken>"),
+            "Then it built."
+        );
+    }
+
+    #[test]
+    fn an_error_is_spoken_as_its_first_sentence() {
+        assert_eq!(
+            spoken_error("Agent 'jarvis': That turn was interrupted, say it again."),
+            "That turn was interrupted, say it again."
+        );
+        assert_eq!(
+            spoken_error(
+                "Agent 'jarvis': `claude` was not found. Install Claude Code, or set command in \
+                 [[agents]] to its full path."
+            ),
+            "Claude was not found."
+        );
+        assert_eq!(
+            spoken_error("Agent 'jarvis': its dir /home/u/Projects/x does not exist."),
+            "Its dir does not exist."
+        );
+        assert_eq!(
+            spoken_error(
+                "Agent 'jarvis': Claude Code does not trust this folder yet. Open /p in Claude \
+                 Code once and accept the trust prompt."
+            ),
+            "Claude Code does not trust this folder yet."
+        );
+        assert_eq!(spoken_error("no prefix here. Second."), "No prefix here.");
+        assert_eq!(spoken_error("Agent 'jarvis': /a/b/c"), ERROR_FALLBACK);
+        assert_eq!(spoken_error(""), ERROR_FALLBACK);
     }
 }
