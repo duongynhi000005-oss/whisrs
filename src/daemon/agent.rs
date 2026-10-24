@@ -191,9 +191,10 @@ struct Utterance {
 }
 
 /// Holds agent replies while it lives: a command-mode or `[[llm_commands]]`
-/// press between its state check and its recording (the selection capture
-/// releases the dictation lock), or a recording that is starting. Dropping
-/// it wakes the reply queue.
+/// press between its state check and its recording, or a read-aloud press
+/// until its read-aloud started (the selection capture releases the
+/// dictation lock), or a recording that is starting. Dropping it wakes the
+/// reply queue.
 pub(crate) struct ReplyHold<'a> {
     rt: &'a AgentRuntime,
 }
@@ -430,15 +431,26 @@ impl AgentRuntime {
         }
     }
 
-    /// Put the utterance that was playing back at the front of the queue
-    /// (a recording start stopped it, so it plays after the recording).
+    /// Run `stop`, which stops an agent reply or notice being synthesized or
+    /// played (the caller holds the dictation lock), and when it stopped
+    /// one, put that utterance back at the front of the queue, so it plays
+    /// after the recording. `true` when one was stopped.
+    ///
+    /// The utterance is copied before `stop` runs: the stop broadcasts Idle,
+    /// and the reply queue, woken by it on another worker, clears `playing`
+    /// ([`utterance_loop`]) perhaps before `stop` returns. The queue only
+    /// clears it and never puts back a reply that ran, so the copy is
+    /// queued exactly once.
     #[cfg(feature = "recording")]
-    fn requeue_playing(&self) {
+    fn requeue_if_stopped(&self, stop: impl FnOnce() -> bool) -> bool {
         let playing = self
             .playing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take();
+            .clone();
+        if !stop() {
+            return false;
+        }
         if let Some(utterance) = playing {
             info!(
                 "agent '{}': the reply plays again after the recording",
@@ -446,6 +458,7 @@ impl AgentRuntime {
             );
             self.requeue_front(utterance);
         }
+        true
     }
 
     /// Hold agent replies until the guard drops ([`ReplyHold`]).
@@ -675,8 +688,8 @@ fn may_speak(state: State, held: bool) -> bool {
 }
 
 /// Whether agent replies wait besides the dictation state: a
-/// [`ReplyHold`] (a command press capturing the selection, a recording
-/// starting), or a recording capturing (a meeting recording does not touch
+/// [`ReplyHold`] (a command or read-aloud press capturing the selection, a
+/// recording starting), or a recording capturing (a meeting recording does not touch
 /// the dictation state, and a reply would play mid-call and land on its
 /// system track). Checked under the dictation lock by `speak_text`, so a
 /// hold taken under that lock is never missed.
@@ -697,25 +710,50 @@ fn recording_captures(_context: &DaemonContext) -> bool {
 /// the front of the queue so it plays after the recording. A selection
 /// read-aloud is left alone.
 ///
-/// The hold is taken first: a reply the queue starts after it is refused
-/// under the dictation lock (`speak_text`), and one it started before it is
-/// marked playing before it takes that lock. So the dictation lock, which a
-/// dictation start holds for seconds while its mic opens, is only waited
-/// on while the queue speaks something.
+/// Never waits on the dictation lock, which a dictation start holds for
+/// seconds while its mic opens: a recording start must not wait on it. The
+/// hold is taken first, so a reply the queue starts after it is refused
+/// under that lock (`speak_text`), and only one that already started needs
+/// stopping. When the lock is busy, that stop is spawned and runs once the
+/// lock is free, while replies are still held.
 #[cfg(feature = "recording")]
-pub(crate) async fn hold_for_recording(context: &DaemonContext) -> ReplyHold<'_> {
+pub(crate) fn hold_for_recording(context: &Arc<DaemonContext>) -> ReplyHold<'_> {
     let rt = &context.agents;
     let hold = rt.hold_replies();
     if !rt.is_speaking() {
         return hold;
     }
-    if let Some(daemon_state) = rt.daemon_state.get() {
-        let mut ds = daemon_state.lock().await;
-        if crate::speak::stop_agent_playback(&mut ds, context, "recording") {
-            rt.requeue_playing();
+    let Some(daemon_state) = rt.daemon_state.get() else {
+        return hold;
+    };
+    match daemon_state.try_lock() {
+        Ok(mut ds) => stop_for_recording(&mut ds, context),
+        Err(_) => {
+            debug!(
+                "recording: the dictation lock is busy; an agent reply is stopped once it is free"
+            );
+            let daemon_state = Arc::clone(daemon_state);
+            let context = Arc::clone(context);
+            tokio::spawn(async move {
+                let mut ds = daemon_state.lock().await;
+                // Nothing holds replies any more: the recording start
+                // failed and is gone, so there is nothing to stop for.
+                if replies_held(&context) {
+                    stop_for_recording(&mut ds, &context);
+                }
+            });
         }
     }
     hold
+}
+
+/// Stop an agent reply or notice playing for a recording start and put it
+/// back at the front of the queue. The caller holds the dictation lock.
+#[cfg(feature = "recording")]
+fn stop_for_recording(ds: &mut DaemonState, context: &DaemonContext) {
+    context
+        .agents
+        .requeue_if_stopped(|| crate::speak::stop_agent_playback(ds, context, "recording"));
 }
 
 /// What wakes the reply queue besides the dictation state: the recording
@@ -777,7 +815,7 @@ async fn utterance_loop(
         let held = replies_held(&context);
         if !may_speak(state, held) {
             if held {
-                debug!("agents: a recording or a command press holds replies");
+                debug!("agents: a recording or a command or read-aloud press holds replies");
             }
             if !wait_for_change(&context, &mut state_rx, &mut hold).await {
                 return;
@@ -1475,7 +1513,17 @@ async fn stop_idle_session(
             driver
                 .stop(agent, &session)
                 .await
-                .map_err(|e| format!("stopping the session failed: {e}"))
+                .map_err(|e| format!("stopping the session failed: {e}"))?;
+            // A needs-you that work set (a permission prompt with no turn
+            // running) ends with it, so the row printed after the stop does
+            // not say needs-you. A turn started meanwhile keeps its phase.
+            let mut inner = context.agents.inner.lock().await;
+            if let Some(slot) = inner.slots.get_mut(&agent.name) {
+                if slot.turn.is_none() {
+                    slot.phase = AgentPhase::Idle;
+                }
+            }
+            Ok(())
         }
         Ok(AgentPhase::Idle) => Err(nothing()),
         Err(e) => Err(format!(
@@ -2062,53 +2110,62 @@ mod tests {
         }
     }
 
+    /// A reply of `jarvis`.
+    #[cfg(feature = "recording")]
+    fn utterance(text: &str) -> Utterance {
+        Utterance {
+            agent: "jarvis".into(),
+            text: text.into(),
+            notice: None,
+        }
+    }
+
+    /// Put `ds` in a read-aloud of `origin` that plays, as `speak_text`
+    /// does; returns its stop flag.
+    #[cfg(feature = "recording")]
+    async fn start_speaking(
+        ds: &Mutex<DaemonState>,
+        origin: SpeakOrigin,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut g = ds.lock().await;
+        g.state_machine.transition(Action::SpeakStart).unwrap();
+        g.state_machine.transition(Action::SpeakPlaying).unwrap();
+        g.tts_stop = Some(Arc::clone(&stop));
+        g.tts_origin = Some(origin);
+        stop
+    }
+
     /// A recording start stops an agent reply being played, which plays
     /// again after the recording (first in the queue), and holds replies
     /// until the guard drops. A selection read-aloud is left alone.
     #[cfg(feature = "recording")]
     #[tokio::test]
     async fn a_recording_start_stops_an_agent_reply_and_plays_it_after() {
-        use std::sync::atomic::AtomicBool;
         let dir = tempfile::tempdir().unwrap();
         let context = test_context(&["jarvis"], dir.path());
         let rt = &context.agents;
         let ds = Arc::new(Mutex::new(DaemonState::new()));
         rt.daemon_state.set(Arc::clone(&ds)).ok().unwrap();
-        let speaking = |origin| {
-            let ds = Arc::clone(&ds);
-            async move {
-                let stop = Arc::new(AtomicBool::new(false));
-                let mut g = ds.lock().await;
-                g.state_machine.transition(Action::SpeakStart).unwrap();
-                g.state_machine.transition(Action::SpeakPlaying).unwrap();
-                g.tts_stop = Some(Arc::clone(&stop));
-                g.tts_origin = Some(origin);
-                stop
-            }
-        };
-        let utterance = |text: &str| Utterance {
-            agent: "jarvis".into(),
-            text: text.into(),
-            notice: None,
-        };
 
-        let stop = speaking(SpeakOrigin::Agent).await;
+        let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
         rt.set_playing(Some(utterance("first")));
         rt.say("jarvis", "second".into());
-        let hold = hold_for_recording(&context).await;
+        let hold = hold_for_recording(&context);
         assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
         assert!(stop.load(Ordering::Acquire), "playback was not stopped");
-        assert!(!rt.is_speaking());
         assert!(replies_held(&context));
         drop(hold);
         assert!(!replies_held(&context));
         assert_eq!(queued(rt), ["first", "second"]);
+        // The reply queue clears `playing` once it sees the playback end.
+        rt.set_playing(None);
 
         // A selection read-aloud keeps playing, even while the queue is
         // about to speak (it then finds the daemon busy and waits).
-        let stop = speaking(SpeakOrigin::Selection).await;
+        let stop = start_speaking(&ds, SpeakOrigin::Selection).await;
         rt.set_playing(Some(utterance("third")));
-        let hold = hold_for_recording(&context).await;
+        let hold = hold_for_recording(&context);
         assert_eq!(ds.lock().await.state_machine.state(), State::Speaking);
         assert!(!stop.load(Ordering::Acquire));
         assert!(
@@ -2117,6 +2174,187 @@ mod tests {
         );
         drop(hold);
         assert!(queued(rt).is_empty());
+    }
+
+    /// The stop broadcasts Idle, and the reply queue, woken by it on another
+    /// worker, can clear `playing` before the stopper puts the reply back.
+    /// The reply is copied before the stop, so it still plays after the
+    /// recording, once. Run here in that order: `playing` is cleared inside
+    /// the stop, as the queue would between the stop and the requeue.
+    #[cfg(feature = "recording")]
+    #[test]
+    fn a_stopped_reply_is_requeued_when_the_queue_clears_it_first() {
+        let mut rt = AgentRuntime::disabled();
+        rt.speak = true;
+        rt.set_playing(Some(utterance("first")));
+        rt.say("jarvis", "second".into());
+        assert!(rt.requeue_if_stopped(|| {
+            rt.set_playing(None);
+            true
+        }));
+        assert_eq!(queued(&rt), ["first", "second"]);
+        assert!(!rt.is_speaking());
+
+        // Nothing was stopped: nothing is put back.
+        rt.set_playing(Some(utterance("third")));
+        assert!(!rt.requeue_if_stopped(|| false));
+        assert!(queued(&rt).is_empty());
+    }
+
+    /// A recording start never waits on the dictation lock, which a
+    /// dictation start holds while its mic opens: it holds replies at once
+    /// and stops the agent reply playing once the lock is free.
+    #[cfg(feature = "recording")]
+    #[tokio::test]
+    async fn a_recording_start_does_not_wait_on_the_dictation_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        let rt = &context.agents;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        rt.daemon_state.set(Arc::clone(&ds)).ok().unwrap();
+        let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
+        rt.set_playing(Some(utterance("first")));
+
+        // A dictation start holds the lock.
+        let dictation = ds.lock().await;
+        let hold = hold_for_recording(&context);
+        assert!(replies_held(&context));
+        assert!(!stop.load(Ordering::Acquire), "stopped without the lock");
+        assert!(!rt.has_utterances());
+        drop(dictation);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !rt.has_utterances() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stop runs once the lock is free");
+        assert!(stop.load(Ordering::Acquire), "playback was not stopped");
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+        drop(hold);
+        assert_eq!(queued(rt), ["first"]);
+
+        // A start that is gone by the time the lock frees (nothing holds
+        // replies) stops nothing.
+        rt.set_playing(None);
+        let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
+        rt.set_playing(Some(utterance("second")));
+        let dictation = ds.lock().await;
+        drop(hold_for_recording(&context));
+        drop(dictation);
+        // Let the spawned stop run (one runtime thread: it runs on the
+        // first yield, and nothing in it waits once the lock is free).
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(ds.lock().await.state_machine.state(), State::Speaking);
+        assert!(!stop.load(Ordering::Acquire));
+        assert!(!rt.has_utterances());
+    }
+
+    /// A harness whose session waits on a permission prompt it hit on its
+    /// own (no whisrs turn running), and stops when asked.
+    struct PromptWaitingDriver;
+
+    #[async_trait::async_trait]
+    impl Driver for PromptWaitingDriver {
+        async fn run_turn(
+            &self,
+            _agent: &Agent,
+            _session: SessionRef,
+            _request: TurnRequest,
+            _io: TurnIo,
+        ) -> TurnOutcome {
+            unreachable!("no turn runs")
+        }
+
+        async fn rewatch(
+            &self,
+            _agent: &Agent,
+            _session: SessionRef,
+            _request: TurnRequest,
+            _io: TurnIo,
+        ) -> TurnOutcome {
+            unreachable!("no turn runs")
+        }
+
+        async fn stop(&self, _agent: &Agent, _session: &SessionRef) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn hook_matches(&self, payload: &serde_json::Value, _session: &SessionRef) -> bool {
+            payload["session_id"] == "sid-1"
+        }
+
+        async fn session_phase(
+            &self,
+            _agent: &Agent,
+            _session: &SessionRef,
+        ) -> Result<AgentPhase, String> {
+            Ok(AgentPhase::NeedsYou)
+        }
+
+        async fn session_phases(
+            &self,
+            sessions: &[(Arc<Agent>, SessionRef)],
+        ) -> Vec<Result<AgentPhase, String>> {
+            sessions.iter().map(|_| Ok(AgentPhase::NeedsYou)).collect()
+        }
+
+        async fn idle_event(
+            &self,
+            _payload: &serde_json::Value,
+            _session: &SessionRef,
+        ) -> IdleEvent {
+            IdleEvent::NeedsYou("Waiting for your approval to use Bash.".into())
+        }
+    }
+
+    /// `--stop` with no whisrs turn running stops the session's own work,
+    /// and the needs-you its permission prompt set goes with it: the row
+    /// printed after the stop says idle.
+    #[tokio::test]
+    async fn stopping_a_sessions_own_work_clears_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context(&["jarvis"], dir.path());
+        Arc::get_mut(&mut context)
+            .unwrap()
+            .agents
+            .drivers
+            .insert(Harness::Claude, Arc::new(PromptWaitingDriver));
+        {
+            let mut inner = context.agents.inner.lock().await;
+            let mut record = AgentRecord::new("claude", Path::new("/proj"));
+            record.session_id = Some("sid-1".into());
+            record.bg_id = Some("bg1".into());
+            inner.store.agents.insert("jarvis".into(), record);
+        }
+        handle_agent_event(
+            &context,
+            serde_json::json!({
+                "session_id": "sid-1",
+                "hook_event_name": "Notification",
+                "notification_type": "permission_prompt",
+            }),
+        )
+        .await;
+        assert_eq!(context.agents.phase("jarvis").await, AgentPhase::NeedsYou);
+
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        let response = handle_agent(
+            ds,
+            Arc::clone(&context),
+            AgentAction::Stop,
+            Some("jarvis".into()),
+            None,
+            false,
+        )
+        .await;
+        match response {
+            Response::Agents { agents } => assert_eq!(agents[0].phase, AgentPhase::Idle),
+            other => panic!("expected the agent's row, got {other:?}"),
+        }
     }
 
     #[test]

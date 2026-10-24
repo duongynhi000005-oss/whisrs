@@ -35,7 +35,7 @@ pub(crate) async fn handle_speak(
 ) -> Response {
     // (a) Inspect the FSM. A second press while read-aloud is active is a
     // deterministic stop, regardless of playback timing.
-    {
+    let _hold = {
         let mut ds = daemon_state.lock().await;
         match ds.state_machine.state() {
             State::Speaking | State::Synthesizing => {
@@ -49,10 +49,16 @@ pub(crate) async fn handle_speak(
                 };
             }
             State::Idle => {
-                // Fall through; do NOT transition yet.
+                // Fall through; do NOT transition yet. The lock is released
+                // to capture the selection, so agent replies are held for
+                // the rest of the press, like command mode: the next queued
+                // one would otherwise take the Idle state and this press
+                // would do nothing. Taken under the lock, so a reply cannot
+                // slip in before it.
+                context.agents.hold_replies()
             }
         }
-    }
+    };
 
     // (b) Verify TTS is configured/enabled and build the backend. State is
     // still Idle on any error here — nothing to unwind.
@@ -86,7 +92,7 @@ pub(crate) async fn handle_speak(
 
     match speak_text(
         daemon_state,
-        context,
+        Arc::clone(&context),
         backend,
         &selected_text,
         SpeakOrigin::Selection,
@@ -551,6 +557,26 @@ mod tests {
     async fn until_stopped_returns_the_output_when_not_stopped() {
         let stop = AtomicBool::new(false);
         assert_eq!(until_stopped(async { 7 }, &stop).await, Some(7));
+    }
+
+    /// A read-aloud press releases the dictation lock to capture the
+    /// selection, so it takes a reply hold in its locked state check and
+    /// keeps it for the whole press: an agent reply arriving during the
+    /// capture would take the Idle state and the press would do nothing.
+    #[test]
+    fn a_read_aloud_press_holds_agent_replies_while_it_captures() {
+        let code = include_str!("speak.rs");
+        let start = code
+            .find("pub(crate) async fn handle_speak(")
+            .expect("handle_speak");
+        let body = &code[start..start + code[start..].find("\n}").unwrap()];
+        let lock = body.find("daemon_state.lock()").expect("the state check");
+        let hold = body.find("hold_replies()").expect("the reply hold");
+        let capture = body.find("capture_selection(").expect("the capture");
+        let speak = body.find("speak_text(").expect("the read-aloud");
+        assert!(lock < hold && hold < capture && capture < speak);
+        // Bound for the whole handler, not dropped at once.
+        assert!(body.contains("let _hold = {"));
     }
 
     #[test]

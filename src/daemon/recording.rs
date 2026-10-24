@@ -884,7 +884,7 @@ async fn start(
     // Agent replies are held from here, not only once the devices are open,
     // and one playing is stopped and plays after the recording: it would
     // land on the system track.
-    let _replies = crate::agent::hold_for_recording(context).await;
+    let _replies = crate::agent::hold_for_recording(context);
 
     let recording_cfg = RecordingConfig::effective(&context.config);
     let root = recordings_root(&context.config);

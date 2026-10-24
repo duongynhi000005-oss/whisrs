@@ -84,11 +84,17 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
    Held replies are spoken once the recording stops. Replies are held from the moment a
    recording starts, before its devices open, and a reply or notice being synthesized or
    played when it starts is stopped and put back at the front of the FIFO, so it plays after
-   the recording (a selection read-aloud is left alone). A command-mode or
-   `[[llm_commands]]` press holds them too, from its state check until its recording starts
-   or it gives up: it releases the dictation lock meanwhile (command mode to capture the
-   selection), and the next queued reply would otherwise take the Idle state from it. Every
-   hold is checked under the dictation lock where a reply starts (`speak_text`). Errors are
+   the recording (a selection read-aloud is left alone). A recording start never waits on
+   the dictation lock for that stop: when the lock is busy (a dictation start opening its
+   mic), the stop is spawned and runs once the lock is free, while replies are still held.
+   The stopped utterance is copied before the stop, since the stop wakes the reply queue,
+   which clears what it was playing. A command-mode or `[[llm_commands]]` press holds them
+   too, from its state check until its recording starts or it gives up, and a read-aloud
+   press until its read-aloud started: each releases the dictation lock meanwhile (command
+   mode and read-aloud to capture the selection), and the next queued reply would otherwise
+   take the Idle state from it. Every hold is checked under the dictation lock where a reply
+   starts (`speak_text`). A `--stop` with no whisrs turn running that stopped the session's
+   own work clears the needs-you its permission prompt set. Errors are
    spoken too, as a short line
    (the message's first sentence, `spoken_error`; prefixed with the agent's name when several
    are configured), and notified per `[general] notify`, so they are heard with
