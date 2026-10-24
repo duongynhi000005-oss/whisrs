@@ -170,11 +170,19 @@ pub(crate) async fn handle_command_mode(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) -> Response {
-    let current_state = {
+    let (current_state, _hold) = {
         let mut ds = daemon_state.lock().await;
         // An agent reply playing is stopped, not a reason to refuse.
         crate::speak::stop_agent_playback(&mut ds, &context, "command mode");
-        ds.state_machine.state()
+        let state = ds.state_machine.state();
+        // A first press releases the lock to capture the selection: agent
+        // replies are held until it has started recording (or gave up), or
+        // the next queued one would take the Idle state from it. Taken
+        // under the lock, so a reply cannot slip in before it.
+        (
+            state,
+            (state == State::Idle).then(|| context.agents.hold_replies()),
+        )
     };
 
     match current_state {
@@ -208,7 +216,7 @@ pub(crate) async fn handle_command_mode(
             if let Some(refused) = refuse_while_recording(&context, DictationStart::CommandMode) {
                 return refused;
             }
-            command_mode_start(daemon_state, context).await
+            command_mode_start(daemon_state, Arc::clone(&context)).await
         }
         State::Transcribing => Response::Error {
             message: "cannot start command mode while transcribing".to_string(),
@@ -573,11 +581,17 @@ pub(crate) async fn handle_llm_command(
     context: Arc<DaemonContext>,
     name: String,
 ) -> Response {
-    let current_state = {
+    let (current_state, _hold) = {
         let mut ds = daemon_state.lock().await;
         // An agent reply playing is stopped, not a reason to refuse.
         crate::speak::stop_agent_playback(&mut ds, &context, "llm-command");
-        ds.state_machine.state()
+        let state = ds.state_machine.state();
+        // Held until the recording started or the press gave up, like
+        // command mode: the lock is released before the recording starts.
+        (
+            state,
+            (state == State::Idle).then(|| context.agents.hold_replies()),
+        )
     };
 
     match current_state {
@@ -622,7 +636,7 @@ pub(crate) async fn handle_llm_command(
                     {
                         return refused;
                     }
-                    llm_command_start(daemon_state, context, entry).await
+                    llm_command_start(daemon_state, Arc::clone(&context), entry).await
                 }
                 None => Response::Error {
                     message: format!("no llm_commands entry named '{name}' — check config.toml"),

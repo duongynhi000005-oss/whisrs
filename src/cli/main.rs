@@ -739,19 +739,31 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
     let (mut reader, mut writer) = stream.into_split();
 
     // Send command.
+    let new_command = older_daemon_cannot_parse(&cmd);
     let encoded = encode_message(&cmd)?;
     writer.write_all(&encoded).await?;
     writer.shutdown().await?;
 
     // Read response. A daemon that cannot parse the command (one older than
-    // this CLI) closes the connection without answering.
+    // this CLI) closes the connection without answering; only a command an
+    // older daemon may not know gets that hint.
     match read_message::<Response>(&mut reader).await {
         Ok(response) => Ok(response),
-        Err(e) => exit_with_error(&format!(
+        Err(e) if new_command => exit_with_error(&format!(
             "whisrsd closed the connection without answering ({e}). It may be older than this \
              whisrs and not know this command: restart it (whisrs restart)."
         )),
+        Err(e) => Err(e),
     }
+}
+
+/// Whether a daemon older than agent mode cannot parse `cmd`: `speak-text`,
+/// `agent` and `agent-event` are new with it.
+fn older_daemon_cannot_parse(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::SpeakText { .. } | Command::Agent { .. } | Command::AgentEvent { .. }
+    )
 }
 
 /// `whisrs recording <action>`. Recording control goes through the daemon;
@@ -1134,6 +1146,36 @@ mod tests {
         let cli = Cli::try_parse_from(["whisrs", "mcp"]).unwrap();
         assert!(matches!(cli.command, SubCmd::Mcp));
         assert!(Cli::try_parse_from(["whisrs", "mcp", "extra"]).is_err());
+    }
+
+    /// Only the commands an older daemon cannot parse get the "older
+    /// daemon" hint when the daemon hangs up; every other one keeps its
+    /// plain error.
+    #[test]
+    fn only_new_commands_get_the_older_daemon_hint() {
+        use whisrs::agent::AgentAction;
+        assert!(older_daemon_cannot_parse(&Command::SpeakText {
+            text: "hi".into()
+        }));
+        assert!(older_daemon_cannot_parse(&Command::Agent {
+            action: AgentAction::List,
+            name: None,
+            text: None,
+            new: false,
+        }));
+        assert!(older_daemon_cannot_parse(&Command::AgentEvent {
+            payload: serde_json::json!({}),
+        }));
+        for old in [
+            Command::Toggle { language: None },
+            Command::Cancel,
+            Command::Status,
+            Command::Speak,
+            Command::CommandMode,
+            Command::Log { limit: 5 },
+        ] {
+            assert!(!older_daemon_cannot_parse(&old), "{}", old.log_summary());
+        }
     }
 
     #[cfg(not(feature = "mcp"))]

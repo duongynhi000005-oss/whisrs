@@ -43,8 +43,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::{
-    Agent, AgentPhase, Driver, HookEvent, Permissions, SessionRef, TurnIo, TurnOutcome,
-    TurnRequest, TurnUpdate, TurnUpdates, STILL_WORKING,
+    Agent, AgentPhase, Driver, HookEvent, IdleEvent, Permissions, SessionRef, TurnIo, TurnOutcome,
+    TurnRequest, TurnUpdate, TurnUpdates,
 };
 
 /// How often a running turn is polled.
@@ -55,6 +55,9 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// `claude agents --json --all` and `claude stop`.
 const QUICK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `claude agents --json --all` for `whisrs agent`, which waits on it.
+const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a `done` poll waits for the `Stop` hook before reading the
 /// transcript instead. Hook events keep being handled meanwhile.
@@ -67,6 +70,14 @@ pub const DONE_POLLS_WITHOUT_TEXT: u32 = 3;
 
 /// The error for a turn that ended without a reply of its own.
 pub const INTERRUPTED: &str = "That turn was interrupted, say it again.";
+
+/// The error for a turn a restart interrupted before its launch printed a bg
+/// id. The launch runs in a scope of its own and may well have started the
+/// session, which whisrs cannot find without matching sessions by name: it
+/// never does, so it says so instead of inviting the instruction again.
+pub const LOST_TRACK: &str =
+    "whisrs lost track of that turn after a restart, and it may still be running. \
+     `claude agents` lists it.";
 
 /// Attempts to find a just-launched session in `claude agents`.
 const LIST_ATTEMPTS: u32 = 10;
@@ -207,6 +218,11 @@ pub struct ListedSession {
     pub alive: bool,
     /// What a waiting session waits for (`permission prompt`, ...).
     pub waiting_for: Option<String>,
+    /// `status` is `busy`: the session still runs something, a background
+    /// task included. Measured on 2.1.301: a turn that started a background
+    /// command and replied lists `state: done` with `status: busy` for as
+    /// long as that command runs.
+    pub busy: bool,
 }
 
 /// Parse `claude agents --json --all` output.
@@ -230,6 +246,7 @@ pub fn find_session(list: &[Value], bg_id: &str) -> Option<ListedSession> {
         state: text("state"),
         alive: entry.get("pid").is_some_and(|p| !p.is_null()),
         waiting_for: text("waitingFor"),
+        busy: entry.get("status").and_then(Value::as_str) == Some("busy"),
     })
 }
 
@@ -251,8 +268,27 @@ pub enum PollState {
     Other,
 }
 
-/// Classify a listed session. A running session in a terminal state
-/// (`failed`, `stopped`) is treated as exited.
+/// What a session does while no whisrs turn runs: `Working` while its
+/// process runs a turn of its own or anything else (`status: busy`: a
+/// background task, after its turn replied with `state: done`), `NeedsYou`
+/// while that work waits for a prompt, else `Idle`. A new turn is refused
+/// while it works: stopping the session for it would kill that work.
+pub fn idle_phase(listed: Option<&ListedSession>) -> AgentPhase {
+    let Some(listed) = listed.filter(|l| l.alive) else {
+        return AgentPhase::Idle;
+    };
+    match poll_state(Some(listed)) {
+        PollState::Working => AgentPhase::Working,
+        PollState::Blocked { .. } => AgentPhase::NeedsYou,
+        PollState::Done | PollState::Other if listed.busy => AgentPhase::Working,
+        _ => AgentPhase::Idle,
+    }
+}
+
+/// Classify a listed session for a running turn. A running session in a
+/// terminal state (`failed`, `stopped`) is treated as exited. `done` ends
+/// the turn even while `status` is `busy` (a background task the turn
+/// started runs on after its reply); see [`idle_phase`] for between turns.
 pub fn poll_state(listed: Option<&ListedSession>) -> PollState {
     let Some(listed) = listed else {
         return PollState::Gone;
@@ -686,8 +722,13 @@ async fn run_launch(agent: &Agent, args: &[String], use_scope: bool) -> Result<O
 
 /// `claude agents --json --all`, parsed.
 async fn list_sessions(agent: &Agent) -> Result<Vec<Value>, String> {
+    list_sessions_within(agent, QUICK_TIMEOUT).await
+}
+
+/// [`list_sessions`] with its own timeout.
+async fn list_sessions_within(agent: &Agent, timeout: Duration) -> Result<Vec<Value>, String> {
     let args = ["agents", "--json", "--all"].map(String::from);
-    let out = run_claude(agent, &args, QUICK_TIMEOUT).await?;
+    let out = run_claude(agent, &args, timeout).await?;
     if !out.success {
         return Err(format!(
             "`claude agents --json --all` failed: {}",
@@ -797,7 +838,7 @@ impl ClaudeDriver {
         agent: &Agent,
         text: &str,
         updates: &TurnUpdates,
-    ) -> Result<(SessionRef, Instant), String> {
+    ) -> Result<(SessionRef, Instant), TurnOutcome> {
         let settings = hook_settings(&self.hook_command);
         let launched_at = Instant::now();
         let (bg_id, mut session) = launch_reported(
@@ -807,7 +848,8 @@ impl ClaudeDriver {
             updates,
             self.use_scope,
         )
-        .await?;
+        .await
+        .map_err(TurnOutcome::Failed)?;
         match learn_session(agent, &bg_id).await {
             Ok(listed) => {
                 session.session_id = listed.session_id;
@@ -823,17 +865,17 @@ impl ClaudeDriver {
         Ok((session, launched_at))
     }
 
-    /// A later turn: refused while the session works on its own; otherwise
-    /// stop the old process if it is alive, then resume. Returns the session
-    /// and when the resume was spawned: hook events received earlier are the
-    /// old process's.
+    /// A later turn: refused ([`TurnOutcome::Busy`]) while the session works
+    /// on its own; otherwise stop the old process if it is alive, then
+    /// resume. Returns the session and when the resume was spawned: hook
+    /// events received earlier are the old process's.
     async fn next_turn(
         &self,
         agent: &Agent,
         session: &SessionRef,
         text: &str,
         updates: &TurnUpdates,
-    ) -> Result<(SessionRef, Instant), String> {
+    ) -> Result<(SessionRef, Instant), TurnOutcome> {
         let mut session_id = session.session_id.clone();
         if let Some(bg_id) = &session.bg_id {
             match list_sessions(agent).await {
@@ -842,8 +884,13 @@ impl ClaudeDriver {
                         if session_id.is_none() {
                             session_id = listed.session_id.clone();
                         }
-                        if poll_state(Some(&listed)) == PollState::Working {
-                            return Err(format!("Agent '{}': {STILL_WORKING}", agent.name));
+                        if idle_phase(Some(&listed)) == AgentPhase::Working {
+                            info!(
+                                "agent '{}': its session is working on its own; not stopped \
+                                 for a new turn",
+                                agent.name
+                            );
+                            return Err(TurnOutcome::Busy);
                         }
                         if listed.alive {
                             if let Err(e) = stop_bg(agent, bg_id).await {
@@ -886,12 +933,15 @@ impl ClaudeDriver {
             updates,
             self.use_scope,
         )
-        .await?;
+        .await
+        .map_err(TurnOutcome::Failed)?;
         if session.bg_id.as_deref() == Some(bg_id.as_str()) {
             return Ok((resumed, launched_at));
         }
         // A copy: Claude Code could not continue in place.
-        let listed = learn_session(agent, &bg_id).await?;
+        let listed = learn_session(agent, &bg_id)
+            .await
+            .map_err(TurnOutcome::Failed)?;
         warn!(
             "agent '{}': resume started a copy: session {} (bg {bg_id}) replaces {session_id}",
             agent.name,
@@ -919,10 +969,9 @@ impl ClaudeDriver {
         updates: &TurnUpdates,
     ) -> TurnOutcome {
         let Some(bg_id) = session.bg_id.clone() else {
-            return TurnOutcome::Failed(format!(
-                "Agent '{}': {INTERRUPTED} It stopped before its session started.",
-                agent.name
-            ));
+            // Only a turn watched again after a restart lacks a bg id: the
+            // restart landed before its launch printed one.
+            return TurnOutcome::Failed(format!("Agent '{}': {LOST_TRACK}", agent.name));
         };
         let mut poll = tokio::time::interval(self.poll_interval);
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -944,10 +993,23 @@ impl ClaudeDriver {
                         continue;
                     };
                     if !is_current(&event, accept_after) {
-                        debug!(
-                            "agent '{}': ignored a hook event from before this turn's launch",
-                            agent.name
-                        );
+                        // The old process's: not this turn's reply, but a
+                        // Stop with a message is work the session finished
+                        // on its own, spoken as such.
+                        match classify_hook(&event.payload) {
+                            HookKind::Stop { message: Some(m), .. } if !m.trim().is_empty() => {
+                                debug!(
+                                    "agent '{}': a Stop from before this turn's launch is the \
+                                     session's own reply",
+                                    agent.name
+                                );
+                                updates.send(TurnUpdate::SessionReply(m));
+                            }
+                            _ => debug!(
+                                "agent '{}': ignored a hook event from before this turn's launch",
+                                agent.name
+                            ),
+                        }
                         continue;
                     }
                     match classify_hook(&event.payload) {
@@ -980,7 +1042,7 @@ impl ClaudeDriver {
                             "agent '{}': turn done without a Stop hook; read the transcript",
                             agent.name
                         );
-                        return TurnOutcome::Reply(text);
+                        return TurnOutcome::PolledReply(text);
                     }
                     // `done` before this turn wrote anything: the previous
                     // turn's state for a moment, or a turn that never ran.
@@ -1023,7 +1085,7 @@ impl ClaudeDriver {
                         PollState::Exited { state } => {
                             if state.as_deref() == Some("done") {
                                 if let Some(text) = transcript_reply(&session, since).await {
-                                    return TurnOutcome::Reply(text);
+                                    return TurnOutcome::PolledReply(text);
                                 }
                             }
                             if state.as_deref() == Some("failed") {
@@ -1100,7 +1162,7 @@ impl Driver for ClaudeDriver {
         };
         let (session, launched_at) = match launched {
             Ok(s) => s,
-            Err(message) => return TurnOutcome::Failed(message),
+            Err(outcome) => return outcome,
         };
         updates.send(TurnUpdate::Session(session.clone()));
         self.watch(
@@ -1161,22 +1223,54 @@ impl Driver for ClaudeDriver {
             return Ok(AgentPhase::Idle);
         };
         let list = list_sessions(agent).await?;
-        Ok(match poll_state(find_session(&list, bg_id).as_ref()) {
-            PollState::Working => AgentPhase::Working,
-            PollState::Blocked { .. } => AgentPhase::NeedsYou,
-            _ => AgentPhase::Idle,
-        })
+        Ok(listed_phase(&list, bg_id))
     }
 
-    fn idle_reply(&self, payload: &Value) -> Option<String> {
+    /// One `claude agents --json --all` per distinct `command` (it lists
+    /// every session), with a short timeout: `whisrs agent` waits on it.
+    async fn session_phases(
+        &self,
+        sessions: &[(std::sync::Arc<Agent>, SessionRef)],
+    ) -> Vec<Result<AgentPhase, String>> {
+        let mut lists: Vec<(String, Result<Vec<Value>, String>)> = Vec::new();
+        let mut phases = Vec::with_capacity(sessions.len());
+        for (agent, session) in sessions {
+            let Some(bg_id) = &session.bg_id else {
+                phases.push(Ok(AgentPhase::Idle));
+                continue;
+            };
+            if !lists.iter().any(|(command, _)| command == &agent.command) {
+                let list = list_sessions_within(agent, LIST_TIMEOUT).await;
+                lists.push((agent.command.clone(), list));
+            }
+            let list = lists
+                .iter()
+                .find(|(command, _)| command == &agent.command)
+                .map(|(_, list)| list);
+            phases.push(match list {
+                Some(Ok(list)) => Ok(listed_phase(list, bg_id)),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err("no session list".to_string()),
+            });
+        }
+        phases
+    }
+
+    async fn idle_event(&self, payload: &Value, session: &SessionRef) -> IdleEvent {
         match classify_hook(payload) {
             HookKind::Stop {
                 message: Some(message),
                 ..
-            } if !message.trim().is_empty() => Some(message),
-            _ => None,
+            } if !message.trim().is_empty() => IdleEvent::Reply(message),
+            HookKind::PermissionPrompt => IdleEvent::NeedsYou(notice(session).await),
+            _ => IdleEvent::Ignored,
         }
     }
+}
+
+/// What the session with `bg_id` does, from a `claude agents` listing.
+fn listed_phase(list: &[Value], bg_id: &str) -> AgentPhase {
+    idle_phase(find_session(list, bg_id).as_ref())
 }
 
 #[cfg(test)]
@@ -1302,6 +1396,35 @@ mod tests {
       {"pid":1522977,"cwd":"/home/u/whisrs","kind":"interactive","startedAt":4,"sessionId":"ddc53afe-477f","name":"whisrs-d9","status":"busy"}
     ]"#;
 
+    /// Measured on 2.1.301 (this branch's e2e): a turn that started `sleep
+    /// 30` in the background and replied lists `state: done` with `status:
+    /// busy` while the sleep runs. Between turns that is working (a new turn
+    /// would `claude stop` it and kill the task); for a running turn `done`
+    /// still ends it.
+    #[test]
+    fn a_background_task_keeps_the_session_working_between_turns() {
+        let list = parse_agent_list(
+            r#"[{"pid":1974658,"id":"0350dec6","cwd":"/proj","kind":"background","startedAt":1,"sessionId":"0350dec6-5eb2","name":"whisrs-jarvis","status":"busy","state":"done"}]"#,
+        )
+        .unwrap();
+        let listed = find_session(&list, "0350dec6").unwrap();
+        assert!(listed.busy);
+        assert_eq!(idle_phase(Some(&listed)), AgentPhase::Working);
+        assert_eq!(listed_phase(&list, "0350dec6"), AgentPhase::Working);
+        assert_eq!(poll_state(Some(&listed)), PollState::Done);
+        // Idle, waiting, exited and missing sessions are not working.
+        let list = parse_agent_list(LIST).unwrap();
+        assert_eq!(listed_phase(&list, "cc7a37cf"), AgentPhase::Idle);
+        assert_eq!(listed_phase(&list, "e237a624"), AgentPhase::NeedsYou);
+        assert_eq!(listed_phase(&list, "35622b7b"), AgentPhase::Idle);
+        assert_eq!(listed_phase(&list, "nope"), AgentPhase::Idle);
+        let exited_busy = ListedSession {
+            alive: false,
+            ..listed
+        };
+        assert_eq!(idle_phase(Some(&exited_busy)), AgentPhase::Idle);
+    }
+
     #[test]
     fn sessions_are_found_by_bg_id_only() {
         let list = parse_agent_list(LIST).unwrap();
@@ -1312,6 +1435,7 @@ mod tests {
                 state: Some("done".into()),
                 alive: true,
                 waiting_for: None,
+                busy: false,
             })
         );
         let blocked = find_session(&list, "e237a624").unwrap();
@@ -1353,6 +1477,7 @@ mod tests {
             state: Some(state.into()),
             alive,
             waiting_for: None,
+            busy: false,
         };
         assert_eq!(
             poll_state(Some(&listed("working", true))),
@@ -1547,21 +1672,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_stop_with_text_is_an_idle_reply() {
-        let driver = ClaudeDriver::new(Path::new("/w"), Path::new("/s"));
-        let stop = |m: &str| serde_json::json!({"session_id": "s", "hook_event_name": "Stop", "last_assistant_message": m});
-        assert_eq!(
-            driver.idle_reply(&stop("tests pass")).as_deref(),
-            Some("tests pass")
-        );
-        assert_eq!(driver.idle_reply(&stop("  ")), None);
-        assert_eq!(
-            driver.idle_reply(&serde_json::json!({"hook_event_name": "Notification", "notification_type": "permission_prompt"})),
-            None
-        );
-    }
-
-    #[test]
     fn hooks_match_by_stored_session_id_only() {
         let driver = ClaudeDriver::new(Path::new("/w"), Path::new("/s"));
         let session = SessionRef {
@@ -1704,12 +1814,14 @@ not json
 
     /// The old process of a resumed session can send its Stop while the
     /// resume launches: only a Stop received after the launch ends the turn.
+    /// The earlier one is work the session finished on its own, reported as
+    /// such (spoken as a follow-up), not dropped.
     #[tokio::test]
     async fn a_stop_from_before_the_launch_is_not_the_reply() {
         let fake = FakeClaude::new(&entry(Some(1), "working"));
         let driver = fast_driver(Duration::from_secs(3600), DONE_GRACE);
         let (hooks_tx, mut hooks) = mpsc::unbounded_channel();
-        let (updates, _rx) = TurnUpdates::channel();
+        let (updates, mut rx) = TurnUpdates::channel();
         let before = Instant::now();
         let launched = before + Duration::from_millis(5);
         hooks_tx.send(stop_event("STALE", before)).unwrap();
@@ -1727,6 +1839,11 @@ not json
             )
             .await;
         assert_eq!(outcome, TurnOutcome::Reply("fresh".into()));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            TurnUpdate::SessionReply("STALE".into())
+        );
+        assert!(rx.try_recv().is_err());
         // A turn watched again after a restart takes every event.
         assert!(is_current(&stop_event("x", before), None));
         assert!(!is_current(&stop_event("x", before), Some(launched)));
@@ -1849,7 +1966,12 @@ not json
         )
         .await
         .unwrap();
-        assert_eq!(outcome, TurnOutcome::Reply("from the transcript".into()));
+        // Read without the Stop hook: that hook may still come, and must not
+        // be spoken twice.
+        assert_eq!(
+            outcome,
+            TurnOutcome::PolledReply("from the transcript".into())
+        );
     }
 
     /// While a `done` poll waits for the Stop hook, other hook events are
@@ -1968,11 +2090,17 @@ not json
         let result = driver
             .next_turn(&fake.agent(), &fake.session(), "next", &updates)
             .await;
-        assert_eq!(
-            result.unwrap_err(),
-            format!("Agent 'jarvis': {STILL_WORKING}")
-        );
+        assert_eq!(result.unwrap_err(), TurnOutcome::Busy);
         assert!(!fake.calls().contains("stop"), "{}", fake.calls());
+        // Done with a background task still running (`status: busy`): the
+        // same refusal, so the task is not killed by the stop.
+        let busy = entry(Some(1), "done").replace(r#""state":"#, r#""status":"busy","state":"#);
+        let fake_busy = FakeClaude::new(&busy);
+        let result = driver
+            .next_turn(&fake_busy.agent(), &fake_busy.session(), "next", &updates)
+            .await;
+        assert_eq!(result.unwrap_err(), TurnOutcome::Busy);
+        assert!(!fake_busy.calls().contains("stop"), "{}", fake_busy.calls());
         assert_eq!(
             driver.session_phase(&fake.agent(), &fake.session()).await,
             Ok(AgentPhase::Working)
@@ -1995,5 +2123,120 @@ not json
             driver.session_phase(&fake.agent(), &fake.session()).await,
             Ok(AgentPhase::Idle)
         );
+    }
+
+    /// A turn watched again after a restart that landed before its launch
+    /// printed a bg id: the launch may have started the session anyway, so
+    /// the message says whisrs lost track of it and does not invite the
+    /// instruction again.
+    #[tokio::test]
+    async fn a_restart_during_a_first_launch_does_not_invite_a_repeat() {
+        let fake = FakeClaude::new("[]");
+        let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(5));
+        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
+        let (updates, _rx) = TurnUpdates::channel();
+        let outcome = driver
+            .watch(
+                &fake.agent(),
+                SessionRef::default(),
+                Utc::now(),
+                None,
+                &mut hooks,
+                &updates,
+            )
+            .await;
+        let TurnOutcome::Failed(message) = outcome else {
+            panic!("expected a failure, got {outcome:?}");
+        };
+        assert_eq!(message, format!("Agent 'jarvis': {LOST_TRACK}"));
+        assert!(message.contains("may still be running"), "{message}");
+        assert!(!message.contains("say it again"), "{message}");
+        assert_eq!(
+            crate::agent::spoken::spoken_error(&message),
+            "Whisrs lost track of that turn after a restart, and it may still be running."
+        );
+        // Nothing was asked of Claude Code: no session is looked up by name.
+        assert_eq!(fake.calls(), "");
+    }
+
+    /// With no whisrs turn running, a Stop is the session's own reply and a
+    /// permission prompt is the work it does on its own waiting for the
+    /// user. Anything else is ignored.
+    #[tokio::test]
+    async fn idle_events_are_replies_or_permission_prompts() {
+        let fake = FakeClaude::new("[]");
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let session = fake.session();
+        let stop = stop_event("on its own", Instant::now()).payload;
+        assert_eq!(
+            driver.idle_event(&stop, &session).await,
+            IdleEvent::Reply("on its own".into())
+        );
+        let prompt = serde_json::json!({
+            "session_id": "abc12345-1111",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+        });
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+        std::fs::write(
+            fake.dir.path().join("transcript.jsonl"),
+            format!("{line}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            driver.idle_event(&prompt, &session).await,
+            IdleEvent::NeedsYou("Waiting for your approval to use Bash.".into())
+        );
+        let idle = serde_json::json!({
+            "session_id": "abc12345-1111",
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+        });
+        assert_eq!(driver.idle_event(&idle, &session).await, IdleEvent::Ignored);
+        let empty = stop_event("  ", Instant::now()).payload;
+        assert_eq!(
+            driver.idle_event(&empty, &session).await,
+            IdleEvent::Ignored
+        );
+    }
+
+    /// `whisrs agent` asks `claude agents` once for every agent (it lists
+    /// every session), not once per agent.
+    #[tokio::test]
+    async fn the_list_asks_claude_once_for_every_agent() {
+        let list = r#"[
+            {"pid":1,"id":"abc12345","kind":"background","sessionId":"abc12345-1111","state":"working"},
+            {"pid":2,"id":"def67890","kind":"background","sessionId":"def67890-2222","state":"blocked"},
+            {"id":"0a1b2c3d","kind":"background","sessionId":"0a1b2c3d-3333","state":"done"}
+        ]"#;
+        let fake = FakeClaude::new(list);
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let agent = std::sync::Arc::new(fake.agent());
+        let bg = |id: &str| SessionRef {
+            bg_id: Some(id.into()),
+            ..SessionRef::default()
+        };
+        let sessions = vec![
+            (std::sync::Arc::clone(&agent), bg("abc12345")),
+            (std::sync::Arc::clone(&agent), bg("def67890")),
+            (std::sync::Arc::clone(&agent), bg("0a1b2c3d")),
+            (std::sync::Arc::clone(&agent), bg("gone0000")),
+            (std::sync::Arc::clone(&agent), SessionRef::default()),
+        ];
+        let phases = driver.session_phases(&sessions).await;
+        assert_eq!(
+            phases,
+            vec![
+                Ok(AgentPhase::Working),
+                Ok(AgentPhase::NeedsYou),
+                Ok(AgentPhase::Idle),
+                Ok(AgentPhase::Idle),
+                Ok(AgentPhase::Idle),
+            ]
+        );
+        let calls = fake.calls();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        assert_eq!(calls.trim(), "agents --json --all");
     }
 }

@@ -242,6 +242,12 @@ pub(crate) async fn speak_text(
         if ds.state_machine.state() != State::Idle {
             return SpeakAttempt::NotIdle(ds.state_machine.state());
         }
+        // An agent reply also waits for a recording and a command press
+        // ([`crate::agent::replies_held`]). Checked under the lock those
+        // take their hold under, so a reply cannot start in between.
+        if origin == SpeakOrigin::Agent && crate::agent::replies_held(&context) {
+            return SpeakAttempt::NotIdle(ds.state_machine.state());
+        }
         let _ = ds.state_machine.transition(Action::SpeakStart);
         ds.tts_stop = Some(Arc::clone(&stop));
         ds.tts_origin = Some(origin);

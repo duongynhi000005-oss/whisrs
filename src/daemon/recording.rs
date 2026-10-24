@@ -881,6 +881,10 @@ async fn start(
     if let Some(session) = slot.as_ref() {
         bail!("a recording is already in progress ({})", session.meta.id);
     }
+    // Agent replies are held from here, not only once the devices are open,
+    // and one playing is stopped and plays after the recording: it would
+    // land on the system track.
+    let _replies = crate::agent::hold_for_recording(context).await;
 
     let recording_cfg = RecordingConfig::effective(&context.config);
     let root = recordings_root(&context.config);
@@ -4510,6 +4514,29 @@ mod tests {
             .unwrap_or_else(|| panic!("{signature} not found"));
         let rest = &code[start..];
         &rest[..rest.find("\n}").expect("the fn ends")]
+    }
+
+    /// A recording start holds agent replies (and stops one playing) before
+    /// anything that can take a while: the free-space check, the device
+    /// lookup and opening the tracks. Not only once its devices are open.
+    #[test]
+    fn a_recording_start_holds_agent_replies_first() {
+        // This file has a test-only item before its test module, so it is
+        // cut at the module itself.
+        let source = include_str!("recording.rs");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let body = fn_body(code, "async fn start(");
+        let hold = body
+            .find("crate::agent::hold_for_recording(context)")
+            .expect("start holds agent replies");
+        for later in ["check_space_to_start(", "resolve_system)", "open_tracks)"] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} not found"));
+            assert!(hold < at, "the hold comes after {later}");
+        }
+        // Bound to a name, so it lives until the start returns.
+        assert!(body.contains("let _replies = crate::agent::hold_for_recording"));
     }
 
     /// Dictation and voice-command toasts never say "recording", the

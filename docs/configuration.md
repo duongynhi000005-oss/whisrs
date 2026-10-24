@@ -640,30 +640,40 @@ How a turn goes:
 - The reply is spoken when whisrs is idle. A reply that arrives while you
   dictate waits for the dictation to finish, and one that arrives during a
   `whisrs recording` waits until the recording stops (it would play into the
-  call and land on the recording). Several replies queue up.
+  call and land on the recording). A reply still playing when a recording
+  starts is stopped and plays again once the recording stops. Several replies
+  queue up.
+- A voice instruction with nothing in it (too short, silent, or nothing
+  recognized) is not sent, and whisrs says "I didn't catch that." A failed
+  transcription is spoken too, in a short sentence, so both are heard with
+  notifications off.
 - Pressing the agent's hotkey while a reply plays stops it and starts
   recording, so answering the agent is one press. A dictation toggle,
   `whisrs command` or an `[[llm_commands]]` hotkey also stops an agent reply
   and goes ahead (a selection read-aloud still has to finish or be cancelled
   first). `whisrs cancel` while a reply plays also drops the replies queued
   after it.
-- A press while that agent is still working is refused with a short "Still
-  working on the last one." Other agents can run at the same time; only one
-  recording exists at a time.
+- A press while that agent's turn is still running is refused with a short
+  "Still working on the last one." Other agents can run at the same time; only
+  one recording exists at a time.
 - The session can also work on its own: when a command it started in the
   background finishes, Claude Code goes on without you. Its reply is spoken
   like any other, and while it works `whisrs agent` shows it as working and a
-  new turn is refused rather than stopping that work. Claude Code counts a
-  session as working for as long as one of its background commands runs, so a
-  long-running one (a dev server) keeps refusing turns until it ends; `whisrs
-  agent <name> --stop` stops it.
+  new turn is refused rather than stopping that work: whisrs says "It's still
+  running a background task." Claude Code counts a session as working for as
+  long as one of its background commands runs, so a long-running one (a dev
+  server) keeps refusing turns until it ends. To go on, run `whisrs agent
+  <name> --stop`, which stops the session and ends that task with it, then
+  send the instruction again. A refused instruction is never sent; with
+  `[general] notify` on, the notification repeats it so you can send it again.
 - When a turn fails (the session ended, `claude` was not found, the folder is
   not trusted), whisrs says so in a short sentence and, with `[general] notify`
   on, shows the full message as a notification.
 - When the agent waits for a permission prompt, `whisrs agent` shows it as
-  needs-you and whisrs says so ("Waiting for your approval to use Bash."). The
-  next turn you send replaces the waiting one. To approve the prompt itself,
-  open the session in Claude Code (`claude attach <id>`).
+  needs-you and whisrs says so ("Waiting for your approval to use Bash."), for
+  a turn you sent and for work the session does on its own alike. The next
+  turn you send replaces the waiting one. To approve the prompt itself, open
+  the session in Claude Code (`claude attach <id>`).
 
 The spoken reply. whisrs asks the agent to end every final message with a short
 reply inside `<spoken></spoken>` tags, written to be heard (`reply_instruction`
@@ -693,7 +703,11 @@ Sessions. Each agent's session is a Claude Code background session named
 `~/.local/share/whisrs/agents.json` and only ever stops, resumes or reads
 sessions it started, by those ids; your other sessions are never touched.
 Sessions outlive the daemon: a turn that is still running when `whisrsd`
-restarts is watched again, so its reply is still spoken. A session you delete
+restarts is watched again, so its reply is still spoken. A restart that lands
+while a new session is being started, before whisrs learned its id, leaves a
+session whisrs cannot find without matching it by name, which it never does:
+it says it lost track of that turn, which may still be running (`claude agents`
+lists it). A session you delete
 (`claude rm`) is forgotten, and the next turn starts a new one. Changing an
 agent's `harness` or `dir` starts a new session too.
 

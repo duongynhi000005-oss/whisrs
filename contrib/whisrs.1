@@ -147,8 +147,9 @@ forgets the session (with
 .BR \-\-text ,
 starts a new one with it).
 .B \-\-stop
-stops the running turn (or work the session does on its own) and keeps the
-session. whisrs only ever touches sessions it started.
+stops the running turn and keeps the session. With no turn running it stops
+work the session does on its own, such as a background task it started, which
+refuses new turns until it ends. whisrs only ever touches sessions it started.
 .TP
 .B status
 Query the dictation state (for a recording, see

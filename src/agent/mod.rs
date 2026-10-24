@@ -365,10 +365,15 @@ pub struct AgentInfo {
     pub bg_id: Option<String>,
 }
 
-/// The refusal for a turn while the agent is still working: its own turn,
-/// or work its session does on its own (a follow-up after a background
-/// command). Spoken and notified.
+/// The refusal for a turn while the agent's whisrs turn is still running.
+/// Spoken and notified.
 pub const STILL_WORKING: &str = "Still working on the last one.";
+
+/// The refusal for a turn while the agent's session works on its own, with
+/// no whisrs turn running (a background task it started, or a follow-up
+/// after one). Spoken and notified; `whisrs agent <name> --stop` ends that
+/// work.
+pub const BACKGROUND_TASK: &str = "It's still running a background task.";
 
 // ---------------------------------------------------------------------------
 // Driver abstraction
@@ -410,16 +415,42 @@ pub enum TurnUpdate {
     NeedsYou(String),
     /// The turn is running again after a wait.
     Working,
+    /// A reply the session's old process produced on its own before this
+    /// turn's launch (work it finished by itself, like a follow-up after a
+    /// background command): not this turn's reply, but spoken as one the
+    /// session produced on its own. The text is the raw final message.
+    SessionReply(String),
 }
 
 /// How a turn ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnOutcome {
-    /// The agent's final message, raw (the runtime turns it into speech).
+    /// The agent's final message, raw (the runtime turns it into speech),
+    /// from the harness's end-of-turn event.
     Reply(String),
+    /// The final message, read without the end-of-turn event (a poll found
+    /// the turn done). That event can still arrive after the turn ended,
+    /// carrying the same message, and is then not spoken twice.
+    PolledReply(String),
+    /// The session works on its own (no whisrs turn running), so the turn
+    /// was not sent: stopping that work for it would lose it.
+    Busy,
     /// The turn could not run or did not finish. The text is actionable and
     /// goes to a notification as-is.
     Failed(String),
+}
+
+/// What a hook event for one of our sessions means while no whisrs turn
+/// runs ([`Driver::idle_event`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdleEvent {
+    /// The session finished work it did on its own: its raw final message.
+    Reply(String),
+    /// Work the session does on its own waits for a permission prompt. The
+    /// text is a short spoken notice.
+    NeedsYou(String),
+    /// Anything else.
+    Ignored,
 }
 
 /// A hook payload as the runtime routes it, with when the daemon received
@@ -565,10 +596,19 @@ pub trait Driver: Send + Sync {
         session: &SessionRef,
     ) -> Result<AgentPhase, String>;
 
-    /// The final message in a hook payload that arrives while no whisrs
-    /// turn runs: the session finished work it did on its own, and the
-    /// runtime speaks it like a reply. `None` for any other event.
-    fn idle_reply(&self, payload: &serde_json::Value) -> Option<String>;
+    /// [`Driver::session_phase`] for several agents at once (`whisrs
+    /// agent`), one answer per entry in order. A harness that lists every
+    /// session in one call asks once, not once per agent.
+    async fn session_phases(
+        &self,
+        sessions: &[(Arc<Agent>, SessionRef)],
+    ) -> Vec<Result<AgentPhase, String>>;
+
+    /// What a hook payload for `session` means while no whisrs turn runs:
+    /// the final message of work the session finished on its own (spoken
+    /// like a reply), a permission prompt that work waits on (needs-you), or
+    /// nothing.
+    async fn idle_event(&self, payload: &serde_json::Value, session: &SessionRef) -> IdleEvent;
 }
 
 #[cfg(test)]
