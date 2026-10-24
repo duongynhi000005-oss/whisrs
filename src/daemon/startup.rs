@@ -136,6 +136,7 @@ fn default_config() -> Config {
         hotkeys: None,
         hooks: None,
         llm_commands: Vec::new(),
+        agents: Vec::new(),
         replacements: Default::default(),
         recording: None,
         overlay: None,

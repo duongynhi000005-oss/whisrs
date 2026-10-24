@@ -15,7 +15,7 @@
 
 **Voice for the Linux desktop, written in Rust: dictation, read-aloud, and voice-driven LLM commands.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record your mic and the system audio too: both become one timestamped Markdown transcript, kept in its own folder.
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor, or talk to a coding agent: Claude Code works on it in the background and answers out loud. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record your mic and the system audio too: both become one timestamped Markdown transcript, kept in its own folder.
 
 ![whisrs demo: dictation, read aloud, and command mode](assets/demo.gif)
 
@@ -237,6 +237,8 @@ whisrs command   # Command mode: select text + speak instruction → LLM rewrite
 whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see config.toml)
 whisrs llm-command-set <name>  # Reprogram a named LLM command from the current selection
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
+whisrs speak --text "Hi"       # Speak the given text (--text - reads stdin)
+whisrs agent jarvis            # Talk to a coding agent (see [[agents]]); --text, --new, --stop; no name lists them
 whisrs recording start -t "Standup"   # Record mic + system audio; stop | toggle | cancel | status
 whisrs recording show last            # Print the latest recording's transcript (list | path | copy | retry)
 whisrs recording summarize last       # Summarize a transcript with the [llm] (or [recording] summary = true for each)
@@ -266,6 +268,20 @@ Three ways to put an LLM between your voice and the cursor, all sharing the one 
 `llm_post_process` works with **batch backends only** (`deepgram`, `groq`, `openai`, `asr-sidecar`). Streaming backends (including `local-whisper`) type text as it arrives, so no whole transcript ever exists to post-process and the flag is a silent no-op; `whisrsd` warns at startup if you pair them. Use an `[[llm_commands]]` hotkey instead, which works whatever the backend.
 
 If the LLM call fails, times out, or returns nothing, the raw transcript is typed instead, so a dictation is never lost to post-processing. Post-processed entries show up in `whisrs log` tagged `<backend>+llm`. Full reference: [docs/configuration.md](docs/configuration.md).
+
+### Voice + coding agent
+
+An `[[agents]]` entry gives a coding agent its own hotkey. Press it, say what you want, press again: whisrs sends it to a Claude Code background session in the agent's directory and goes back to dictation. When the turn ends, you hear a short spoken reply (through `[tts]`), and the next press continues the same session, so answering the agent's question is one press. Press it while a reply plays to cut in.
+
+```toml
+[[agents]]
+name = "jarvis"
+hotkey = "Super+Shift+J"
+dir = "~/Projects/whisrs"
+permissions = "auto"   # auto | bypass | ask
+```
+
+`whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn. Sessions show up in `claude agents` as `whisrs-<name>`, and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
 
 ---
 

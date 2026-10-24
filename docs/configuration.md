@@ -395,7 +395,9 @@ hotkey = "Super+Shift+T"           # run: dictate -> LLM -> type
 set_hotkey = "Super+Shift+Alt+T"   # reprogram: select new instruction, press
 instruction = "Translate the following text into German, using the friendly informal 'du' form and a warm, casual tone. Return only the translated text — no explanations, no quotes."
 
-# Text-to-speech: read the current selection aloud (`whisrs speak`).
+# Text-to-speech: read the current selection aloud (`whisrs speak`), or the
+# text you give it (`whisrs speak --text "..."`, `--text -` for stdin), and
+# speak agent replies (see [[agents]] below).
 # Opt-in. model/voice are optional; each backend has its own default,
 # so switching `backend` works without re-editing model/voice.
 [tts]
@@ -411,6 +413,22 @@ response_format = "wav"     # audio format requested from the API
 #                           #   ([groq]/[openai]/[deepgram]). tts-sidecar needs none.
 # url = "http://127.0.0.1:8880/v1/audio/speech"  # tts-sidecar only: local
 #                           #   OpenAI-compatible server (Kokoro, Supertonic, ...)
+
+# Agent mode (optional): talk to a coding agent by voice. Each entry is one
+# agent working in one directory. Its replies are spoken through [tts] above
+# (enable it), and shown as a notification when [general] notify is on. See
+# "Agent mode" below.
+# [[agents]]
+# name = "jarvis"                # required, unique: lowercase letters, digits, - and _
+# hotkey = "Super+Shift+J"       # optional: records a voice turn, same syntax as [hotkeys]
+# harness = "claude"             # claude (Claude Code) is the one supported today
+# dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist
+# permissions = "auto"           # auto (default) | bypass | ask
+# command = "claude"             # optional: the binary. Set its full path when the
+#                                #   daemon's PATH lacks it (a systemd user service often
+#                                #   has no ~/.local/bin)
+# args = ["--model", "sonnet"]   # optional: extra arguments for the first turn of a session
+# reply_instruction = "..."      # optional: replaces the built-in voice instruction
 
 # Recording (optional). Records your mic and the system audio as two tracks,
 # then transcribes them after you stop. Every key is optional; see "Recording"
@@ -458,7 +476,8 @@ audio_retention_days = 7      # 0 = delete audio once transcribed, negative = ke
 #   Keys are not grabbed: the press still reaches the system, so ScrollLock
 #   still toggles its LED.
 # Two bindings sharing a combo both fire on one press, so whisrs warns at
-#   startup when it finds a duplicate across [hotkeys] and [[llm_commands]].
+#   startup when it finds a duplicate across [hotkeys], [[llm_commands]] and
+#   [[agents]].
 [hotkeys]
 toggle = "Super+Shift+W"
 cancel = "Super+Shift+D"
@@ -573,6 +592,103 @@ terminal, each run of line breaks becomes a single space, whether the text is
 typed or pasted. A `clipboard_only` copy keeps its line breaks. This uses the
 same terminal detection, so it does not fire on KDE and GNOME. Control characters such as Escape and Backspace are removed from
 everything whisrs types, pastes or copies, wherever it is going.
+
+## Agent mode
+
+Agent mode lets you talk to a coding agent. Press an agent's hotkey (or run
+`whisrs agent <name>`), say what you want, and press again. whisrs sends the
+words to a Claude Code session working in that agent's `dir`, and when the turn
+ends it speaks a short reply. The next press continues the same session, so you
+can answer the question the agent asked or make the decision it needs.
+
+```toml
+[tts]
+enabled = true
+backend = "groq"
+
+[[agents]]
+name = "jarvis"
+hotkey = "Super+Shift+J"
+dir = "~/Projects/whisrs"
+```
+
+```
+whisrs agent                       # list the agents: name, harness, idle | working | needs-you, session
+whisrs agent jarvis                # record a voice turn (same as the hotkey; press again to stop)
+whisrs agent jarvis --text "..."   # send a typed turn (`--text -` reads stdin)
+whisrs agent jarvis --new          # forget the session; with --text, start a new one with it
+whisrs agent jarvis --stop         # stop the running turn and keep the session
+```
+
+What you need:
+
+- Claude Code (`claude`), logged in. Tested on 2.1.301; it needs a version
+  whose `claude --bg --resume` continues a session in place (2.1.257 or later).
+- The agent's `dir` trusted in Claude Code: background sessions refuse a
+  directory you never trusted. Open it with `claude` once and accept the trust
+  prompt. whisrs tells you so when it hits this.
+- `[tts] enabled = true` to hear the replies. Without it they arrive as
+  notifications only, and `whisrsd` warns at startup.
+
+How a turn goes:
+
+- The voice instruction is recorded like command mode's: the overlay, the
+  cues, the silence auto-stop, and every transcription backend. Dictation is
+  back to normal as soon as the transcript is ready, while the agent works.
+- The reply is spoken when whisrs is idle. A reply that arrives while you
+  dictate waits for the dictation to finish. Several replies queue up.
+- Pressing the agent's hotkey while a reply plays stops it and starts
+  recording, so answering the agent is one press.
+- A press while that agent is still working is refused with a short "Still
+  working on the last one." Other agents can run at the same time; only one
+  recording exists at a time.
+- When the agent waits for a permission prompt, `whisrs agent` shows it as
+  needs-you and whisrs says so ("Waiting for your approval to use Bash."). The
+  next turn you send replaces the waiting one. To approve the prompt itself,
+  open the session in Claude Code (`claude attach <id>`).
+
+The spoken reply. whisrs asks the agent to end every final message with a short
+reply inside `<spoken></spoken>` tags, written to be heard (`reply_instruction`
+replaces that instruction). It does not rely on the model: it takes the last
+`<spoken>` block, or the first two sentences when there is none, drops code,
+links, file paths and markdown, and caps it at 400 characters. Anything outside
+the tags stays in the session for when you look at it. When nothing speakable
+is left, it says "Done."
+
+`permissions` maps to Claude Code's permission modes:
+
+| `permissions` | Claude Code |
+|---|---|
+| `auto` (default) | `--permission-mode auto` |
+| `bypass` | `--permission-mode bypassPermissions` |
+| `ask` | `--permission-mode default`: asks before acting, even when your own default mode is `auto` |
+
+`permissions` and `args` are passed when a session starts. A later turn resumes
+the session with the options it was started with, so a change applies from the
+next new session (`whisrs agent <name> --new`).
+
+Sessions. Each agent's session is a Claude Code background session named
+`whisrs-<name>`: it shows up in `claude agents`, and `claude attach <id>` opens it
+(the id is the one `whisrs agent` shows). whisrs keeps its session ids in
+`~/.local/share/whisrs/agents.json` and only ever stops, resumes or reads
+sessions it started, by those ids; your other sessions are never touched.
+Sessions outlive the daemon: a turn that is still running when `whisrsd`
+restarts is watched again, so its reply is still spoken. A session you delete
+(`claude rm`) is forgotten, and the next turn starts a new one. Changing an
+agent's `harness` or `dir` starts a new session too.
+
+How whisrs hears the end of a turn: it starts sessions with `--settings`
+holding a `Stop` hook and a permission-prompt `Notification` hook, both running
+`whisrs agent-hook`, which forwards the event to the daemon and always exits
+within two seconds. Your own Claude Code settings are not changed. While a turn
+runs, whisrs also checks `claude agents` every ten seconds, which covers a
+missed hook.
+
+`claude` runs in the agent's `dir` with the daemon's environment, minus the
+variables a parent Claude Code session sets (so a daemon started from inside
+one works) and whisrs's own `WHISRS_*` keys. If no Claude Code background
+service is running yet, the first `claude --bg` starts one, and it keeps that
+environment for every background session it hosts until it exits.
 
 ## Choosing the microphone
 

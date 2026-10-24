@@ -16,6 +16,12 @@ pub(crate) fn truncate_preview(text: &str, max_bytes: usize) -> String {
 }
 
 pub(crate) fn send_notification(summary: &str, body: &str) {
+    send_notification_for(summary, body, 2000);
+}
+
+/// [`send_notification`] that stays up for `timeout_ms` (an agent's reply is
+/// longer than a progress toast).
+pub(crate) fn send_notification_for(summary: &str, body: &str, timeout_ms: u32) {
     let summary = summary.to_string();
     let body = body.to_string();
     // Run on a blocking thread to avoid D-Bus block_on conflict with ksni tray.
@@ -24,7 +30,7 @@ pub(crate) fn send_notification(summary: &str, body: &str) {
             .summary(&summary)
             .body(&body)
             .appname("whisrs")
-            .timeout(notify_rust::Timeout::Milliseconds(2000))
+            .timeout(notify_rust::Timeout::Milliseconds(timeout_ms))
             .show()
         {
             warn!("failed to send notification: {e}");

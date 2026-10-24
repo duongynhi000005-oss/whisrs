@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::agent::{AgentAction, AgentInfo};
 use crate::history;
 use crate::recording::{RecordingAction, RecordingOptions, RecordingStatus};
 
@@ -55,6 +56,32 @@ pub enum Command {
     /// stops any in-progress playback.
     #[serde(alias = "read")]
     Speak,
+    /// Speak the given text via TTS (`whisrs speak --text`). A variant of its
+    /// own, not a field on `Speak`: a daemon that predates it must answer
+    /// with an error, never read the selection instead. Stops a read-aloud in
+    /// progress first.
+    #[serde(rename = "speak-text")]
+    SpeakText {
+        text: String,
+    },
+    /// Agent mode (`[[agents]]`). `name` is required by every action but
+    /// `list`; `text` is the typed instruction of `send`; `new` on `send`
+    /// starts a new session first.
+    Agent {
+        action: AgentAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        new: bool,
+    },
+    /// A harness hook event, forwarded by `whisrs agent-hook` (the payload is
+    /// the hook's stdin JSON, as the harness wrote it).
+    #[serde(rename = "agent-event")]
+    AgentEvent {
+        payload: serde_json::Value,
+    },
     /// The recording feature: record mic + system audio, then transcribe.
     /// `title` names a new recording (`start`/`toggle`); `id` selects an
     /// existing one (`retry`/`copy`/`name`). `options` (flat on the wire:
@@ -96,6 +123,41 @@ pub enum Response {
     Recording {
         recording: RecordingStatus,
     },
+    /// Agent rows after an `agent` command (`list`, `send`).
+    Agents {
+        agents: Vec<AgentInfo>,
+    },
+}
+
+impl Command {
+    /// The command for the daemon's log: the new text-carrying commands are
+    /// summarized, so an agent's reply or a hook payload is not logged whole.
+    pub fn log_summary(&self) -> String {
+        match self {
+            Command::SpeakText { text } => {
+                format!("SpeakText {{ {} chars }}", text.chars().count())
+            }
+            Command::Agent {
+                action,
+                name,
+                text,
+                new,
+            } => format!(
+                "Agent {{ action: {action:?}, name: {name:?}, text: {}, new: {new} }}",
+                text.as_ref()
+                    .map(|t| format!("{} chars", t.chars().count()))
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            Command::AgentEvent { payload } => format!(
+                "AgentEvent {{ {} }}",
+                payload
+                    .get("hook_event_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+            ),
+            other => format!("{other:?}"),
+        }
+    }
 }
 
 /// Daemon state.
@@ -664,5 +726,114 @@ mod tests {
         assert!(
             matches!(idle, Response::Recording { recording } if recording == RecordingStatus::default())
         );
+    }
+
+    /// `speak-text` is its own command: it never parses as `speak` (which a
+    /// daemon would answer by reading the selection), and `speak` stays a
+    /// plain read-aloud.
+    #[test]
+    fn speak_text_is_not_confused_with_speak() {
+        let cmd = Command::SpeakText {
+            text: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"cmd":"speak-text","text":"hello"}"#);
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Command::SpeakText { text } if text == "hello"));
+        assert!(matches!(
+            serde_json::from_str::<Command>(r#"{"cmd":"speak"}"#).unwrap(),
+            Command::Speak
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Command>(r#"{"cmd":"read"}"#).unwrap(),
+            Command::Speak
+        ));
+        // A speak-text without its text is malformed, not a read-aloud.
+        assert!(serde_json::from_str::<Command>(r#"{"cmd":"speak-text"}"#).is_err());
+    }
+
+    #[test]
+    fn agent_command_wire_format() {
+        let list = Command::Agent {
+            action: AgentAction::List,
+            name: None,
+            text: None,
+            new: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&list).unwrap(),
+            r#"{"cmd":"agent","action":"list"}"#
+        );
+        let send = Command::Agent {
+            action: AgentAction::Send,
+            name: Some("jarvis".to_string()),
+            text: Some("run the tests".to_string()),
+            new: true,
+        };
+        let json = serde_json::to_string(&send).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"agent","action":"send","name":"jarvis","text":"run the tests","new":true}"#
+        );
+        let parsed: Command = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Command::Agent { action: AgentAction::Send, name: Some(n), text: Some(t), new: true }
+                if n == "jarvis" && t == "run the tests"
+        ));
+        for (wire, action) in [
+            ("toggle", AgentAction::Toggle),
+            ("reset", AgentAction::Reset),
+            ("stop", AgentAction::Stop),
+        ] {
+            let json = format!(r#"{{"cmd":"agent","action":"{wire}","name":"jarvis"}}"#);
+            let parsed: Command = serde_json::from_str(&json).unwrap();
+            assert!(
+                matches!(parsed, Command::Agent { action: a, new: false, text: None, .. } if a == action),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_event_carries_the_payload_verbatim() {
+        let json = r#"{"cmd":"agent-event","payload":{"session_id":"s1","hook_event_name":"Stop","last_assistant_message":"done"}}"#;
+        let parsed: Command = serde_json::from_str(json).unwrap();
+        let Command::AgentEvent { payload } = &parsed else {
+            panic!("not an agent event: {parsed:?}");
+        };
+        assert_eq!(payload["last_assistant_message"], "done");
+        let back: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(
+            back,
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+        // The log line names the event, not the message.
+        assert_eq!(parsed.log_summary(), "AgentEvent { Stop }");
+        let speak = Command::SpeakText {
+            text: "secret reply".to_string(),
+        };
+        assert_eq!(speak.log_summary(), "SpeakText { 12 chars }");
+    }
+
+    #[test]
+    fn agents_response_roundtrip() {
+        use crate::agent::AgentPhase;
+        let resp = Response::Agents {
+            agents: vec![AgentInfo {
+                name: "jarvis".to_string(),
+                harness: "claude".to_string(),
+                phase: AgentPhase::Working,
+                session: Some("cc7a37cf".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"agents","agents":[{"name":"jarvis","harness":"claude","phase":"working","session":"cc7a37cf"}]}"#
+        );
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Agents { agents } if agents.len() == 1));
     }
 }

@@ -189,6 +189,7 @@ fn default_config() -> Config {
         hooks: None,
         overlay: None,
         llm_commands: Vec::new(),
+        agents: Vec::new(),
         replacements: Default::default(),
         recording: None,
     }

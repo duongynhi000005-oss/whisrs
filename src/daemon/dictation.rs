@@ -466,7 +466,8 @@ fn discard_recording_session(ds: &mut DaemonState) {
     ds.session_language = None;
 }
 
-/// Take both command-session context slots (command mode and llm-command),
+/// Take every command-session context slot (command mode, llm-command and
+/// an agent's voice turn),
 /// logging any session actually discarded. `reason` names the trigger in the
 /// log line ("cancel", "toggle-stop").
 ///
@@ -482,6 +483,9 @@ pub(crate) fn discard_command_sessions(ds: &mut DaemonState, reason: &str) {
     }
     if let Some(cmd) = ds.llm_command.take() {
         info!("{reason}: discarded llm-command '{}' session", cmd.name);
+    }
+    if let Some(agent) = ds.agent_recording.take() {
+        info!("{reason}: discarded agent '{}' voice turn", agent.name);
     }
 }
 

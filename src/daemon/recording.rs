@@ -168,6 +168,8 @@ pub(crate) enum DictationStart<'a> {
     CommandMode,
     /// A named `[[llm_commands]]` entry.
     LlmCommand(&'a str),
+    /// An agent's voice turn (`[[agents]]`).
+    Agent(&'a str),
 }
 
 /// Refuse `start` while a recording is in progress, returning the error to
@@ -192,6 +194,7 @@ pub(crate) fn refuse_while_recording(
         DictationStart::Dictation => ("dictation".to_string(), "Dictation".to_string()),
         DictationStart::CommandMode => ("command mode".to_string(), "Command mode".to_string()),
         DictationStart::LlmCommand(name) => (format!("llm-command '{name}'"), format!("'{name}'")),
+        DictationStart::Agent(name) => (format!("agent '{name}'"), format!("Agent '{name}'")),
     };
     info!("{what} not started: a recording is in progress");
     let message = format!("A recording is in progress. {subject} is off until you stop it.");
@@ -2844,6 +2847,7 @@ mod tests {
             overlay_level_tx: None,
             overlay_enabled: false,
             recording,
+            agents: crate::agent::AgentRuntime::disabled(),
         };
         (Arc::new(context), queue_rx)
     }

@@ -94,7 +94,39 @@ enum SubCmd {
     },
     /// Read the selected text aloud via TTS (press again to stop playback)
     #[command(alias = "read")]
-    Speak,
+    Speak {
+        /// Speak this text instead of the selection (`-` reads it from
+        /// stdin). Stops a read-aloud in progress first
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        text: Option<String>,
+    },
+    /// Talk to a coding agent (see [[agents]] in config.toml). With no name,
+    /// list the agents. With a name, record a voice instruction for it (same
+    /// as its hotkey; press again to stop), or send --text. The reply is
+    /// spoken when the turn ends, and the next turn continues the session
+    Agent {
+        /// The [[agents]] entry
+        name: Option<String>,
+        /// Send this instruction instead of recording one (`-` reads it from
+        /// stdin)
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        text: Option<String>,
+        /// Forget the session; with --text, start a new one with it
+        #[arg(long)]
+        new: bool,
+        /// Stop the running turn and keep the session
+        #[arg(long, conflicts_with_all = ["text", "new"])]
+        stop: bool,
+    },
+    /// Forward a coding-agent hook event to the daemon (run by the hooks
+    /// whisrs installs in the sessions it starts). Always exits 0, within two
+    /// seconds
+    #[command(name = "agent-hook", hide = true)]
+    AgentHook {
+        /// The daemon socket (default: the usual one)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<std::path::PathBuf>,
+    },
     /// Restart the whisrs daemon (uses the systemd or OpenRC user service when present)
     Restart,
     /// Record your mic and the system audio, then turn them into a transcript
@@ -384,9 +416,26 @@ async fn main() -> anyhow::Result<()> {
         SubCmd::LlmCommandSet { name } => {
             send_command(Command::SetLlmInstruction { name }).await?;
         }
-        SubCmd::Speak => {
+        SubCmd::Speak { text: None } => {
             send_command(Command::Speak).await?;
         }
+        SubCmd::Speak { text: Some(text) } => {
+            let text = text_arg(text);
+            send_command(Command::SpeakText { text }).await?;
+        }
+        SubCmd::Agent {
+            name,
+            text,
+            new,
+            stop,
+        } => {
+            let cmd = match agent_command(name, text.map(text_arg), new, stop) {
+                Ok(cmd) => cmd,
+                Err(message) => exit_with_error(&message),
+            };
+            send_command(cmd).await?;
+        }
+        SubCmd::AgentHook { socket } => cmd_agent_hook(socket).await,
         SubCmd::Restart => {
             cmd_restart()?;
         }
@@ -514,9 +563,125 @@ async fn send_command(cmd: Command) -> anyhow::Result<()> {
         Response::Recording { recording } => {
             println!("{}", format_recording_status(&recording, use_color));
         }
+        Response::Agents { agents } => print_agents(&agents, use_color),
         Response::Error { message } => exit_with_error(&message),
     }
 
+    Ok(())
+}
+
+/// A `--text` value: `-` reads stdin.
+fn text_arg(text: String) -> String {
+    if text != "-" {
+        return text;
+    }
+    use std::io::Read;
+    let mut buf = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+        exit_with_error(&format!("cannot read the text from stdin: {e}"));
+    }
+    // The newline `echo` ends it with is not part of the text.
+    buf.trim_end().to_string()
+}
+
+/// The IPC command for `whisrs agent [<name>] [--text T] [--new] [--stop]`.
+fn agent_command(
+    name: Option<String>,
+    text: Option<String>,
+    new: bool,
+    stop: bool,
+) -> Result<Command, String> {
+    use whisrs::agent::AgentAction;
+    let Some(name) = name else {
+        if text.is_some() || new || stop {
+            return Err("which agent? Pass its name: whisrs agent <name> ...".to_string());
+        }
+        return Ok(Command::Agent {
+            action: AgentAction::List,
+            name: None,
+            text: None,
+            new: false,
+        });
+    };
+    let (action, new) = match (&text, new, stop) {
+        (_, _, true) => (AgentAction::Stop, false),
+        (Some(_), new, false) => (AgentAction::Send, new),
+        (None, true, false) => (AgentAction::Reset, false),
+        (None, false, false) => (AgentAction::Toggle, false),
+    };
+    Ok(Command::Agent {
+        action,
+        name: Some(name),
+        text,
+        new,
+    })
+}
+
+/// `whisrs agent` rows: name, harness, state, short session id.
+fn print_agents(agents: &[whisrs::agent::AgentInfo], use_color: bool) {
+    use whisrs::agent::AgentPhase;
+    if agents.is_empty() {
+        println!("No agents configured. Add an [[agents]] entry to config.toml.");
+        return;
+    }
+    let name_width = agents
+        .iter()
+        .map(|a| a.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let harness_width = agents
+        .iter()
+        .map(|a| a.harness.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    for agent in agents {
+        let phase = agent.phase.to_string();
+        let phase = if use_color {
+            match agent.phase {
+                AgentPhase::Idle => format!("{BOLD}{phase:<9}{RESET}"),
+                AgentPhase::Working => format!("{BOLD}{YELLOW}{phase:<9}{RESET}"),
+                AgentPhase::NeedsYou => format!("{BOLD}{RED}{phase:<9}{RESET}"),
+            }
+        } else {
+            format!("{phase:<9}")
+        };
+        let session = agent.session.as_deref().unwrap_or("-");
+        println!(
+            "{:<name_width$}  {:<harness_width$}  {phase}  {session}",
+            agent.name, agent.harness
+        );
+    }
+}
+
+/// How long `whisrs agent-hook` may take in all.
+const AGENT_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_millis(1800);
+
+/// `whisrs agent-hook`: read the hook JSON on stdin and forward it to the
+/// daemon. Never blocks the harness: it prints nothing and exits 0 within
+/// [`AGENT_HOOK_BUDGET`], also when the daemon is down or the input is bad.
+async fn cmd_agent_hook(socket: Option<std::path::PathBuf>) -> ! {
+    let _ = tokio::time::timeout(AGENT_HOOK_BUDGET, forward_agent_hook(socket)).await;
+    process::exit(0);
+}
+
+async fn forward_agent_hook(socket: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    tokio::io::stdin()
+        .take(1024 * 1024)
+        .read_to_end(&mut buf)
+        .await?;
+    let payload: serde_json::Value = serde_json::from_slice(&buf)?;
+    let path = socket.unwrap_or_else(socket_path);
+    let stream = UnixStream::connect(&path).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    writer
+        .write_all(&encode_message(&Command::AgentEvent { payload })?)
+        .await?;
+    writer.shutdown().await?;
+    let _: Response = read_message(&mut reader).await?;
     Ok(())
 }
 
@@ -572,9 +737,15 @@ async fn request(cmd: Command) -> anyhow::Result<Response> {
     writer.write_all(&encoded).await?;
     writer.shutdown().await?;
 
-    // Read response.
-    let response: Response = read_message(&mut reader).await?;
-    Ok(response)
+    // Read response. A daemon that cannot parse the command (one older than
+    // this CLI) closes the connection without answering.
+    match read_message::<Response>(&mut reader).await {
+        Ok(response) => Ok(response),
+        Err(e) => exit_with_error(&format!(
+            "whisrsd closed the connection without answering ({e}). It may be older than this \
+             whisrs and not know this command: restart it (whisrs restart)."
+        )),
+    }
 }
 
 /// `whisrs recording <action>`. Recording control goes through the daemon;
@@ -1072,7 +1243,9 @@ mod tests {
         let headers = entry_headers(section);
 
         let cli = Cli::command();
-        for sub in cli.get_subcommands() {
+        // A hidden subcommand (`agent-hook`, run by harness hooks) is not for
+        // users, so it is neither in `--help` nor in the man page.
+        for sub in cli.get_subcommands().filter(|s| !s.is_hide_set()) {
             let name = sub.get_name();
             assert!(
                 headers.iter().any(|h| h == name),
@@ -1618,5 +1791,99 @@ mod tests {
             assert_eq!(json["status"], "waiting");
             assert_eq!(json["error"], "could not reach the transcription service");
         }
+    }
+
+    #[test]
+    fn speak_takes_an_optional_text() {
+        let cli = Cli::try_parse_from(["whisrs", "speak"]).unwrap();
+        assert!(matches!(cli.command, SubCmd::Speak { text: None }));
+        let cli = Cli::try_parse_from(["whisrs", "read"]).unwrap();
+        assert!(matches!(cli.command, SubCmd::Speak { text: None }));
+        let cli = Cli::try_parse_from(["whisrs", "speak", "--text", "hello there"]).unwrap();
+        assert!(matches!(cli.command, SubCmd::Speak { text: Some(t) } if t == "hello there"));
+        // `-` is stdin, not a flag.
+        let cli = Cli::try_parse_from(["whisrs", "speak", "--text", "-"]).unwrap();
+        assert!(matches!(cli.command, SubCmd::Speak { text: Some(t) } if t == "-"));
+    }
+
+    fn parse_agent(args: &[&str]) -> Result<Command, String> {
+        let mut argv = vec!["whisrs", "agent"];
+        argv.extend_from_slice(args);
+        let cli = Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+        let SubCmd::Agent {
+            name,
+            text,
+            new,
+            stop,
+        } = cli.command
+        else {
+            panic!("not the agent subcommand");
+        };
+        agent_command(name, text, new, stop)
+    }
+
+    #[test]
+    fn agent_subcommand_maps_to_its_actions() {
+        use whisrs::agent::AgentAction;
+        let action = |args: &[&str]| match parse_agent(args).unwrap() {
+            Command::Agent {
+                action,
+                name,
+                text,
+                new,
+            } => (action, name, text, new),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(action(&[]), (AgentAction::List, None, None, false));
+        assert_eq!(
+            action(&["jarvis"]),
+            (AgentAction::Toggle, Some("jarvis".into()), None, false)
+        );
+        assert_eq!(
+            action(&["jarvis", "--text", "run the tests"]),
+            (
+                AgentAction::Send,
+                Some("jarvis".into()),
+                Some("run the tests".into()),
+                false
+            )
+        );
+        assert_eq!(
+            action(&["jarvis", "--new", "--text", "fresh start"]),
+            (
+                AgentAction::Send,
+                Some("jarvis".into()),
+                Some("fresh start".into()),
+                true
+            )
+        );
+        assert_eq!(
+            action(&["jarvis", "--new"]),
+            (AgentAction::Reset, Some("jarvis".into()), None, false)
+        );
+        assert_eq!(
+            action(&["jarvis", "--stop"]),
+            (AgentAction::Stop, Some("jarvis".into()), None, false)
+        );
+    }
+
+    #[test]
+    fn agent_subcommand_rejects_contradictions() {
+        assert!(parse_agent(&["jarvis", "--stop", "--new"]).is_err());
+        assert!(parse_agent(&["jarvis", "--stop", "--text", "x"]).is_err());
+        let err = parse_agent(&["--text", "x"]).unwrap_err();
+        assert!(err.contains("which agent"), "{err}");
+    }
+
+    #[test]
+    fn agent_hook_is_hidden_and_takes_a_socket() {
+        let cli = Cli::try_parse_from(["whisrs", "agent-hook", "--socket", "/tmp/w.sock"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            SubCmd::AgentHook { socket: Some(p) } if p == std::path::Path::new("/tmp/w.sock")
+        ));
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("agent-hook"), "agent-hook must stay hidden");
+        assert!(help.contains("agent"));
     }
 }

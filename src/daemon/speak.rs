@@ -39,15 +39,7 @@ pub(crate) async fn handle_speak(
         let mut ds = daemon_state.lock().await;
         match ds.state_machine.state() {
             State::Speaking | State::Synthesizing => {
-                if let Some(stop) = ds.tts_stop.take() {
-                    stop.store(true, Ordering::Release);
-                }
-                let _ = ds.state_machine.transition(Action::Cancel);
-                let new_state = ds.state_machine.state();
-                let _ = context.state_tx.send(new_state);
-                if let Some(level_tx) = &context.overlay_level_tx {
-                    let _ = level_tx.send(0.0);
-                }
+                let new_state = stop_read_aloud(&mut ds, &context);
                 info!("speak: stopped in-progress read-aloud");
                 return Response::Ok { state: new_state };
             }
@@ -64,28 +56,9 @@ pub(crate) async fn handle_speak(
 
     // (b) Verify TTS is configured/enabled and build the backend. State is
     // still Idle on any error here — nothing to unwind.
-    let tts_config = match &context.config.tts {
-        Some(t) if t.enabled => t.clone(),
-        Some(_) => {
-            return Response::Error {
-                message: "TTS is disabled — set [tts] enabled = true in config.toml".to_string(),
-            };
-        }
-        None => {
-            return Response::Error {
-                message: "TTS is not configured — add a [tts] section to config.toml".to_string(),
-            };
-        }
-    };
-
-    let api_key = resolve_tts_api_key(&context.config);
-    let backend = match whisrs::tts::create_backend(&tts_config, api_key) {
+    let backend = match tts_backend(&context) {
         Ok(b) => b,
-        Err(e) => {
-            return Response::Error {
-                message: e.to_string(),
-            };
-        }
+        Err(message) => return Response::Error { message },
     };
 
     // (c) Capture the selection. On failure, surface an error and — since this
@@ -111,6 +84,126 @@ pub(crate) async fn handle_speak(
         }
     };
 
+    match speak_text(
+        daemon_state,
+        context,
+        backend,
+        &selected_text,
+        SpeakOrigin::Selection,
+    )
+    .await
+    {
+        SpeakAttempt::NotIdle(state) => Response::Ok { state },
+        SpeakAttempt::Ran(response) => response,
+    }
+}
+
+/// `whisrs speak --text`: speak the given text. A read-aloud in progress is
+/// stopped first, so the new text replaces it; a recording refuses it.
+pub(crate) async fn handle_speak_text(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+    text: String,
+) -> Response {
+    if text.trim().is_empty() {
+        return Response::Error {
+            message: "nothing to speak: the text is empty".to_string(),
+        };
+    }
+    {
+        let mut ds = daemon_state.lock().await;
+        match ds.state_machine.state() {
+            State::Speaking | State::Synthesizing => {
+                stop_read_aloud(&mut ds, &context);
+                info!("speak-text: stopped in-progress read-aloud");
+            }
+            State::Recording | State::Transcribing => {
+                return Response::Error {
+                    message: "busy — finish or cancel recording first".to_string(),
+                };
+            }
+            State::Idle => {}
+        }
+    }
+    let backend = match tts_backend(&context) {
+        Ok(b) => b,
+        Err(message) => return Response::Error { message },
+    };
+    match speak_text(daemon_state, context, backend, &text, SpeakOrigin::Text).await {
+        SpeakAttempt::NotIdle(_) => Response::Error {
+            message: "busy — another command started first; try again".to_string(),
+        },
+        SpeakAttempt::Ran(response) => response,
+    }
+}
+
+/// The configured TTS backend, or why there is none. State is untouched.
+pub(crate) fn tts_backend(
+    context: &DaemonContext,
+) -> Result<Box<dyn whisrs::tts::TtsBackend>, String> {
+    let tts_config = match &context.config.tts {
+        Some(t) if t.enabled => t.clone(),
+        Some(_) => {
+            return Err("TTS is disabled — set [tts] enabled = true in config.toml".to_string());
+        }
+        None => {
+            return Err("TTS is not configured — add a [tts] section to config.toml".to_string());
+        }
+    };
+    let api_key = resolve_tts_api_key(&context.config);
+    whisrs::tts::create_backend(&tts_config, api_key).map_err(|e| e.to_string())
+}
+
+/// Stop a read-aloud in progress (Synthesizing or Speaking) and return the
+/// new state. The caller holds the lock and checked the state.
+pub(crate) fn stop_read_aloud(ds: &mut DaemonState, context: &DaemonContext) -> State {
+    if let Some(stop) = ds.tts_stop.take() {
+        stop.store(true, Ordering::Release);
+    }
+    let _ = ds.state_machine.transition(Action::Cancel);
+    let new_state = ds.state_machine.state();
+    let _ = context.state_tx.send(new_state);
+    if let Some(level_tx) = &context.overlay_level_tx {
+        let _ = level_tx.send(0.0);
+    }
+    new_state
+}
+
+/// What is being spoken, for the log and the progress toast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpeakOrigin {
+    /// The selection (`whisrs speak`).
+    Selection,
+    /// Text given on the command line (`whisrs speak --text`).
+    Text,
+    /// An agent's reply or notice (agent mode).
+    Agent,
+}
+
+/// The outcome of [`speak_text`].
+pub(crate) enum SpeakAttempt {
+    /// The daemon was not Idle when speech would have started: nothing was
+    /// sent or played, and the caller may try again later.
+    NotIdle(State),
+    /// Synthesis ran: the response to send back (playback may still be
+    /// running in the background).
+    Ran(Response),
+}
+
+/// Speak `text` through `backend`: Idle → Synthesizing → Speaking → Idle,
+/// the read-aloud flow every caller shares (the selection, `speak --text`,
+/// agent replies). Returns once playback has started (or failed); a
+/// background task finishes the session when playback ends.
+///
+/// The daemon mutex is never held across the synth, chunk-read or playback
+/// `.await`.
+pub(crate) async fn speak_text(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+    backend: Box<dyn whisrs::tts::TtsBackend>,
+    text: &str,
+    origin: SpeakOrigin,
+) -> SpeakAttempt {
     // (d) Re-lock; only begin synthesizing if still Idle (a concurrent command
     // may have intervened). Do NOT proceed otherwise.
     //
@@ -121,26 +214,36 @@ pub(crate) async fn handle_speak(
     {
         let mut ds = daemon_state.lock().await;
         if ds.state_machine.state() != State::Idle {
-            return Response::Ok {
-                state: ds.state_machine.state(),
-            };
+            return SpeakAttempt::NotIdle(ds.state_machine.state());
         }
         let _ = ds.state_machine.transition(Action::SpeakStart);
         ds.tts_stop = Some(Arc::clone(&stop));
         let _ = context.state_tx.send(ds.state_machine.state());
     }
 
-    info!("speak: synthesizing {} chars", selected_text.len());
-    if context.notify_state() {
+    info!("speak ({origin:?}): synthesizing {} chars", text.len());
+    if origin == SpeakOrigin::Selection && context.notify_state() {
         send_notification("whisrs", "Reading selection aloud...");
     }
+    SpeakAttempt::Ran(play(daemon_state, context, backend, text, stop).await)
+}
+
+/// Steps (e) to (i) of a read-aloud session this caller already moved to
+/// Synthesizing with `stop` installed.
+async fn play(
+    daemon_state: Arc<Mutex<DaemonState>>,
+    context: Arc<DaemonContext>,
+    backend: Box<dyn whisrs::tts::TtsBackend>,
+    text: &str,
+    stop: Arc<AtomicBool>,
+) -> Response {
     let started_at = Instant::now();
 
     // (e) Start synthesis (no lock held). This returns once the response
     // headers arrive; the audio body is streamed afterwards. It is raced
     // against `stop`, so a second press / cancel while a slow server holds
     // the headers drops the request instead of leaving it running.
-    let synth_result = until_stopped(backend.synthesize(&selected_text), &stop).await;
+    let synth_result = until_stopped(backend.synthesize(text), &stop).await;
 
     // (f) Re-lock to decide whether to play.
     let audio = {

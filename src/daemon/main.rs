@@ -12,6 +12,7 @@ use whisrs::history;
 use whisrs::window::{self, WindowTracker};
 use whisrs::{encode_message, read_message, socket_path, Command, Response, State};
 
+mod agent;
 mod command_mode;
 mod context;
 mod dictation;
@@ -35,7 +36,7 @@ use crate::injection::{prime_modifier_probe, warm_keyboard};
 use crate::notify::send_notification;
 #[cfg(feature = "recording")]
 use crate::recording::{error_already_notified, handle_recording, RecordingRuntime};
-use crate::speak::handle_speak;
+use crate::speak::{handle_speak, handle_speak_text};
 #[cfg(feature = "hooks")]
 use crate::startup::check_session_bus;
 use crate::startup::{
@@ -132,6 +133,8 @@ async fn main() -> Result<()> {
     let tray_enabled = config.general.tray;
     let overlay_enabled = config.general.overlay;
     let overlay_config = config.overlay.clone().unwrap_or_default();
+    // Inert (no file, no task, no process) without [[agents]].
+    let agents = crate::agent::AgentRuntime::new(&config, &socket_path());
     let context = Arc::new(DaemonContext {
         config,
         window_tracker,
@@ -142,6 +145,7 @@ async fn main() -> Result<()> {
         overlay_enabled,
         #[cfg(feature = "recording")]
         recording: recording_runtime,
+        agents,
     });
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
@@ -155,7 +159,7 @@ async fn main() -> Result<()> {
         let dispatch_ctx = Arc::clone(&context);
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                info!("internal command (hotkey/tray): {cmd:?}");
+                info!("internal command (hotkey/tray): {}", cmd.log_summary());
                 // A recording start can spend seconds opening devices; run it
                 // aside so a dictation hotkey pressed meanwhile is not held
                 // behind it. Recordings never touch the dictation state, so
@@ -184,9 +188,20 @@ async fn main() -> Result<()> {
                     });
                     continue;
                 }
-                let _response =
+                // A hotkey press shows nobody the response, so an agent
+                // error is notified here (unless it already was).
+                let is_agent = matches!(cmd, Command::Agent { .. });
+                let response =
                     handle_command(cmd, Arc::clone(&dispatch_state), Arc::clone(&dispatch_ctx))
                         .await;
+                if let Response::Error { message } = &response {
+                    if is_agent
+                        && dispatch_ctx.notify_error()
+                        && !crate::agent::error_already_notified(message)
+                    {
+                        send_notification("whisrs", &format!("Agent: {message}"));
+                    }
+                }
                 // Broadcast state for tray.
                 let current = dispatch_state.lock().await.state_machine.state();
                 let _ = dispatch_ctx.state_tx.send(current);
@@ -219,6 +234,10 @@ async fn main() -> Result<()> {
     if let Some(hooks) = context.config.hooks.clone() {
         tokio::spawn(crate::hooks::hook_dispatch_loop(state_rx.clone(), hooks));
     }
+
+    // Agent mode watches the same state broadcast to speak replies when the
+    // daemon is Idle.
+    let agent_state_rx = state_rx.clone();
 
     // Start bottom recording overlay if enabled.
     // Spawned as a background task so desktop integration failures do not stop the daemon.
@@ -267,6 +286,19 @@ async fn main() -> Result<()> {
         tokio::spawn(crate::recording::run_network_retries(Arc::clone(&context)));
     }
 
+    // Agent mode: the reply queue, and the turns a restart interrupted
+    // (watched again so their replies are still spoken). Only with agents.
+    if context.agents.is_enabled() {
+        crate::agent::start_background(
+            Arc::clone(&context),
+            Arc::clone(&daemon_state),
+            agent_state_rx,
+        )
+        .await;
+    } else {
+        drop(agent_state_rx);
+    }
+
     // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both remove the
     // socket before exiting, and finalize a recording in progress, so it is
     // transcribed on the next start.
@@ -288,17 +320,21 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     });
 
-    // Start global hotkey listener if configured — either the fixed
-    // [hotkeys] section, or any [[llm_commands]] entry (each carries its own
-    // hotkey independent of [hotkeys]).
+    // Start global hotkey listener if configured — the fixed [hotkeys]
+    // section, any [[llm_commands]] entry, or any [[agents]] entry with a
+    // hotkey (each carries its own hotkey independent of [hotkeys]).
     // Spawned as a background task so retries don't block the IPC server.
-    if context.config.hotkeys.is_some() || !context.config.llm_commands.is_empty() {
+    if context.config.hotkeys.is_some()
+        || !context.config.llm_commands.is_empty()
+        || context.agents.has_hotkeys()
+    {
         let hk_config = context.config.hotkeys.clone().unwrap_or_default();
         let llm_commands = context.config.llm_commands.clone();
+        let agents = context.agents.agents();
         let hk_tx = cmd_tx.clone();
         tokio::spawn(async move {
             // Hotkey presses feed the shared dispatch loop above.
-            whisrs::hotkey::start_hotkey_listener(&hk_config, &llm_commands, hk_tx).await;
+            whisrs::hotkey::start_hotkey_listener(&hk_config, &llm_commands, &agents, hk_tx).await;
         });
     }
 
@@ -321,7 +357,7 @@ async fn handle_connection(
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let cmd: Command = read_message(&mut reader).await?;
-    info!("received command: {cmd:?}");
+    info!("received command: {}", cmd.log_summary());
 
     let response = handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
 
@@ -372,6 +408,19 @@ async fn handle_command(
             handle_set_llm_instruction(daemon_state, context, name).await
         }
         Command::Speak => handle_speak(daemon_state, context).await,
+        Command::SpeakText { text } => handle_speak_text(daemon_state, context, text).await,
+        Command::Agent {
+            action,
+            name,
+            text,
+            new,
+        } => crate::agent::handle_agent(daemon_state, context, action, name, text, new).await,
+        Command::AgentEvent { payload } => {
+            crate::agent::handle_agent_event(&context, payload).await;
+            Response::Ok {
+                state: daemon_state.lock().await.state_machine.state(),
+            }
+        }
         #[cfg(feature = "recording")]
         Command::Recording {
             action,
@@ -471,6 +520,7 @@ mod tests {
             state_tx: tokio::sync::watch::channel(State::Idle).0,
             overlay_level_tx: None,
             overlay_enabled: false,
+            agents: crate::agent::AgentRuntime::disabled(),
         });
         let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
         for action in [

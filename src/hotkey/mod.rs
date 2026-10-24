@@ -13,6 +13,7 @@ use evdev::{AttributeSetRef, Device, EventType, InputEventKind, Key};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::agent::{Agent, AgentAction};
 use crate::llm::LlmCommandConfig;
 #[cfg(feature = "recording")]
 use crate::recording::{RecordingAction, RecordingOptions};
@@ -40,9 +41,10 @@ struct HotkeyAction {
 pub async fn start_hotkey_listener(
     config: &HotkeyConfig,
     llm_commands: &[LlmCommandConfig],
+    agents: &[Agent],
     cmd_tx: mpsc::Sender<Command>,
 ) {
-    let actions = build_actions(config, llm_commands);
+    let actions = build_actions(config, llm_commands, agents);
 
     if actions.is_empty() {
         debug!("no hotkeys configured");
@@ -117,17 +119,21 @@ pub async fn start_hotkey_listener(
     }
 }
 
-/// Build the dispatch table: every set `[hotkeys]` field, plus every
-/// `[[llm_commands]]` entry's `hotkey` and optional `set_hotkey`. Invalid
-/// specs are warned about and skipped, so one bad combo never disables the
-/// rest.
+/// Build the dispatch table: every set `[hotkeys]` field, every
+/// `[[llm_commands]]` entry's `hotkey` and optional `set_hotkey`, and every
+/// usable `[[agents]]` entry's `hotkey` (a voice turn). Invalid specs are
+/// warned about and skipped, so one bad combo never disables the rest.
 ///
 /// Split out of [`start_hotkey_listener`] — which needs real input devices and
 /// so cannot be unit-tested — because the failure this guards against is
 /// silent: a field added to [`HotkeyConfig`] but not listed here parses fine,
 /// validates fine, shows up in the config editor, and simply never fires.
 /// `every_fixed_hotkey_field_is_dispatched` below fails when that happens.
-fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Vec<HotkeyAction> {
+fn build_actions(
+    config: &HotkeyConfig,
+    llm_commands: &[LlmCommandConfig],
+    agents: &[Agent],
+) -> Vec<HotkeyAction> {
     let mut actions = Vec::new();
 
     // Every field of `HotkeyConfig` must appear in this table.
@@ -197,6 +203,25 @@ fn build_actions(config: &HotkeyConfig, llm_commands: &[LlmCommandConfig]) -> Ve
                     set_hotkey, entry.name
                 ),
             }
+        }
+    }
+
+    for agent in agents {
+        let Some(spec) = &agent.hotkey else { continue };
+        match parse_hotkey(spec) {
+            Ok(binding) => {
+                info!("hotkey: agent '{}' = {spec}", agent.name);
+                actions.push(HotkeyAction {
+                    binding,
+                    command: Command::Agent {
+                        action: AgentAction::Toggle,
+                        name: Some(agent.name.clone()),
+                        text: None,
+                        new: false,
+                    },
+                });
+            }
+            Err(e) => warn!("invalid hotkey '{spec}' for agent '{}': {e}", agent.name),
         }
     }
 
@@ -563,7 +588,7 @@ mod tests {
             .expect("as a table")
             .len();
 
-        let actions = build_actions(&config, &[]);
+        let actions = build_actions(&config, &[], &[]);
         // `[hotkeys] recording` alone binds nothing in a build without the
         // recording feature, which warns that it is ignored.
         let ignored = usize::from(!cfg!(feature = "recording"));
@@ -584,8 +609,8 @@ mod tests {
             recording: Some("ScrollLock".to_string()),
             ..Default::default()
         };
-        assert!(build_actions(&config, &[]).is_empty());
-        let actions = build_actions(&all_hotkeys_set(), &[]);
+        assert!(build_actions(&config, &[], &[]).is_empty());
+        let actions = build_actions(&all_hotkeys_set(), &[], &[]);
         assert!(actions
             .iter()
             .all(|a| !matches!(a.command, Command::Recording { .. })));
@@ -600,7 +625,7 @@ mod tests {
             recording: Some("ScrollLock".to_string()),
             ..Default::default()
         };
-        let actions = build_actions(&config, &[]);
+        let actions = build_actions(&config, &[], &[]);
         assert_eq!(actions.len(), 1);
         assert!(actions[0].binding.modifiers.is_empty());
         assert_eq!(actions[0].binding.trigger, Key::KEY_SCROLLLOCK);
@@ -617,7 +642,7 @@ mod tests {
     /// would silently send one key's press through another's handler.
     #[test]
     fn each_field_dispatches_its_own_command() {
-        let actions = build_actions(&all_hotkeys_set(), &[]);
+        let actions = build_actions(&all_hotkeys_set(), &[], &[]);
         for expected in [
             Command::Toggle { language: None },
             Command::Cancel,
@@ -651,7 +676,7 @@ mod tests {
             command: Some("Super+Shift+G".to_string()),
             ..Default::default()
         };
-        let actions = build_actions(&config, &[]);
+        let actions = build_actions(&config, &[], &[]);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0].command, Command::CommandMode));
     }
@@ -664,9 +689,39 @@ mod tests {
             speak: Some("NotAKey".to_string()),
             ..Default::default()
         };
-        let actions = build_actions(&config, &[]);
+        let actions = build_actions(&config, &[], &[]);
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0].command, Command::Toggle { .. }));
+    }
+
+    /// An agent's hotkey records a voice turn for that agent; one without a
+    /// hotkey binds nothing.
+    #[test]
+    fn agent_hotkeys_dispatch_a_voice_turn() {
+        use crate::agent::{Harness, Permissions};
+        let agent = |name: &str, hotkey: Option<&str>| Agent {
+            name: name.to_string(),
+            hotkey: hotkey.map(str::to_string),
+            harness: Harness::Claude,
+            dir: PathBuf::from("/proj"),
+            permissions: Permissions::Auto,
+            command: "claude".to_string(),
+            args: Vec::new(),
+            instruction: String::new(),
+        };
+        let agents = [
+            agent("jarvis", Some("Super+Shift+J")),
+            agent("quiet", None),
+            agent("broken", Some("Super+Nope")),
+        ];
+        let actions = build_actions(&HotkeyConfig::default(), &[], &agents);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].binding.trigger, Key::KEY_J);
+        assert!(matches!(
+            &actions[0].command,
+            Command::Agent { action: AgentAction::Toggle, name: Some(n), text: None, new: false }
+                if n == "jarvis"
+        ));
     }
 
     fn key_set(keys: &[Key]) -> evdev::AttributeSet<Key> {

@@ -1,5 +1,6 @@
 //! whisrs — shared types for CLI and daemon communication.
 
+pub mod agent;
 pub mod audio;
 pub mod config;
 pub mod history;

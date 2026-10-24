@@ -80,13 +80,45 @@ fn refused_multi_line_message(label: Option<&str>, history: bool) -> String {
 /// gone → bail, machine stays Idle) or the background wins (machine moves to
 /// Transcribing, from which `Cancel` is an invalid transition, so the
 /// pipeline owns the state until its finalizer's `TranscriptionDone`).
-fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Option<T>) -> Option<T> {
+pub(crate) fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Option<T>) -> Option<T> {
     if ctx.is_none() || state_machine.state() != State::Recording {
         return None;
     }
     // From Recording, Toggle → Transcribing cannot fail.
     let _ = state_machine.transition(Action::Toggle);
     ctx.take()
+}
+
+/// Collect a recorded instruction until the silence auto-stop fires or the
+/// audio channel closes (a manual stop, a cancel, or a vanished device). On
+/// auto-stop the capture is stopped here. `label` names the flow in the log.
+///
+/// Shared by command mode, `[[llm_commands]]` and agent voice turns, which
+/// all record a whole instruction before transcribing it.
+pub(crate) async fn collect_instruction_audio(
+    audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
+    daemon_state: &Mutex<DaemonState>,
+    context: &DaemonContext,
+    label: &str,
+) -> Vec<i16> {
+    let silence_timeout = context.config.general.silence_timeout_ms;
+    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
+    let mut all_samples: Vec<i16> = Vec::new();
+    if let Some(mut rx) = audio_rx {
+        while let Some(chunk) = rx.recv().await {
+            all_samples.extend_from_slice(&chunk);
+            if auto_stop.feed(&chunk) {
+                info!("{label}: silence auto-stop");
+                let mut ds = daemon_state.lock().await;
+                if let Some(mut capture) = ds.audio_capture.take() {
+                    capture.stop();
+                    tokio::task::spawn_blocking(move || drop(capture));
+                }
+                break;
+            }
+        }
+    }
+    all_samples
 }
 
 /// The claim block of [`command_mode_background`]: claim the session via
@@ -298,26 +330,9 @@ async fn command_mode_background(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) {
-    let silence_timeout = context.config.general.silence_timeout_ms;
-    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
-    let mut all_samples: Vec<i16> = Vec::new();
-
     // Collect audio until silence auto-stop or channel close (manual stop).
-    if let Some(mut rx) = audio_rx {
-        while let Some(chunk) = rx.recv().await {
-            all_samples.extend_from_slice(&chunk);
-            if auto_stop.feed(&chunk) {
-                info!("command mode: silence auto-stop");
-                // Stop capture.
-                let mut ds = daemon_state.lock().await;
-                if let Some(mut capture) = ds.audio_capture.take() {
-                    capture.stop();
-                    tokio::task::spawn_blocking(move || drop(capture));
-                }
-                break;
-            }
-        }
-    }
+    let all_samples =
+        collect_instruction_audio(audio_rx, &daemon_state, &context, "command mode").await;
 
     // Claim the session context and enter Transcribing. `handle_cancel`
     // takes the context under this same lock, so whoever locks first wins:
@@ -809,24 +824,8 @@ async fn llm_command_background(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) {
-    let silence_timeout = context.config.general.silence_timeout_ms;
-    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
-    let mut all_samples: Vec<i16> = Vec::new();
-
-    if let Some(mut rx) = audio_rx {
-        while let Some(chunk) = rx.recv().await {
-            all_samples.extend_from_slice(&chunk);
-            if auto_stop.feed(&chunk) {
-                info!("llm-command: silence auto-stop");
-                let mut ds = daemon_state.lock().await;
-                if let Some(mut capture) = ds.audio_capture.take() {
-                    capture.stop();
-                    tokio::task::spawn_blocking(move || drop(capture));
-                }
-                break;
-            }
-        }
-    }
+    let all_samples =
+        collect_instruction_audio(audio_rx, &daemon_state, &context, "llm-command").await;
 
     // Claim the session context and enter Transcribing. `handle_cancel`
     // takes the context under this same lock, so whoever locks first wins:

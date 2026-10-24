@@ -620,6 +620,8 @@ pub(crate) enum BatchOrigin<'a> {
     /// A named `[[llm_commands]]` hotkey. Carries the command name for
     /// toasts/logs — runtime config data, hence not a `&'static str` label.
     LlmCommand { name: &'a str },
+    /// An agent's voice turn (`[[agents]]`). Carries the agent name.
+    Agent { name: &'a str },
 }
 
 impl BatchOrigin<'_> {
@@ -632,6 +634,9 @@ impl BatchOrigin<'_> {
                 format!("Skipped: the audio was {label}")
             }
             BatchOrigin::CommandMode => format!("Command mode: the audio was {label}"),
+            BatchOrigin::Agent { name } => {
+                format!("Agent '{name}': the audio was {label}, nothing was sent")
+            }
         }
     }
 
@@ -642,6 +647,7 @@ impl BatchOrigin<'_> {
             BatchOrigin::Dictation => None,
             BatchOrigin::CommandMode => Some("Processing command...".to_string()),
             BatchOrigin::LlmCommand { name } => Some(format!("Processing '{name}'...")),
+            BatchOrigin::Agent { name } => Some(format!("Sending to '{name}'...")),
         }
     }
 
@@ -652,6 +658,9 @@ impl BatchOrigin<'_> {
             BatchOrigin::Dictation => None,
             BatchOrigin::CommandMode => Some("Could not understand instruction — try again"),
             BatchOrigin::LlmCommand { .. } => Some("Could not understand speech — try again"),
+            BatchOrigin::Agent { .. } => {
+                Some("Could not understand the instruction, nothing was sent. Try again.")
+            }
         }
     }
 }
@@ -727,6 +736,22 @@ impl<'a> BatchOptions<'a> {
         }
     }
 
+    /// An agent's voice turn: the transcript is the agent's instruction.
+    /// Prompted (project vocabulary helps) and echo-checked like an
+    /// llm-command, with `[replacements]` applied, since a word fix-up the
+    /// user configured matters as much to the agent as on screen. No
+    /// recovery save or filler removal.
+    pub(crate) fn agent(name: &'a str) -> BatchOptions<'a> {
+        BatchOptions {
+            use_prompt: true,
+            save_recovery: false,
+            check_prompt_echo: true,
+            apply_filler: false,
+            apply_replacements: true,
+            origin: BatchOrigin::Agent { name },
+        }
+    }
+
     /// `config.prompt` is set for every backend, including ones that never
     /// transmit it — hence the separate `backend_sends_prompt` gate. The
     /// caller reads that flag off `TranscriptionBackend::sends_prompt` per
@@ -798,6 +823,15 @@ pub(crate) async fn transcribe_batch_audio(
                     samples.len()
                 );
                 if context.notify_state() {
+                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
+                }
+            }
+            BatchOrigin::Agent { name } => {
+                info!(
+                    "agent '{name}': skipping (recording was {label}, {} samples)",
+                    samples.len()
+                );
+                if context.notify_error() {
                     send_notification("whisrs", &opts.origin.gate_skip_message(label));
                 }
             }
@@ -2048,6 +2082,7 @@ mod tests {
             overlay_enabled: false,
             #[cfg(feature = "recording")]
             recording: crate::recording::RecordingRuntime::new().0,
+            agents: crate::agent::AgentRuntime::disabled(),
         }
     }
 

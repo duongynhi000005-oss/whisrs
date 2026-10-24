@@ -33,6 +33,10 @@ systemctl --user enable --now whisrs.service
 whisrs toggle    # start/stop dictation
 whisrs cancel    # cancel and discard audio
 whisrs speak     # read the selected text aloud via TTS (alias: read; press again to stop)
+whisrs speak --text "..."   # speak the given text (--text - reads stdin); its own IPC command (speak-text)
+whisrs agent     # list [[agents]]; `whisrs agent <name>` records a voice turn for that coding agent
+                 # (same as its hotkey), --text "..." sends a typed one, --new forgets the session,
+                 # --stop stops the running turn. The reply is spoken via [tts] when the turn ends
 whisrs status    # query daemon state
 whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
@@ -66,11 +70,20 @@ src/
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
 ├── llm.rs                  # LLM calls for command mode
+├── agent/                  # Agent mode ([[agents]]): voice turns to a coding agent, spoken replies
+│   ├── mod.rs              #   AgentConfig + resolve_agents (validation), IPC types, Driver trait,
+│   │                       #   SessionRef/TurnUpdate/TurnOutcome, the default voice instruction
+│   ├── spoken.rs           #   <spoken> extraction + sanitize + 400-char cap (pure)
+│   ├── claude.rs           #   Claude Code driver: claude --bg, stop + --bg --resume, hooks via --settings, poll
+│   └── store.rs            #   $XDG_DATA_HOME/whisrs/agents.json (0600, atomic), written only with agents
 ├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
 ├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown (feature recording)
+├── daemon/agent.rs         # Agent runtime: slots, turns, reply FIFO (spoken when Idle), IPC handlers,
+│                           #   hook events, the voice-turn recording sink
+├── daemon/speak.rs         # Read-aloud: selection, speak --text, agent replies (speak_text)
 ├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
 │   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types: every build (IPC wire);
 │   │                       #   the submodules below are feature `recording`
@@ -248,6 +261,12 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
+{"cmd": "speak-text", "text": "..."} // speak the text; its own variant so an older daemon errors
+                                     // instead of reading the selection
+{"cmd": "agent", "action": "list|toggle|send|reset|stop", "name": "jarvis", "text": "...", "new": true}
+                                     // all but action optional (name required but for list);
+                                     // list/send/reset/stop answer with an Agents response
+{"cmd": "agent-event", "payload": {...}}  // a harness hook's stdin JSON, from `whisrs agent-hook`
 {"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
  "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"],
@@ -261,12 +280,15 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,
-a `History` variant carrying log entries, and a `Recording` variant carrying the recording status.
+a `History` variant carrying log entries, a `Recording` variant carrying the recording status, and
+an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`).
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
 list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC
 (as does the speaker list `whisrs recording name` prints after the daemon renamed one).
+`whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
+only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 `whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
 starts it with `store::configured_recordings_dir()`.
 
@@ -277,6 +299,15 @@ Path: `~/.config/whisrs/config.toml` (permissions: 0600)
 Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realtime`, `openai-compatible-realtime`, `openai`, `local-whisper`, `local-vosk`, `local-parakeet`, `asr-sidecar`
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
+
+Agent mode: `[[agents]]` entries (`name`, `hotkey`, `harness` = `claude`, `dir`, `permissions` =
+`auto|bypass|ask`, `command`, `args`, `reply_instruction`; `agent::resolve_agents` validates and
+skips bad entries, shared by `Config::validate` and the runtime). With none, nothing runs and no file
+is written. A voice turn records like command mode's instruction (`BatchOrigin::Agent`), then the
+turn runs on its own task; replies queue in a FIFO spoken when the state is Idle. The Claude driver
+starts `claude --bg` sessions with `--settings` hooks (`Stop`, `Notification`) that run `whisrs
+agent-hook --socket <sock>`; the next turn is `claude stop` + `claude --bg --resume <id> -- <text>`
+with no other flag (any flag starts a copy). Only stored ids are ever passed to `claude`.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 

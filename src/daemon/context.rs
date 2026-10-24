@@ -10,6 +10,7 @@ use whisrs::transcription::TranscriptionBackend;
 use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 
+use crate::agent::AgentRuntime;
 #[cfg(feature = "recording")]
 use crate::recording::RecordingRuntime;
 
@@ -28,6 +29,13 @@ pub(crate) struct LlmCommandContext {
     pub(crate) name: String,
     pub(crate) instruction: String,
     pub(crate) llm_config: llm::LlmConfig,
+}
+
+/// Context saved when an agent's hotkey (or `whisrs agent <name>`) starts
+/// recording a voice turn. The transcript goes to the agent instead of an
+/// LLM rewrite; there is no selection.
+pub(crate) struct AgentRecordingContext {
+    pub(crate) name: String,
 }
 
 /// Shared daemon state protected by a mutex.
@@ -59,6 +67,8 @@ pub(crate) struct DaemonState {
     /// Active named LLM command context (set when an `[[llm_commands]]`
     /// hotkey is recording).
     pub(crate) llm_command: Option<LlmCommandContext>,
+    /// Active agent voice turn context (set while recording for an agent).
+    pub(crate) agent_recording: Option<AgentRecordingContext>,
     /// Runtime instruction overrides for `[[llm_commands]]`, keyed by command
     /// name. Written by the `set_hotkey` path (`SetLlmInstruction`) so a
     /// reprogrammed instruction takes effect immediately — the loaded
@@ -89,6 +99,7 @@ impl DaemonState {
             session_language: None,
             command_mode: None,
             llm_command: None,
+            agent_recording: None,
             llm_instruction_overrides: std::collections::HashMap::new(),
             tts_stop: None,
         }
@@ -148,6 +159,9 @@ pub(crate) struct DaemonContext {
     /// never waits on, or blocks, the dictation lock.
     #[cfg(feature = "recording")]
     pub(crate) recording: RecordingRuntime,
+    /// Agent mode (`[[agents]]`): sessions, running turns and the reply
+    /// queue, behind its own lock. Empty, and inert, without agents.
+    pub(crate) agents: AgentRuntime,
 }
 
 impl DaemonContext {

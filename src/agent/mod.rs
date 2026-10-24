@@ -1,0 +1,639 @@
+//! Agent mode: send a voice (or typed) instruction to a coding agent session
+//! running in a configured directory, and hear a short reply when its turn
+//! ends (`[[agents]]`).
+//!
+//! This module holds what both binaries share: the `[[agents]]` config and
+//! its validation, the IPC types, the driver abstraction every harness
+//! implements and the default spoken-reply instruction. The runtime that
+//! owns the sessions lives in the daemon (`src/daemon/agent.rs`).
+//!
+//! Two driver shapes fit [`Driver`]: Claude Code's turn is launched as a
+//! background session and ends on a hook event or a poll
+//! ([`claude::ClaudeDriver`]); a process-per-turn driver (phase 2: OpenCode,
+//! Codex, Copilot) spawns one child per turn with `kill_on_drop`, reads the
+//! session id and the final message from its JSON output, and returns when
+//! the child exits. The runtime only ever calls [`Driver::run_turn`],
+//! [`Driver::rewatch`], [`Driver::stop`] and [`Driver::hook_matches`].
+
+pub mod claude;
+pub mod spoken;
+pub mod store;
+
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+use crate::hotkey;
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/// One `[[agents]]` entry as written in `config.toml`.
+///
+/// Every field but `name` and `dir` has a default, and `harness` and
+/// `permissions` are plain strings checked by [`resolve_agents`], so an entry
+/// with an unknown value is skipped with a warning instead of failing the
+/// whole config parse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Unique, `[a-z0-9_-]`. Used by `whisrs agent <name>`.
+    #[serde(default)]
+    pub name: String,
+    /// Optional global hotkey, same syntax as `[hotkeys]`: a voice turn.
+    #[serde(default)]
+    pub hotkey: Option<String>,
+    /// Which coding agent: `claude` (phase 1).
+    #[serde(default = "default_harness")]
+    pub harness: String,
+    /// The directory the agent works in. `~` is expanded; it must exist.
+    #[serde(default)]
+    pub dir: String,
+    /// `auto` (default), `bypass` or `ask`, mapped per harness.
+    #[serde(default = "default_permissions")]
+    pub permissions: String,
+    /// The harness binary. Default: the harness name on `PATH`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Extra arguments, passed on the first turn of a session.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Replaces the built-in voice instruction ([`DEFAULT_REPLY_INSTRUCTION`]).
+    #[serde(default)]
+    pub reply_instruction: Option<String>,
+}
+
+fn default_harness() -> String {
+    "claude".to_string()
+}
+
+fn default_permissions() -> String {
+    "auto".to_string()
+}
+
+/// The coding agent an entry drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Harness {
+    /// Claude Code (`claude --bg`).
+    Claude,
+}
+
+impl Harness {
+    /// Every harness this build drives, for messages.
+    pub const ALL: &'static [Harness] = &[Harness::Claude];
+
+    pub fn parse(s: &str) -> Option<Harness> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "claude" => Some(Harness::Claude),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude",
+        }
+    }
+
+    /// The binary looked up on `PATH` when `command` is unset.
+    pub fn default_command(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude",
+        }
+    }
+}
+
+impl std::fmt::Display for Harness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How much the agent may do without asking, harness-neutral. Each driver
+/// maps it to its own flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permissions {
+    /// The harness decides what is safe (Claude: auto mode).
+    Auto,
+    /// No permission checks at all.
+    Bypass,
+    /// Ask before acting.
+    Ask,
+}
+
+impl Permissions {
+    pub fn parse(s: &str) -> Option<Permissions> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Permissions::Auto),
+            "bypass" => Some(Permissions::Bypass),
+            "ask" => Some(Permissions::Ask),
+            _ => None,
+        }
+    }
+}
+
+/// A validated `[[agents]]` entry, ready to drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agent {
+    pub name: String,
+    /// The configured hotkey, if any (validity is checked by the listener).
+    pub hotkey: Option<String>,
+    pub harness: Harness,
+    /// `dir` with `~` expanded; an existing directory at load time.
+    pub dir: PathBuf,
+    pub permissions: Permissions,
+    /// The binary to run: `command`, or the harness default.
+    pub command: String,
+    pub args: Vec<String>,
+    /// The voice instruction: `reply_instruction`, or the default.
+    pub instruction: String,
+}
+
+/// Whether `name` is a valid agent name: non-empty, `[a-z0-9_-]`.
+pub fn valid_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Expand a leading `~` (`~` or `~/...`) to the home directory.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    let path = path.trim();
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Validate `[[agents]]`: the usable agents, plus a warning for each entry
+/// skipped or partly ignored. Shared by `Config::validate` (which logs the
+/// warnings at startup) and the daemon runtime (which drives the agents), so
+/// the two never disagree about which entries exist.
+///
+/// Skipped: a missing, invalid or duplicate name, an unknown harness or
+/// permissions value, and a missing or nonexistent dir. An invalid hotkey is
+/// warned about but keeps the entry (the CLI still reaches it).
+pub fn resolve_agents(entries: &[AgentConfig]) -> (Vec<Agent>, Vec<String>) {
+    resolve_agents_with(entries, |p| p.is_dir())
+}
+
+/// [`resolve_agents`] with the directory check injected, for tests.
+fn resolve_agents_with(
+    entries: &[AgentConfig],
+    is_dir: impl Fn(&Path) -> bool,
+) -> (Vec<Agent>, Vec<String>) {
+    let mut agents: Vec<Agent> = Vec::new();
+    let mut warnings = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let name = entry.name.trim();
+        if name.is_empty() {
+            warnings.push(format!(
+                "[[agents]] entry {} has no name, so it is skipped",
+                index + 1
+            ));
+            continue;
+        }
+        if !valid_agent_name(name) {
+            warnings.push(format!(
+                "[[agents]] name '{name}' is skipped: use lowercase letters, digits, '-' and '_'"
+            ));
+            continue;
+        }
+        if agents.iter().any(|a| a.name == name) {
+            warnings.push(format!(
+                "[[agents]] has a duplicate name '{name}': only the first one is used"
+            ));
+            continue;
+        }
+        let Some(harness) = Harness::parse(&entry.harness) else {
+            let known: Vec<&str> = Harness::ALL.iter().map(|h| h.as_str()).collect();
+            warnings.push(format!(
+                "[[agents]] '{name}' has an unknown harness '{}', so it is skipped (this build \
+                 drives: {})",
+                entry.harness,
+                known.join(", ")
+            ));
+            continue;
+        };
+        let Some(permissions) = Permissions::parse(&entry.permissions) else {
+            warnings.push(format!(
+                "[[agents]] '{name}' has an unknown permissions value '{}', so it is skipped \
+                 (use auto, bypass or ask)",
+                entry.permissions
+            ));
+            continue;
+        };
+        if entry.dir.trim().is_empty() {
+            warnings.push(format!(
+                "[[agents]] '{name}' has no dir, so it is skipped: set dir to the project the \
+                 agent works in"
+            ));
+            continue;
+        }
+        let dir = expand_tilde(&entry.dir);
+        if !is_dir(&dir) {
+            warnings.push(format!(
+                "[[agents]] '{name}' is skipped: its dir {} does not exist",
+                dir.display()
+            ));
+            continue;
+        }
+        let hotkey = entry
+            .hotkey
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string);
+        if let Some(spec) = &hotkey {
+            if let Err(e) = hotkey::parse_hotkey(spec) {
+                warnings.push(format!(
+                    "[[agents]] '{name}' has an invalid hotkey '{spec}': {e}. The agent still \
+                     works through `whisrs agent {name}`"
+                ));
+            }
+        }
+        let command = entry
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|c| expand_tilde(c).to_string_lossy().into_owned())
+            .unwrap_or_else(|| harness.default_command().to_string());
+        let instruction = entry
+            .reply_instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .unwrap_or(DEFAULT_REPLY_INSTRUCTION)
+            .to_string();
+        agents.push(Agent {
+            name: name.to_string(),
+            hotkey,
+            harness,
+            dir,
+            permissions,
+            command,
+            args: entry.args.clone(),
+            instruction,
+        });
+    }
+    (agents, warnings)
+}
+
+/// The built-in voice instruction: Claude's appended system prompt, or the
+/// prefix of the first message on a harness without one. It asks for a
+/// `<spoken>` reply, but whisrs never relies on it ([`spoken::spoken_reply`]).
+pub const DEFAULT_REPLY_INSTRUCTION: &str = "You are being driven by voice through whisrs. The \
+user spoke this request, and speech recognition can mishear words, so read it charitably; if a \
+misheard word could make you do something destructive or irreversible, ask first. Work as you \
+normally would. The user will hear your final message through text-to-speech rather than read \
+it, so end every final message with a spoken reply inside <spoken></spoken> tags, written to be \
+heard: lead with the outcome; one to three short sentences, under 40 words, up to 60 only when \
+you need a decision; plain spoken words with no code, file paths, URLs, markdown, lists or \
+symbols; say numbers the way a person would. If you need the user to decide or answer \
+something, end with exactly one direct question; otherwise ask nothing and do not offer more \
+help. Do not narrate your steps, apologize or repeat the request. Be calm, precise and brief, \
+like a capable assistant reporting to the person they work for. Anything outside the tags stays \
+on screen for when the user looks at the session.";
+
+// ---------------------------------------------------------------------------
+// IPC types
+// ---------------------------------------------------------------------------
+
+/// What a `{"cmd":"agent"}` request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentAction {
+    /// `whisrs agent`: every configured agent and its state.
+    List,
+    /// `whisrs agent <name>`, or its hotkey: record a voice turn (a second
+    /// press stops the recording).
+    Toggle,
+    /// `whisrs agent <name> --text "..."`: a typed turn.
+    Send,
+    /// `whisrs agent <name> --new`: forget the session.
+    Reset,
+    /// `whisrs agent <name> --stop`: stop the running turn, keep the session.
+    Stop,
+}
+
+/// What an agent is doing, as `whisrs agent` shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPhase {
+    /// No turn running.
+    Idle,
+    /// A turn is running.
+    Working,
+    /// The turn waits for the user (a permission prompt).
+    NeedsYou,
+}
+
+impl std::fmt::Display for AgentPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AgentPhase::Idle => "idle",
+            AgentPhase::Working => "working",
+            AgentPhase::NeedsYou => "needs-you",
+        })
+    }
+}
+
+/// One row of `whisrs agent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub name: String,
+    pub harness: String,
+    pub phase: AgentPhase,
+    /// The first eight characters of the session id, once there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Driver abstraction
+// ---------------------------------------------------------------------------
+
+/// What the runtime remembers about an agent's session between turns, and
+/// persists in `agents.json`. Ids are only ever ones a driver learned from a
+/// session whisrs started.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRef {
+    /// The harness's session id (Claude: the conversation UUID).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The id of the background process running it (Claude: the short id
+    /// `claude --bg` prints). `None` for process-per-turn drivers.
+    #[serde(default)]
+    pub bg_id: Option<String>,
+    /// Where the harness writes the conversation, once known.
+    #[serde(default)]
+    pub transcript_path: Option<PathBuf>,
+}
+
+/// One turn to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRequest {
+    /// What the user said or typed.
+    pub text: String,
+    /// When the turn was started (a reply older than this belongs to an
+    /// earlier turn).
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Progress a driver reports while a turn runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnUpdate {
+    /// The session ids changed (first turn, or a resume that started a copy).
+    Session(SessionRef),
+    /// The turn waits for the user. The text is a short spoken notice.
+    NeedsYou(String),
+    /// The turn is running again after a wait.
+    Working,
+}
+
+/// How a turn ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// The agent's final message, raw (the runtime turns it into speech).
+    Reply(String),
+    /// The turn could not run or did not finish. The text is actionable and
+    /// goes to a notification as-is.
+    Failed(String),
+}
+
+/// The channels between a running turn and the runtime.
+pub struct TurnIo {
+    /// Hook payloads the runtime routed to this turn
+    /// ([`Driver::hook_matches`]).
+    pub hooks: mpsc::UnboundedReceiver<serde_json::Value>,
+    /// Progress for the runtime to record and announce.
+    pub updates: mpsc::UnboundedSender<TurnUpdate>,
+}
+
+/// A coding-agent harness. One implementation per harness; adding one must
+/// not change the runtime.
+#[async_trait]
+pub trait Driver: Send + Sync {
+    /// Run one turn from launch to its end. `session` is the agent's current
+    /// session (empty for a new one). Dropped (aborted) on `--stop`, so a
+    /// child it spawns must use `kill_on_drop`.
+    async fn run_turn(
+        &self,
+        agent: &Agent,
+        session: SessionRef,
+        request: TurnRequest,
+        io: TurnIo,
+    ) -> TurnOutcome;
+
+    /// Watch a turn launched before the daemon restarted until it ends. A
+    /// process-per-turn driver lost its child with the daemon and reports
+    /// that.
+    async fn rewatch(
+        &self,
+        agent: &Agent,
+        session: SessionRef,
+        request: TurnRequest,
+        io: TurnIo,
+    ) -> TurnOutcome;
+
+    /// Stop the running turn and keep the session. Called after the turn's
+    /// task was aborted.
+    async fn stop(&self, agent: &Agent, session: &SessionRef) -> Result<(), String>;
+
+    /// Whether a hook payload (`whisrs agent-hook`) belongs to `session`.
+    /// Matched by stored ids only, never by name.
+    fn hook_matches(&self, payload: &serde_json::Value, session: &SessionRef) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.to_string(),
+            hotkey: None,
+            harness: "claude".to_string(),
+            dir: "/proj".to_string(),
+            permissions: "auto".to_string(),
+            command: None,
+            args: Vec::new(),
+            reply_instruction: None,
+        }
+    }
+
+    fn resolve(entries: &[AgentConfig]) -> (Vec<Agent>, Vec<String>) {
+        resolve_agents_with(entries, |p| {
+            p == Path::new("/proj") || p.ends_with("Projects")
+        })
+    }
+
+    #[test]
+    fn a_minimal_entry_takes_the_defaults() {
+        let parsed: crate::Config =
+            toml::from_str("[[agents]]\nname = \"jarvis\"\ndir = \"/proj\"\n").unwrap();
+        let (agents, warnings) = resolve(&parsed.agents);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            agents,
+            vec![Agent {
+                name: "jarvis".to_string(),
+                hotkey: None,
+                harness: Harness::Claude,
+                dir: PathBuf::from("/proj"),
+                permissions: Permissions::Auto,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                instruction: DEFAULT_REPLY_INSTRUCTION.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn every_field_is_read() {
+        let parsed: crate::Config = toml::from_str(
+            r#"
+[[agents]]
+name = "jarvis"
+hotkey = "Super+Shift+J"
+harness = "claude"
+dir = "/proj"
+permissions = "ask"
+command = "/opt/claude/bin/claude"
+args = ["--remote-control", "jarvis"]
+reply_instruction = "Be terse."
+"#,
+        )
+        .unwrap();
+        let (agents, warnings) = resolve(&parsed.agents);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let a = &agents[0];
+        assert_eq!(a.hotkey.as_deref(), Some("Super+Shift+J"));
+        assert_eq!(a.permissions, Permissions::Ask);
+        assert_eq!(a.command, "/opt/claude/bin/claude");
+        assert_eq!(a.args, ["--remote-control", "jarvis"]);
+        assert_eq!(a.instruction, "Be terse.");
+    }
+
+    #[test]
+    fn invalid_entries_are_skipped_with_a_warning() {
+        let mut bad_name = entry("Jarvis!");
+        bad_name.dir = "/proj".into();
+        let mut no_dir = entry("nodir");
+        no_dir.dir = String::new();
+        let mut missing_dir = entry("missing");
+        missing_dir.dir = "/nope".into();
+        let mut unknown_harness = entry("oc");
+        unknown_harness.harness = "opencode".into();
+        let mut unknown_perm = entry("perm");
+        unknown_perm.permissions = "bypassPermissions".into();
+        let entries = vec![
+            entry(""),
+            bad_name,
+            entry("jarvis"),
+            entry("jarvis"),
+            no_dir,
+            missing_dir,
+            unknown_harness,
+            unknown_perm,
+        ];
+        let (agents, warnings) = resolve(&entries);
+        assert_eq!(
+            agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["jarvis"]
+        );
+        assert_eq!(warnings.len(), 7, "{warnings:#?}");
+        assert!(warnings[0].contains("has no name"));
+        assert!(warnings[1].contains("'Jarvis!'"));
+        assert!(warnings[2].contains("duplicate name 'jarvis'"));
+        assert!(warnings[3].contains("has no dir"));
+        assert!(warnings[4].contains("/nope does not exist"));
+        assert!(warnings[5].contains("unknown harness 'opencode'"));
+        assert!(warnings[6].contains("unknown permissions value 'bypassPermissions'"));
+    }
+
+    #[test]
+    fn an_invalid_hotkey_warns_but_keeps_the_agent() {
+        let mut e = entry("jarvis");
+        e.hotkey = Some("Super+Nope".into());
+        let (agents, warnings) = resolve(&[e]);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("invalid hotkey 'Super+Nope'"));
+    }
+
+    #[test]
+    fn a_blank_hotkey_or_command_is_unset() {
+        let mut e = entry("jarvis");
+        e.hotkey = Some("  ".into());
+        e.command = Some(" ".into());
+        let (agents, warnings) = resolve(&[e]);
+        assert!(warnings.is_empty());
+        assert_eq!(agents[0].hotkey, None);
+        assert_eq!(agents[0].command, "claude");
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/Projects"), home.join("Projects"));
+        assert_eq!(expand_tilde("/abs/~/x"), PathBuf::from("/abs/~/x"));
+        let mut e = entry("jarvis");
+        e.dir = "~/Projects".into();
+        let (agents, _) = resolve(&[e]);
+        assert_eq!(agents[0].dir, home.join("Projects"));
+    }
+
+    #[test]
+    fn names_are_lowercase_ascii_words() {
+        assert!(valid_agent_name("jarvis"));
+        assert!(valid_agent_name("my_agent-2"));
+        assert!(!valid_agent_name(""));
+        assert!(!valid_agent_name("Jarvis"));
+        assert!(!valid_agent_name("a b"));
+        assert!(!valid_agent_name("ärger"));
+    }
+
+    #[test]
+    fn harness_and_permissions_parse_case_insensitively() {
+        assert_eq!(Harness::parse(" Claude "), Some(Harness::Claude));
+        assert_eq!(Harness::parse("codex"), None);
+        assert_eq!(Permissions::parse("BYPASS"), Some(Permissions::Bypass));
+        assert_eq!(Permissions::parse("yolo"), None);
+    }
+
+    #[test]
+    fn agent_info_wire_format() {
+        let info = AgentInfo {
+            name: "jarvis".into(),
+            harness: "claude".into(),
+            phase: AgentPhase::NeedsYou,
+            session: Some("cc7a37cf".into()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"jarvis","harness":"claude","phase":"needs-you","session":"cc7a37cf"}"#
+        );
+        assert_eq!(serde_json::from_str::<AgentInfo>(&json).unwrap(), info);
+        assert_eq!(AgentPhase::NeedsYou.to_string(), "needs-you");
+    }
+
+    #[test]
+    fn the_default_instruction_asks_for_spoken_tags() {
+        assert!(DEFAULT_REPLY_INSTRUCTION.contains("<spoken></spoken>"));
+        assert!(!DEFAULT_REPLY_INSTRUCTION.contains('\u{2014}'));
+    }
+}

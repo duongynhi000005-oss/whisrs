@@ -64,6 +64,11 @@ pub struct Config {
     /// [`llm::LlmCommandConfig`]). Empty by default.
     #[serde(default)]
     pub llm_commands: Vec<llm::LlmCommandConfig>,
+    /// Coding agents driven by voice (see [`crate::agent::AgentConfig`]).
+    /// Empty by default: with none, agent mode spawns nothing and writes
+    /// nothing.
+    #[serde(default)]
+    pub agents: Vec<crate::agent::AgentConfig>,
     /// Word/phrase replacements applied to every dictation before it is
     /// typed, and to every line of a recording's transcript:
     /// `"package build" = "PKGBUILD"`. Matching rules are in
@@ -2138,7 +2143,35 @@ impl Config {
 
         warnings.extend(self.validate_recording()?);
 
-        // Duplicate-binding detection across [hotkeys] and llm_commands. The
+        // [[agents]]: the same resolution the daemon runs, so a warned-about
+        // entry is exactly one the daemon skips.
+        let (agents, agent_warnings) = crate::agent::resolve_agents(&self.agents);
+        warnings.extend(
+            agent_warnings
+                .into_iter()
+                .map(|message| ConfigWarning { message }),
+        );
+        if !agents.is_empty() {
+            let tts_on = self.tts.as_ref().is_some_and(|t| t.enabled);
+            if !tts_on {
+                warnings.push(ConfigWarning {
+                    message: if self.general.notify {
+                        "[[agents]] are configured but [tts] is not enabled, so agent \
+                         replies arrive as notifications only. Set [tts] enabled = true to \
+                         hear them."
+                            .to_string()
+                    } else {
+                        "[[agents]] are configured but [tts] is not enabled and [general] \
+                         notify = false, so agent replies are neither spoken nor shown. Set \
+                         [tts] enabled = true to hear them."
+                            .to_string()
+                    },
+                });
+            }
+        }
+
+        // Duplicate-binding detection across [hotkeys], llm_commands and
+        // agents. The
         // listener dispatches every action whose binding matches, with no
         // early exit, so a shared combo silently fires multiple commands and
         // the loser's error is never seen. Compare parsed bindings (sorted
@@ -2177,6 +2210,11 @@ impl Config {
                         set_hotkey.as_str(),
                     ));
                 }
+            }
+        }
+        for agent in &agents {
+            if let Some(hotkey) = &agent.hotkey {
+                binding_sources.push((format!("agents '{}' hotkey", agent.name), hotkey.as_str()));
             }
         }
         let mut seen_bindings: std::collections::HashMap<(Vec<u16>, u16), (String, String)> =
@@ -3906,6 +3944,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4023,6 +4062,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4056,6 +4096,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4092,6 +4133,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4136,6 +4178,7 @@ mod tests {
                 hotkeys: None,
                 hooks: None,
                 llm_commands: Vec::new(),
+                agents: Vec::new(),
                 replacements: BTreeMap::new(),
                 recording: None,
                 overlay: None,
@@ -4216,6 +4259,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4441,6 +4485,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4705,6 +4750,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4763,6 +4809,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4799,6 +4846,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4836,6 +4884,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4873,6 +4922,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4910,6 +4960,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4944,6 +4995,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5020,6 +5072,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5062,6 +5115,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5106,6 +5160,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5175,6 +5230,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5232,6 +5288,7 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5335,6 +5392,110 @@ mod tests {
             "the warning must name both fields: {}",
             warning.message
         );
+    }
+
+    /// An `[[agents]]` entry in a dir that exists (the crate root).
+    fn agent_entry(name: &str, hotkey: Option<&str>) -> crate::agent::AgentConfig {
+        crate::agent::AgentConfig {
+            name: name.to_string(),
+            hotkey: hotkey.map(str::to_string),
+            harness: "claude".to_string(),
+            dir: env!("CARGO_MANIFEST_DIR").to_string(),
+            permissions: "auto".to_string(),
+            command: None,
+            args: Vec::new(),
+            reply_instruction: None,
+        }
+    }
+
+    #[test]
+    fn config_validate_warns_agent_hotkey_clashes() {
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+Shift+J".to_string()),
+            ..Default::default()
+        });
+        config.agents = vec![agent_entry("jarvis", Some("shift+super+j"))];
+        let warnings = config.validate().unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("duplicate hotkey binding"))
+            .unwrap_or_else(|| panic!("expected a clash warning, got: {warnings:?}"));
+        assert!(
+            warning.message.contains("[hotkeys] toggle")
+                && warning.message.contains("agents 'jarvis' hotkey"),
+            "{}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn config_validate_reports_skipped_agents_and_their_hotkeys_bind_nothing() {
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+Shift+J".to_string()),
+            ..Default::default()
+        });
+        let mut missing_dir = agent_entry("ghost", Some("Super+Shift+J"));
+        missing_dir.dir = "/definitely/not/here".to_string();
+        config.agents = vec![missing_dir];
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("'ghost' is skipped")),
+            "{warnings:?}"
+        );
+        // A skipped entry's hotkey is never bound, so it clashes with nothing.
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.message.contains("duplicate hotkey binding")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_warns_once_when_agents_cannot_speak() {
+        let mut config = validatable_config("groq");
+        config.agents = vec![agent_entry("jarvis", None), agent_entry("friday", None)];
+        let tts_warnings = |config: &Config| {
+            config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .filter(|w| w.message.contains("[[agents]] are configured but [tts]"))
+                .collect::<Vec<_>>()
+        };
+        let warnings = tts_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("notifications only"));
+
+        config.general.notify = false;
+        let warnings = tts_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("neither spoken nor shown"));
+
+        config.tts = Some(toml::from_str("enabled = true\nbackend = \"groq\"").unwrap());
+        assert!(tts_warnings(&config).is_empty());
+
+        // No agents, no warning.
+        config.tts = None;
+        config.agents.clear();
+        assert!(tts_warnings(&config).is_empty());
+    }
+
+    /// `[[agents]]` keys are known keys: no unknown-key warning.
+    #[test]
+    fn agent_keys_are_not_unknown() {
+        let unknown = unknown_config_keys(
+            "[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+Shift+J\"\nharness = \"claude\"\n\
+             dir = \"~/Projects/whisrs\"\npermissions = \"ask\"\ncommand = \"claude\"\n\
+             args = [\"--remote-control\", \"jarvis\"]\nreply_instruction = \"Be brief.\"\n",
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
+        let unknown = unknown_config_keys("[[agents]]\nname = \"jarvis\"\nbogus = 1\n");
+        assert_eq!(unknown, vec!["agents[0].bogus".to_string()]);
     }
 
     /// The recording checks, in a build with the feature.
