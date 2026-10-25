@@ -312,16 +312,20 @@ captures (`may_speak`), errors too (`spoken::spoken_error`). A `ReplyHold` (a co
 `[[llm_commands]]` press until it records, a recording start) also holds them, checked under the
 dictation lock in `speak_text`. A dictation toggle or command press stops an agent reply
 (`speak::stop_agent_playback`, by `DaemonState::tts_origin`), never a selection read-aloud; a
-recording start stops it too and requeues it at the front (`agent::hold_for_recording`). The Claude driver starts `claude --bg` sessions with `--settings` hooks (`Stop`,
+recording start stops it too and requeues it at the front (`agent::hold_for_recording`). An agent
+press refused while its turn runs stops only that agent's own reply or notice and then queues no
+notice (`AgentRuntime::is_playing_for`); another agent's reply plays on, the notice after it. The Claude driver starts `claude --bg` sessions with `--settings` hooks (`Stop`,
 `Notification`) that run `whisrs agent-hook --socket <sock>`; under a systemd service the `--bg`
 launch runs in its own `systemd-run --user --scope` (Claude Code's background service must not
 live in the whisrs unit). The next turn is refused while `claude agents` lists the session
-`working`, else `claude stop`, a wait until its listed pid has exited (`ClaudeDriver::wait_for_exit`:
+`working`, else `claude stop`, a wait until its listed pid has exited (`Exits::wait_for_exit`:
 `claude stop` returns, and the listing drops the pid, before Claude Code settles it; capped at 10 s,
 then the turn fails), then `claude --bg --resume <id> -- <text>` with no other flag (any flag, or a
-resume before the settle, starts a copy without the hooks or `--remote-control`). A copy is never
-adopted: stopped + `claude rm`-ed on the launch task, the resume tried once more, a second copy
-fails the turn (`claude::cannot_continue`); only a `Stop` received after that launch ends it (an earlier one is the old
+resume before the settle, starts a copy without the hooks or `--remote-control`). Every listed pid
+is remembered with its `/proc` start time until seen to exit, so a session already listed with no
+pid is waited for too (`Exits::settle`). A copy is never adopted: stopped, waited for and
+`claude rm`-ed on the launch task (never the session's own bg id, `claude::copy_id`), the resume
+tried once more, a second copy fails the turn (`claude::cannot_continue`); only a `Stop` received after that launch ends it (an earlier one is the old
 process's own reply, `TurnUpdate::SessionReply`). A `Stop` with no turn running is the session's own
 reply and is spoken, unless it repeats a turn that ended on a poll (`TurnOutcome::PolledReply`); a
 permission prompt with no turn running marks needs-you. A session working on its own refuses a turn

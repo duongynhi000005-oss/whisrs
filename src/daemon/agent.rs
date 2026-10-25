@@ -67,12 +67,25 @@ const DIDNT_CATCH: &str = "I didn't catch that.";
 /// The longest instruction a refusal notification repeats, in bytes.
 const REFUSED_INSTRUCTION_MAX: usize = 500;
 
+/// What a turn that waits for you is called when it never said what it
+/// waits for (its needs-you notice names that).
+const WAITING_FOR_YOU: &str = "It's waiting for you.";
+
+/// After the needs-you notice, when forgetting the session (`--new`,
+/// `--reset`) is refused because the turn waits for you.
+const WAITING_HINT: &str = "A plain press answers it; to start fresh, stop it first:";
+
+/// The queue key of a needs-you notice spoken for a refused fresh-session
+/// press ([`Utterance::notice`]).
+const WAITING_KEY: &str = "waiting-for-you";
+
 /// Whether an agent error was already notified where it happened: the
-/// busy refusals, and the refusal while a recording runs
-/// (`refuse_while_recording` notifies it).
+/// busy refusals (a turn that waits for you included), and the refusal
+/// while a recording runs (`refuse_while_recording` notifies it).
 pub(crate) fn error_already_notified(message: &str) -> bool {
     message.starts_with(STILL_WORKING)
         || message.starts_with(BACKGROUND_TASK)
+        || message.contains(WAITING_HINT)
         || message.starts_with("A recording is in progress.")
 }
 
@@ -159,6 +172,10 @@ struct Slot {
     /// not spoken twice. Taken by the next `Stop` with no turn running, and
     /// cleared when another turn ends.
     polled_reply: Option<String>,
+    /// The notice spoken when the agent last started waiting for you
+    /// ("Waiting for your approval to use Bash."). Meant only while `phase`
+    /// is needs-you.
+    needs_you: Option<String>,
 }
 
 impl Default for Slot {
@@ -167,7 +184,22 @@ impl Default for Slot {
             phase: AgentPhase::Idle,
             turn: None,
             polled_reply: None,
+            needs_you: None,
         }
+    }
+}
+
+impl Slot {
+    /// Mark the agent needs-you, with the notice that says so.
+    fn wait_for_you(&mut self, notice: &str) {
+        self.phase = AgentPhase::NeedsYou;
+        self.needs_you = Some(notice.to_string());
+    }
+
+    /// The needs-you notice while a whisrs turn of the agent waits for you.
+    fn waiting(&self) -> Option<&str> {
+        (self.turn.is_some() && self.phase == AgentPhase::NeedsYou)
+            .then(|| self.needs_you.as_deref().unwrap_or(WAITING_FOR_YOU))
     }
 }
 
@@ -184,9 +216,10 @@ struct Inner {
 struct Utterance {
     agent: String,
     text: String,
-    /// The busy notice this speaks ([`Busy::notice`]): one per agent at a
-    /// time, queued or playing. `None` for replies and every other line,
-    /// which are never deduplicated.
+    /// The refusal notice this speaks, as its key ([`Busy::notice`], or
+    /// [`WAITING_KEY`]): one of a kind per agent at a time, queued or
+    /// playing. `None` for replies and every other line, which are never
+    /// deduplicated.
     notice: Option<&'static str>,
 }
 
@@ -388,10 +421,17 @@ impl AgentRuntime {
     /// Not queued again while the same notice for this agent is queued or
     /// playing: compared as the notice, not the spoken line.
     fn say_notice(&self, agent: &str, notice: &'static str) {
+        self.say_keyed(agent, notice, notice.to_string());
+    }
+
+    /// Queue the refusal notice `text` under `key`, named after the agent
+    /// when there are several, unless one of that key is queued or playing
+    /// for this agent.
+    fn say_keyed(&self, agent: &str, key: &'static str, text: String) {
         self.enqueue(Utterance {
             agent: agent.to_string(),
-            text: self.line_for(agent, notice.to_string()),
-            notice: Some(notice),
+            text: self.line_for(agent, text),
+            notice: Some(key),
         });
     }
 
@@ -475,6 +515,15 @@ impl AgentRuntime {
 
     fn set_playing(&self, utterance: Option<Utterance>) {
         *self.playing.lock().unwrap_or_else(|e| e.into_inner()) = utterance;
+    }
+
+    /// Whether the utterance being spoken is `agent`'s (a reply or a notice).
+    fn is_playing_for(&self, agent: &str) -> bool {
+        self.playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|u| u.agent == agent)
     }
 
     /// Whether the queue is speaking an utterance (from just before it asks
@@ -588,6 +637,7 @@ impl AgentRuntime {
         rows
     }
 
+    #[cfg(test)]
     async fn phase(&self, name: &str) -> AgentPhase {
         let inner = self.inner.lock().await;
         inner
@@ -599,10 +649,39 @@ impl AgentRuntime {
 
     /// Whether a whisrs turn of the agent runs, also one that waits for the
     /// user (needs-you).
+    #[cfg(test)]
     async fn has_turn(&self, name: &str) -> bool {
         let inner = self.inner.lock().await;
         inner.slots.get(name).is_some_and(|s| s.turn.is_some())
     }
+
+    /// Why a press for `name` is refused before it records, if it is: the
+    /// agent's turn works; with `new_session`, any turn of it runs, and one
+    /// that waits for you is named by its needs-you notice (a plain press
+    /// answers that one).
+    async fn press_refusal(&self, name: &str, new_session: bool) -> Option<Refusal> {
+        let inner = self.inner.lock().await;
+        let slot = inner.slots.get(name)?;
+        if slot.phase == AgentPhase::Working {
+            return Some(Refusal::Busy);
+        }
+        if !new_session || slot.turn.is_none() {
+            return None;
+        }
+        Some(match slot.waiting() {
+            Some(notice) => Refusal::Waiting(notice.to_string()),
+            None => Refusal::Busy,
+        })
+    }
+}
+
+/// Why a voice press is refused before it records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refusal {
+    /// The agent's turn works (with `--new`: any turn of it runs).
+    Busy,
+    /// `--new` while the agent's turn waits for you: its needs-you notice.
+    Waiting(String),
 }
 
 /// A session for the log: its id, else the bg id of a launch whose session
@@ -1019,7 +1098,7 @@ pub(crate) async fn handle_agent_event(context: &DaemonContext, payload: serde_j
                         let mut inner = rt.inner.lock().await;
                         let slot = inner.slots.entry(agent.name.clone()).or_default();
                         if slot.turn.is_none() {
-                            slot.phase = AgentPhase::NeedsYou;
+                            slot.wait_for_you(&notice);
                         }
                     }
                     info!(
@@ -1362,7 +1441,9 @@ async fn apply_update(context: &DaemonContext, agent: &Agent, generation: u64, u
             forward_unclaimed(context, &mut inner, agent, &session, &hooks, started);
         }
         TurnUpdate::NeedsYou(notice) => {
-            set_phase(&mut inner, AgentPhase::NeedsYou);
+            if let Some(slot) = inner.slots.get_mut(&agent.name) {
+                slot.wait_for_you(&notice);
+            }
             drop(inner);
             announce_needs_you(context, agent, notice);
         }
@@ -1433,24 +1514,24 @@ async fn finish_turn(
 }
 
 /// The error for forgetting the session while a turn runs (`--reset`, or
-/// `--new` while recording or sending).
-fn reset_refusal(agent: &Agent) -> String {
-    format!(
-        "{STILL_WORKING} Stop it first: whisrs agent {} --stop",
-        agent.name
-    )
+/// `--new` while recording or sending). A turn that waits for you is named
+/// by its needs-you notice (`waiting`), which a plain press answers.
+fn reset_refusal(agent: &Agent, waiting: Option<&str>) -> String {
+    match waiting {
+        Some(notice) => format!("{notice} {WAITING_HINT} whisrs agent {} --stop", agent.name),
+        None => format!(
+            "{STILL_WORKING} Stop it first: whisrs agent {} --stop",
+            agent.name
+        ),
+    }
 }
 
 /// Forget the agent's session. Refused while a turn runs.
 async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     let rt = &context.agents;
     let mut inner = rt.inner.lock().await;
-    if inner
-        .slots
-        .get(&agent.name)
-        .is_some_and(|s| s.turn.is_some())
-    {
-        return Err(reset_refusal(agent));
+    if let Some(slot) = inner.slots.get(&agent.name).filter(|s| s.turn.is_some()) {
+        return Err(reset_refusal(agent, slot.waiting()));
     }
     let record = record_mut(&mut inner, agent);
     if let Some(old) = record.session_id.take() {
@@ -1589,6 +1670,41 @@ fn notify_busy(
     busy.message(&agent.name)
 }
 
+/// Refuse a fresh session while the agent's turn waits for you: notified
+/// (per `[general] notify`, repeating `instruction` when there is one) with
+/// how to go on, and the needs-you notice spoken again unless `speak` is
+/// off (the press just stopped this agent's playback). Returns the error
+/// for a CLI request.
+fn refuse_waiting(
+    context: &DaemonContext,
+    agent: &Agent,
+    notice: &str,
+    instruction: Option<&str>,
+    speak: bool,
+) -> String {
+    info!(
+        "agent '{}': refused a fresh session, its turn waits for you",
+        agent.name
+    );
+    let message = reset_refusal(agent, Some(notice));
+    if context.notify_error() {
+        let mut body = format!("{}: {message}", agent.name);
+        if let Some(text) = instruction.map(str::trim).filter(|t| !t.is_empty()) {
+            body.push_str(&format!(
+                " Not sent: \"{}\".",
+                truncate_preview(text, REFUSED_INSTRUCTION_MAX)
+            ));
+        }
+        send_notification_for("whisrs", &body, REPLY_NOTIFICATION_MS);
+    }
+    if speak {
+        context
+            .agents
+            .say_keyed(&agent.name, WAITING_KEY, notice.to_string());
+    }
+    message
+}
+
 // ---------------------------------------------------------------------------
 // Voice turns: the recording sink
 // ---------------------------------------------------------------------------
@@ -1598,20 +1714,25 @@ fn notify_busy(
 ///
 /// - Recording for this agent: stop and transcribe (a press of either kind;
 ///   the press that started the recording decides about the session).
-/// - An agent reply or notice playing: stop it first (barge-in), also while
-///   this agent's turn runs, so a press always silences it.
-/// - This agent's turn runs (`--new`: any turn, also one that waits for
-///   you): refuse. With nothing stopped, the notice is spoken and notified;
-///   a press that stopped what played only notifies, so it never queues
-///   another notice in its place.
-/// - Otherwise record a voice turn (a selection read-aloud is stopped for
-///   it). Anything else: busy.
+/// - This agent's turn works (`--new`: any turn of it runs): refuse. When
+///   this agent's own reply or notice plays, the press stops it and only
+///   notifies, so it never queues another notice in its place; another
+///   agent's reply plays on, and the notice is spoken (once) after it.
+///   `--new` while the turn waits for you says so with its needs-you notice
+///   (a plain press answers it).
+/// - Otherwise an agent reply or notice playing (any agent's) is stopped
+///   (barge-in) and a voice turn recorded (a selection read-aloud is
+///   stopped for it). Anything else: busy.
 async fn voice_toggle(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
     agent: Arc<Agent>,
     new_session: bool,
 ) -> Response {
+    let rt = &context.agents;
+    // Known before the playback check: a refused press silences only this
+    // agent's own playback.
+    let refusal = rt.press_refusal(&agent.name, new_session).await;
     // Held from a barge-in stop until the recording started or the press
     // was refused, so the reply queue cannot start the next reply between
     // the stop and the recording.
@@ -1643,37 +1764,46 @@ async fn voice_toggle(
                 return error("busy: still transcribing, try again in a moment");
             }
             State::Speaking | State::Synthesizing => {
-                let reason = format!("agent '{}'", agent.name);
-                if crate::speak::stop_agent_playback(&mut ds, &context, &reason) {
-                    barge_in = Some(context.agents.hold_replies());
+                // Another agent's reply is not this press's to silence
+                // when the press is refused: it would be lost.
+                if refusal.is_none() || rt.is_playing_for(&agent.name) {
+                    let reason = format!("agent '{}'", agent.name);
+                    if crate::speak::stop_agent_playback(&mut ds, &context, &reason) {
+                        barge_in = Some(rt.hold_replies());
+                    }
                 }
             }
             State::Idle => {}
         }
     }
 
-    let rt = &context.agents;
-    let busy = if new_session {
-        rt.has_turn(&agent.name).await
-    } else {
-        rt.phase(&agent.name).await == AgentPhase::Working
-    };
-    if busy {
-        let message = if barge_in.is_some() {
+    if let Some(refusal) = refusal {
+        // A press that stopped this agent's playback asked for silence: no
+        // notice is spoken in its place.
+        let speak = barge_in.is_none();
+        if !speak {
             info!(
-                "agent '{}': the press stopped the playback; no notice is queued for the \
+                "agent '{}': the press stopped its playback; no notice is queued for the \
                  refusal",
                 agent.name
             );
-            notify_busy(&context, &agent, Busy::Turn, None)
-        } else {
-            refuse_busy(&context, &agent, Busy::Turn, None)
+        }
+        let message = match refusal {
+            Refusal::Waiting(notice) => refuse_waiting(&context, &agent, &notice, None, speak),
+            Refusal::Busy => {
+                let message = if speak {
+                    refuse_busy(&context, &agent, Busy::Turn, None)
+                } else {
+                    notify_busy(&context, &agent, Busy::Turn, None)
+                };
+                if new_session {
+                    reset_refusal(&agent, None)
+                } else {
+                    message
+                }
+            }
         };
-        return error(&if new_session {
-            reset_refusal(&agent)
-        } else {
-            message
-        });
+        return error(&message);
     }
 
     #[cfg(feature = "recording")]
@@ -1840,7 +1970,14 @@ async fn voice_turn_background(
         // A typed turn may have started while this one recorded: the
         // session is not forgotten under it.
         if reset(&context, &agent).await.is_err() {
-            refuse_busy(&context, &agent, Busy::Turn, Some(&text));
+            match rt.press_refusal(&agent.name, true).await {
+                Some(Refusal::Waiting(notice)) => {
+                    refuse_waiting(&context, &agent, &notice, Some(&text), true);
+                }
+                _ => {
+                    refuse_busy(&context, &agent, Busy::Turn, Some(&text));
+                }
+            }
             return;
         }
     }
@@ -2449,6 +2586,11 @@ mod tests {
         // The CLI errors of both refusals are what was notified already.
         assert!(error_already_notified(&Busy::Turn.message("jarvis")));
         assert!(error_already_notified(&Busy::Background.message("jarvis")));
+        // A fresh session refused while the turn waits for you.
+        assert!(error_already_notified(&reset_refusal(
+            &test_agent("jarvis"),
+            Some("Waiting for your approval to use Bash.")
+        )));
         assert!(error_already_notified(
             "A recording is in progress. Agent 'jarvis' is off until you stop it."
         ));
@@ -2697,33 +2839,145 @@ mod tests {
         assert_eq!(queued(&context.agents), [STILL_WORKING]);
     }
 
-    /// `--new` is refused while any turn of the agent runs, also one that
-    /// waits for you (a plain press would answer that one), and says how to
-    /// go on.
+    /// `--new` is refused while any turn of the agent runs and says how to
+    /// go on. One that waits for you is named by its needs-you notice, as
+    /// whisrs said it when the turn started waiting (a plain press answers
+    /// it): spoken once, however often the press comes.
     #[tokio::test]
     async fn a_fresh_session_press_is_refused_while_a_turn_runs() {
         let dir = tempfile::tempdir().unwrap();
         let context = test_context(&["jarvis"], dir.path());
         let agent = Arc::clone(&context.agents.agents[0]);
         install_turn(&context, "jarvis", 1, "the running one").await;
-        context
-            .agents
-            .inner
-            .lock()
-            .await
-            .slots
-            .get_mut("jarvis")
-            .unwrap()
-            .phase = AgentPhase::NeedsYou;
         let ds = Arc::new(Mutex::new(DaemonState::new()));
-        let response = voice_toggle(Arc::clone(&ds), Arc::clone(&context), agent, true).await;
+        let press = || {
+            voice_toggle(
+                Arc::clone(&ds),
+                Arc::clone(&context),
+                Arc::clone(&agent),
+                true,
+            )
+        };
+
+        // Working.
+        let response = press().await;
         assert!(
             matches!(&response, Response::Error { message }
                 if message == "Still working on the last one. Stop it first: whisrs agent jarvis --stop"),
             "{response:?}"
         );
-        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
         assert_eq!(queued(&context.agents), [STILL_WORKING]);
+
+        // Waiting for you: what whisrs said when it started waiting.
+        apply_update(
+            &context,
+            &agent,
+            1,
+            TurnUpdate::NeedsYou("Waiting for your approval to use Bash.".into()),
+        )
+        .await;
+        assert_eq!(
+            queued(&context.agents),
+            ["Waiting for your approval to use Bash."]
+        );
+        let waiting = "Waiting for your approval to use Bash. A plain press answers it; to start \
+                       fresh, stop it first: whisrs agent jarvis --stop";
+        for _ in 0..2 {
+            let response = press().await;
+            assert!(
+                matches!(&response, Response::Error { message } if message == waiting),
+                "{response:?}"
+            );
+        }
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+        assert_eq!(
+            queued(&context.agents),
+            ["Waiting for your approval to use Bash."]
+        );
+        // `--new --text` and `--reset` say the same.
+        for (action, text) in [
+            (AgentAction::Send, Some("fresh".to_string())),
+            (AgentAction::Reset, None),
+        ] {
+            let response = handle_agent(
+                Arc::clone(&ds),
+                Arc::clone(&context),
+                action,
+                Some("jarvis".into()),
+                text,
+                action == AgentAction::Send,
+            )
+            .await;
+            assert!(
+                matches!(&response, Response::Error { message } if message == waiting),
+                "{action:?}: {response:?}"
+            );
+        }
+        // A plain press is not refused for it (it answers the turn): the
+        // refusal check lets it through to the recording.
+        assert_eq!(context.agents.press_refusal("jarvis", false).await, None);
+    }
+
+    /// A refused press stops only this agent's own playback: another
+    /// agent's reply plays on (it would be lost), and the refusal is spoken
+    /// after it, once. This agent's reply is stopped and nothing is queued
+    /// in its place.
+    #[tokio::test]
+    async fn a_refused_press_leaves_another_agents_reply_playing() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis", "friday"], dir.path());
+        let rt = &context.agents;
+        let agent = Arc::clone(&rt.agents[0]);
+        install_turn(&context, "jarvis", 1, "the running one").await;
+        let other = |text: &str| Utterance {
+            agent: "friday".into(),
+            text: text.into(),
+            notice: None,
+        };
+        for new_session in [false, true] {
+            let ds = Arc::new(Mutex::new(DaemonState::new()));
+            let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
+            rt.set_playing(Some(other("friday: The build is green.")));
+            for _ in 0..2 {
+                let response = voice_toggle(
+                    Arc::clone(&ds),
+                    Arc::clone(&context),
+                    Arc::clone(&agent),
+                    new_session,
+                )
+                .await;
+                assert!(matches!(response, Response::Error { .. }), "{response:?}");
+            }
+            assert!(!stop.load(Ordering::Acquire), "friday's reply was stopped");
+            assert_eq!(ds.lock().await.state_machine.state(), State::Speaking);
+            assert!(rt.is_playing_for("friday"));
+            assert_eq!(queued(rt), [format!("jarvis: {STILL_WORKING}")]);
+            assert!(!replies_held(&context));
+            rt.set_playing(None);
+        }
+
+        // This agent's own reply: stopped, refused, nothing queued.
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
+        rt.set_playing(Some(utterance("jarvis: A reply it produced on its own.")));
+        let response = voice_toggle(
+            Arc::clone(&ds),
+            Arc::clone(&context),
+            Arc::clone(&agent),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&response, Response::Error { message } if message == STILL_WORKING),
+            "{response:?}"
+        );
+        assert!(
+            stop.load(Ordering::Acquire),
+            "its own reply was not stopped"
+        );
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+        rt.set_playing(None);
+        assert!(queued(rt).is_empty(), "a notice was queued");
     }
 
     /// A transcription backend that always hears the same words.

@@ -135,7 +135,10 @@ takes). With
 record a voice instruction for that agent (the same as its hotkey; run again
 to stop) and send it to the agent's session; the reply is spoken through
 .B [tts]
-when the turn ends, and the next turn continues the same session.
+when the turn ends, and the next turn continues the same session. A run
+while that agent's turn is still working is refused with a short spoken
+notice; when that agent's own reply or notice is playing, it only stops it,
+and another agent's reply keeps playing.
 .B \-\-text
 sends
 .I TEXT
@@ -153,7 +156,8 @@ it sends
 to a fresh session.
 .B \-\-reset
 forgets the session and sends nothing; the next turn starts a new one. Both
-are refused while a turn of that agent runs.
+are refused while a turn of that agent runs (one that waits for you is named
+by what it waits for, since a plain run answers it).
 .B \-\-stop
 stops the running turn and keeps the session. With no turn running it stops
 work the session does on its own, such as a background task it started, which

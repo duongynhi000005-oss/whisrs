@@ -15,9 +15,12 @@
 //!   Code settles the session), then `claude --bg --resume <session id> --
 //!   <text>`, which keeps the session id and the saved options (`--settings`
 //!   and `--remote-control` included). Any other flag, or a resume while the
-//!   old process still runs, starts a copy without them. A copy is never
-//!   adopted: it is stopped and removed, and the resume is tried once more
-//!   after the old process is gone; a second copy fails the turn.
+//!   old process still runs, starts a copy without them. Every pid a listing
+//!   shows is remembered until it is seen to exit, so a session stopped
+//!   elsewhere (listed with no pid while its process still exits) is waited
+//!   for too. A copy is never adopted: it is stopped, waited for and
+//!   removed (never the session's own bg id), and the resume is tried once
+//!   more after the old process is gone; a second copy fails the turn.
 //! - Turn end: the `Stop` hook (`whisrs agent-hook`, installed through
 //!   `--settings` on whisrs-started sessions only) carries
 //!   `last_assistant_message`. Only a `Stop` received after this turn's launch
@@ -35,9 +38,10 @@
 //! Only ids this driver learned from sessions whisrs started are ever passed
 //! to `claude`; nothing is matched by name.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -123,12 +127,8 @@ pub struct ClaudeDriver {
     hook_command: String,
     poll_interval: Duration,
     done_grace: Duration,
-    /// How often, and how long, a stopped session is waited for, how often
-    /// its process is checked, and the grace after it exited.
-    stop_poll: Duration,
-    stop_wait: Duration,
-    exit_poll: Duration,
-    settle_grace: Duration,
+    /// The processes of our sessions, and the waits for them to exit.
+    exits: Exits,
     /// Launch `--bg` in a scope of its own ([`in_service_unit`]).
     use_scope: bool,
 }
@@ -141,10 +141,7 @@ impl ClaudeDriver {
             hook_command: hook_command(whisrs_bin, socket),
             poll_interval: POLL_INTERVAL,
             done_grace: DONE_GRACE,
-            stop_poll: STOP_POLL,
-            stop_wait: STOP_WAIT,
-            exit_poll: EXIT_POLL,
-            settle_grace: SETTLE_GRACE,
+            exits: Exits::new(STOP_POLL, STOP_WAIT, EXIT_POLL, SETTLE_GRACE),
             use_scope: in_service_unit(),
         }
     }
@@ -262,12 +259,24 @@ pub fn parse_copy_note(output: &str) -> Option<String> {
     })
 }
 
-/// Whether a resume started a copy instead of continuing in place: it
-/// printed another bg id than the session's, or said it started a copy. A
-/// copy comes back without the session's saved options (the `--settings`
-/// hooks, `--remote-control`, the permission mode), so it is never adopted.
-pub fn resumed_a_copy(expected_bg: Option<&str>, printed_bg: &str, copy_note: bool) -> bool {
-    copy_note || expected_bg.is_some_and(|expected| expected != printed_bg)
+/// The bg id of the copy a resume started instead of continuing in place,
+/// if it did: the id its copy note names ([`parse_copy_note`]), else the bg
+/// id it printed when that is not the session's (`session_bg`). A copy comes
+/// back without the session's saved options (the `--settings` hooks,
+/// `--remote-control`, the permission mode), so it is never adopted, and it
+/// is stopped and removed. Never the session's own bg id: a note that names
+/// it, with that id printed, is taken as continued in place, since removing
+/// that id would remove the session itself.
+pub fn copy_id(
+    session_bg: Option<&str>,
+    printed_bg: &str,
+    copy_note: Option<&str>,
+) -> Option<String> {
+    let not_the_session = |id: &&str| session_bg != Some(*id);
+    copy_note
+        .filter(not_the_session)
+        .or_else(|| session_bg.and(Some(printed_bg)).filter(not_the_session))
+        .map(str::to_string)
 }
 
 /// The error for a turn Claude Code would only run in a copy of the session.
@@ -528,13 +537,45 @@ pub fn stat_state(stat: &str) -> Option<char> {
     stat.rsplit_once(')')?.1.trim_start().chars().next()
 }
 
-/// Whether process `pid` still runs. A zombie (exited, not reaped yet) does
-/// not.
-fn process_running(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+/// The start time of a `/proc/<pid>/stat` line (field 22, clock ticks since
+/// boot). With the pid it names one process: a pid the kernel gave to
+/// another process since has another start time.
+pub fn stat_start(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
         .ok()
-        .and_then(|stat| stat_state(&stat))
-        .is_some_and(|state| !matches!(state, 'Z' | 'X' | 'x'))
+}
+
+/// A process `claude agents` listed for one of our sessions: its pid and its
+/// start time ([`stat_start`]), so that a pid an unrelated process got since
+/// is not taken for it (it would hold up a turn for nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListedProcess {
+    pid: u32,
+    started: u64,
+}
+
+impl ListedProcess {
+    /// Process `pid`, while it runs. A zombie (exited, not reaped yet) does
+    /// not run.
+    fn running_now(pid: u32) -> Option<Self> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        if matches!(stat_state(&stat)?, 'Z' | 'X' | 'x') {
+            return None;
+        }
+        Some(Self {
+            pid,
+            started: stat_start(&stat)?,
+        })
+    }
+
+    /// Whether it still runs: its pid runs, and started when it did.
+    fn running(&self) -> bool {
+        Self::running_now(self.pid).is_some_and(|now| now.started == self.started)
+    }
 }
 
 /// What a hook payload means to a turn.
@@ -861,8 +902,9 @@ async fn learn_session(agent: &Agent, bg_id: &str) -> Result<ListedSession, Stri
 /// What a `claude --bg` launch printed.
 struct Launch {
     bg_id: String,
-    /// It said it started a copy ([`parse_copy_note`]).
-    copy_note: bool,
+    /// The bg id its copy note names, when it said it started a copy
+    /// ([`parse_copy_note`]).
+    copy_note: Option<String>,
 }
 
 /// Launch `args` and return the bg id it printed.
@@ -882,9 +924,7 @@ async fn launch(agent: &Agent, args: &[String], use_scope: bool) -> Result<Launc
             out.stdout.trim()
         )
     })?;
-    let copy_note = parse_copy_note(&out.stderr)
-        .or_else(|| parse_copy_note(&out.stdout))
-        .is_some();
+    let copy_note = parse_copy_note(&out.stderr).or_else(|| parse_copy_note(&out.stdout));
     Ok(Launch { bg_id, copy_note })
 }
 
@@ -903,21 +943,214 @@ async fn stop_bg(agent: &Agent, bg_id: &str) -> Result<(), String> {
     }
 }
 
-/// Stop and remove a copy a resume started. Its bg id came from our own
-/// launch's output, so it is ours; nothing else is ever removed.
-async fn discard_copy(agent: &Agent, bg_id: &str) {
-    if let Err(e) = stop_bg(agent, bg_id).await {
-        debug!("agent '{}': {e}", agent.name);
+/// What `claude agents` showed once a stopped session's process was gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stopped {
+    /// Listed with no process: a resume continues it in place.
+    Exited,
+    /// No longer listed (`claude rm`).
+    Gone,
+}
+
+/// The processes `claude agents` listed for our sessions, remembered per bg
+/// id until they are seen to exit, and the waits for them. `claude stop`
+/// returns, and the listing drops the pid, before the process exits (up to
+/// two seconds, measured on 2.1.301), and a resume before it is gone starts
+/// a copy. A session stopped elsewhere (`whisrs agent <name> --stop`, a turn
+/// stopped during its launch, a wait that ran out) is then listed with no pid
+/// while its process still runs, so the remembered pid is what a resume
+/// waits for.
+#[derive(Debug, Clone)]
+struct Exits {
+    seen: Arc<Mutex<HashMap<String, Vec<ListedProcess>>>>,
+    /// How often a stopped session is listed until its process is gone.
+    stop_poll: Duration,
+    /// How long that may take in all ([`STOP_WAIT`]).
+    stop_wait: Duration,
+    /// How often a remembered process is checked once the listing lost it.
+    exit_poll: Duration,
+    /// The grace after it exited, for Claude Code to settle the session.
+    settle_grace: Duration,
+}
+
+impl Exits {
+    fn new(
+        stop_poll: Duration,
+        stop_wait: Duration,
+        exit_poll: Duration,
+        settle_grace: Duration,
+    ) -> Self {
+        Self {
+            seen: Arc::default(),
+            stop_poll,
+            stop_wait,
+            exit_poll,
+            settle_grace,
+        }
     }
-    let args = ["rm".to_string(), bg_id.to_string()];
-    match run_claude(agent, &args, QUICK_TIMEOUT).await {
-        Ok(out) if out.success => info!("agent '{}': removed the copy {bg_id}", agent.name),
-        Ok(out) => warn!(
-            "agent '{}': `claude rm {bg_id}` failed: {}",
+
+    fn seen(&self) -> MutexGuard<'_, HashMap<String, Vec<ListedProcess>>> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Remember the process a listing shows for `bg_id` (with its start
+    /// time, read now), and forget those of it that exited.
+    fn note(&self, bg_id: &str, listed: &ListedSession) {
+        let Some(pid) = listed.pid else {
+            return;
+        };
+        let mut seen = self.seen();
+        let processes = seen.entry(bg_id.to_string()).or_default();
+        processes.retain(ListedProcess::running);
+        if !processes.iter().any(|p| p.pid == pid) {
+            processes.extend(ListedProcess::running_now(pid));
+        }
+        if processes.is_empty() {
+            seen.remove(bg_id);
+        }
+    }
+
+    /// Whether a process of `bg_id` is remembered, exited or not.
+    fn remembers(&self, bg_id: &str) -> bool {
+        self.seen().contains_key(bg_id)
+    }
+
+    /// Whether a remembered process of `bg_id` still runs.
+    fn runs(&self, bg_id: &str) -> bool {
+        self.seen()
+            .get(bg_id)
+            .is_some_and(|processes| processes.iter().any(ListedProcess::running))
+    }
+
+    fn forget(&self, bg_id: &str) {
+        self.seen().remove(bg_id);
+    }
+
+    /// Check `/proc` every `exit_poll` until no remembered process of
+    /// `bg_id` runs, then forget them: `true`. `false` when one still runs
+    /// `stop_wait` after `started`.
+    async fn wait_remembered(&self, bg_id: &str, started: Instant) -> bool {
+        while self.runs(bg_id) {
+            if started.elapsed() >= self.stop_wait {
+                return false;
+            }
+            tokio::time::sleep(self.exit_poll).await;
+        }
+        self.forget(bg_id);
+        true
+    }
+
+    /// `claude stop <bg id>`, after a listing that remembers its process: a
+    /// resume then waits for that process even once the listing no longer
+    /// shows it. Stopping a stopped session is harmless.
+    async fn stop_noting(&self, agent: &Agent, bg_id: &str) -> Result<(), String> {
+        match list_sessions_within(agent, LIST_TIMEOUT).await {
+            Ok(list) => {
+                if let Some(listed) = find_session(&list, bg_id) {
+                    self.note(bg_id, &listed);
+                }
+            }
+            Err(e) => debug!("agent '{}': {e}", agent.name),
+        }
+        stop_bg(agent, bg_id).await
+    }
+
+    /// Wait until `claude agents` lists `bg_id` with no pid and every
+    /// process remembered for it (listed before, or meanwhile) has exited,
+    /// plus the settle grace, for at most `stop_wait`. A failed listing
+    /// counts as still running.
+    async fn wait_for_exit(&self, agent: &Agent, bg_id: &str) -> Result<Stopped, String> {
+        let started = Instant::now();
+        loop {
+            match list_sessions_within(agent, LIST_TIMEOUT).await {
+                Ok(list) => match find_session(&list, bg_id) {
+                    None => {
+                        self.forget(bg_id);
+                        return Ok(Stopped::Gone);
+                    }
+                    Some(listed) if !listed.alive => {
+                        // Unlisted, but maybe still running: check the
+                        // processes themselves, cheaply and often.
+                        if self.wait_remembered(bg_id, started).await {
+                            debug!(
+                                "agent '{}': bg {bg_id} exited {} ms after the stop",
+                                agent.name,
+                                started.elapsed().as_millis()
+                            );
+                            tokio::time::sleep(self.settle_grace).await;
+                            return Ok(Stopped::Exited);
+                        }
+                    }
+                    Some(listed) => self.note(bg_id, &listed),
+                },
+                Err(e) => debug!("agent '{}': {e}", agent.name),
+            }
+            if started.elapsed() >= self.stop_wait {
+                warn!(
+                    "agent '{}': bg {bg_id} still runs {} s after `claude stop`",
+                    agent.name,
+                    self.stop_wait.as_secs()
+                );
+                return Err(format!("Agent '{}': {STOP_TIMEOUT}", agent.name));
+            }
+            tokio::time::sleep(self.stop_poll).await;
+        }
+    }
+
+    /// Before resuming a session `claude agents` lists with no pid (stopped
+    /// already: `--stop`, a turn stopped during its launch, a wait that ran
+    /// out): wait for the processes remembered for it to exit, plus the
+    /// settle grace, for at most `stop_wait`. At once when none is.
+    async fn settle(&self, agent: &Agent, bg_id: &str) -> Result<(), String> {
+        if !self.remembers(bg_id) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        if !self.wait_remembered(bg_id, started).await {
+            warn!(
+                "agent '{}': the last process of bg {bg_id} still runs {} s after it was stopped",
+                agent.name,
+                self.stop_wait.as_secs()
+            );
+            return Err(format!("Agent '{}': {STOP_TIMEOUT}", agent.name));
+        }
+        debug!(
+            "agent '{}': the last process of bg {bg_id} is gone ({} ms)",
             agent.name,
-            out.stderr.trim()
-        ),
-        Err(e) => warn!("agent '{}': {e}", agent.name),
+            started.elapsed().as_millis()
+        );
+        tokio::time::sleep(self.settle_grace).await;
+        Ok(())
+    }
+
+    /// Stop and remove a copy a resume started ([`copy_id`]: never the
+    /// session's own bg id). Its bg id came from our own launch's output, so
+    /// it is ours; nothing else is ever removed. `claude rm` waits for the
+    /// copy's process to exit, since it still runs right after `claude
+    /// stop`. The error names the copy left behind.
+    async fn discard_copy(&self, agent: &Agent, bg_id: &str) -> Result<(), String> {
+        if let Err(e) = self.stop_noting(agent, bg_id).await {
+            debug!("agent '{}': {e}", agent.name);
+        }
+        if self.wait_for_exit(agent, bg_id).await.is_err() {
+            warn!(
+                "agent '{}': the copy {bg_id} still runs after `claude stop`; removing it anyway",
+                agent.name
+            );
+        }
+        let args = ["rm".to_string(), bg_id.to_string()];
+        let out = run_claude(agent, &args, QUICK_TIMEOUT)
+            .await
+            .map_err(|e| format!("cannot remove the copy {bg_id}: {e}"))?;
+        if out.success {
+            info!("agent '{}': removed the copy {bg_id}", agent.name);
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot remove the copy {bg_id}: `claude rm {bg_id}` failed: {}",
+                out.stderr.trim()
+            ))
+        }
     }
 }
 
@@ -938,31 +1171,43 @@ enum Launched {
 /// was stopped meanwhile, the launch stops the session it started.
 ///
 /// `resume_of` is the session a resume continues: a copy of it
-/// ([`resumed_a_copy`]) is stopped and removed on the same task, so a stop
-/// of the turn cannot leave it running, and is never reported.
+/// ([`copy_id`]) is stopped and removed on the same task, so a stop of the
+/// turn cannot leave it running, and is never reported.
 async fn launch_reported(
     agent: &Agent,
     args: Vec<String>,
     base: SessionRef,
     updates: &TurnUpdates,
+    exits: &Exits,
     use_scope: bool,
     resume_of: Option<&SessionRef>,
 ) -> Result<Launched, String> {
     let agent = agent.clone();
     let updates = updates.clone();
+    let exits = exits.clone();
     let resume_of = resume_of.cloned();
     let task = tokio::spawn(async move {
         let Launch { bg_id, copy_note } = launch(&agent, &args, use_scope).await?;
         if let Some(original) = &resume_of {
-            if resumed_a_copy(original.bg_id.as_deref(), &bg_id, copy_note) {
+            let session_bg = original.bg_id.as_deref();
+            if let Some(copy) = copy_id(session_bg, &bg_id, copy_note.as_deref()) {
                 warn!(
-                    "agent '{}': resuming {} started a copy (bg {bg_id}) instead of continuing \
+                    "agent '{}': resuming {} started a copy (bg {copy}) instead of continuing \
                      in place; stopping and removing the copy",
                     agent.name,
                     describe(original)
                 );
-                discard_copy(&agent, &bg_id).await;
-                return Ok(Launched::Copy(bg_id));
+                if let Err(e) = exits.discard_copy(&agent, &copy).await {
+                    warn!("agent '{}': {e}", agent.name);
+                }
+                return Ok(Launched::Copy(copy));
+            }
+            if copy_note.is_some() {
+                warn!(
+                    "agent '{}': the resume's copy note names the session itself (bg {bg_id}); \
+                     taken as continued in place",
+                    agent.name
+                );
             }
         }
         let mut session = base;
@@ -972,7 +1217,7 @@ async fn launch_reported(
                 "agent '{}': the turn was stopped during the launch; stopping bg {bg_id}",
                 agent.name
             );
-            if let Err(e) = stop_bg(&agent, &bg_id).await {
+            if let Err(e) = exits.stop_noting(&agent, &bg_id).await {
                 warn!("agent '{}': {e}", agent.name);
             }
             return Err(format!("Agent '{}': the turn was stopped.", agent.name));
@@ -992,15 +1237,6 @@ fn describe(session: &SessionRef) -> String {
     }
 }
 
-/// What `claude agents` showed once a stopped session's process was gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stopped {
-    /// Listed with no process: a resume continues it in place.
-    Exited,
-    /// No longer listed (`claude rm`).
-    Gone,
-}
-
 impl ClaudeDriver {
     /// The first turn of a new session, and when its launch was spawned.
     async fn first_turn(
@@ -1016,6 +1252,7 @@ impl ClaudeDriver {
             first_turn_args(agent, &settings, text),
             SessionRef::default(),
             updates,
+            &self.exits,
             self.use_scope,
             None,
         )
@@ -1028,6 +1265,7 @@ impl ClaudeDriver {
         };
         match learn_session(agent, &bg_id).await {
             Ok(listed) => {
+                self.exits.note(&bg_id, &listed);
                 session.session_id = listed.session_id;
                 info!(
                     "agent '{}': started session {} (bg {bg_id})",
@@ -1041,87 +1279,23 @@ impl ClaudeDriver {
         Ok((session, launched_at))
     }
 
-    /// Wait until `claude agents` lists `bg_id` with no pid and every
-    /// process it listed for it (`pids`, and any seen meanwhile) has exited,
-    /// for at most `stop_wait`. `claude stop` returns, and the listing drops
-    /// the pid, before the process exits and Claude Code settles the session
-    /// (measured on 2.1.301: up to two seconds), and a resume that lands
-    /// first makes it start a copy. A failed listing counts as still
-    /// running.
-    async fn wait_for_exit(
-        &self,
-        agent: &Agent,
-        bg_id: &str,
-        mut pids: Vec<u32>,
-    ) -> Result<Stopped, String> {
-        let started = Instant::now();
-        loop {
-            match list_sessions_within(agent, LIST_TIMEOUT).await {
-                Ok(list) => match find_session(&list, bg_id) {
-                    None => return Ok(Stopped::Gone),
-                    Some(listed) if !listed.alive => {
-                        // Unlisted, but maybe still running: check the
-                        // processes themselves, cheaply and often.
-                        while pids.iter().any(|&pid| process_running(pid)) {
-                            if started.elapsed() >= self.stop_wait {
-                                break;
-                            }
-                            tokio::time::sleep(self.exit_poll).await;
-                        }
-                        if !pids.iter().any(|&pid| process_running(pid)) {
-                            debug!(
-                                "agent '{}': bg {bg_id} exited {} ms after the stop",
-                                agent.name,
-                                started.elapsed().as_millis()
-                            );
-                            tokio::time::sleep(self.settle_grace).await;
-                            return Ok(Stopped::Exited);
-                        }
-                    }
-                    Some(listed) => {
-                        if let Some(pid) = listed.pid.filter(|p| !pids.contains(p)) {
-                            pids.push(pid);
-                        }
-                    }
-                },
-                Err(e) => debug!("agent '{}': {e}", agent.name),
-            }
-            if started.elapsed() >= self.stop_wait {
-                warn!(
-                    "agent '{}': bg {bg_id} still runs {} s after `claude stop`; the turn is \
-                     not sent",
-                    agent.name,
-                    self.stop_wait.as_secs()
-                );
-                return Err(format!("Agent '{}': {STOP_TIMEOUT}", agent.name));
-            }
-            tokio::time::sleep(self.stop_poll).await;
-        }
-    }
-
-    /// `claude stop <bg id>`, then [`ClaudeDriver::wait_for_exit`] for it
-    /// and `pid`, the process the listing showed before the stop. Stopping
-    /// a stopped session is harmless.
-    async fn stop_and_wait(
-        &self,
-        agent: &Agent,
-        bg_id: &str,
-        pid: Option<u32>,
-    ) -> Result<Stopped, String> {
+    /// `claude stop <bg id>`, then [`Exits::wait_for_exit`] for it and the
+    /// processes remembered for it. Stopping a stopped session is harmless.
+    async fn stop_and_wait(&self, agent: &Agent, bg_id: &str) -> Result<Stopped, String> {
         if let Err(e) = stop_bg(agent, bg_id).await {
             debug!("agent '{}': {e}", agent.name);
         }
-        self.wait_for_exit(agent, bg_id, pid.into_iter().collect())
-            .await
+        self.exits.wait_for_exit(agent, bg_id).await
     }
 
     /// A later turn: refused ([`TurnOutcome::Busy`]) while the session works
     /// on its own; otherwise stop the old process if it is alive and wait
-    /// until it is gone, then resume. A resume that starts a copy anyway is
-    /// never adopted: the copy is stopped and removed, the old process is
-    /// waited for again and the resume is tried once more; a second copy
-    /// fails the turn. Returns the session and when the resume was spawned:
-    /// hook events received earlier are the old process's.
+    /// until it is gone (a session listed with no pid already: wait for the
+    /// process it was last listed with), then resume. A resume that starts a
+    /// copy anyway is never adopted: the copy is stopped and removed, the
+    /// old process is waited for again and the resume is tried once more; a
+    /// second copy fails the turn. Returns the session and when the resume
+    /// was spawned: hook events received earlier are the old process's.
     async fn next_turn(
         &self,
         agent: &Agent,
@@ -1130,12 +1304,11 @@ impl ClaudeDriver {
         updates: &TurnUpdates,
     ) -> Result<(SessionRef, Instant), TurnOutcome> {
         let mut session_id = session.session_id.clone();
-        // The process the listing showed for the session before the stop.
-        let mut pid = None;
         if let Some(bg_id) = &session.bg_id {
             let alive = match list_sessions(agent).await {
                 Ok(list) => match find_session(&list, bg_id) {
                     Some(listed) => {
+                        self.exits.note(bg_id, &listed);
                         if session_id.is_none() {
                             session_id = listed.session_id.clone();
                         }
@@ -1147,12 +1320,12 @@ impl ClaudeDriver {
                             );
                             return Err(TurnOutcome::Busy);
                         }
-                        pid = listed.pid;
                         listed.alive
                     }
                     None => {
                         // Removed (`claude rm`): a resume would come back
                         // without its saved options, hooks included.
+                        self.exits.forget(bg_id);
                         info!(
                             "agent '{}': session {} is no longer listed; starting a new one",
                             agent.name,
@@ -1169,7 +1342,7 @@ impl ClaudeDriver {
             };
             if alive {
                 let stopped = self
-                    .stop_and_wait(agent, bg_id, pid)
+                    .stop_and_wait(agent, bg_id)
                     .await
                     .map_err(TurnOutcome::Failed)?;
                 if stopped == Stopped::Gone {
@@ -1180,6 +1353,14 @@ impl ClaudeDriver {
                     );
                     return self.first_turn(agent, text, updates).await;
                 }
+            } else {
+                // Stopped already, but the process it was last listed with
+                // can still be exiting, and a resume before it is gone
+                // starts a copy.
+                self.exits
+                    .settle(agent, bg_id)
+                    .await
+                    .map_err(TurnOutcome::Failed)?;
             }
         }
         let Some(session_id) = session_id else {
@@ -1197,6 +1378,7 @@ impl ClaudeDriver {
                 resume_args(&session_id, text),
                 base.clone(),
                 updates,
+                &self.exits,
                 self.use_scope,
                 Some(&base),
             )
@@ -1219,7 +1401,7 @@ impl ClaudeDriver {
             // to be gone, then resume once more.
             if let Some(bg_id) = &session.bg_id {
                 let stopped = self
-                    .stop_and_wait(agent, bg_id, pid)
+                    .stop_and_wait(agent, bg_id)
                     .await
                     .map_err(TurnOutcome::Failed)?;
                 if stopped == Stopped::Gone {
@@ -1345,6 +1527,9 @@ impl ClaudeDriver {
                         }
                     };
                     let listed = find_session(&list, &bg_id);
+                    if let Some(listed) = &listed {
+                        self.exits.note(&bg_id, listed);
+                    }
                     // A launch watched again after a restart may not know
                     // its session id yet: learn it, so hooks match.
                     if let Some(id) = listed.as_ref().and_then(|l| l.session_id.clone()) {
@@ -1478,9 +1663,11 @@ impl Driver for ClaudeDriver {
         .await
     }
 
+    /// `claude stop`, after a listing that remembers the session's process,
+    /// so the next turn waits for it to exit before resuming.
     async fn stop(&self, agent: &Agent, session: &SessionRef) -> Result<(), String> {
         match &session.bg_id {
-            Some(bg_id) => stop_bg(agent, bg_id).await,
+            Some(bg_id) => self.exits.stop_noting(agent, bg_id).await,
             None => Ok(()),
         }
     }
@@ -1504,7 +1691,7 @@ impl Driver for ClaudeDriver {
             return Ok(AgentPhase::Idle);
         };
         let list = list_sessions(agent).await?;
-        Ok(listed_phase(&list, bg_id))
+        Ok(self.phase_noting(&list, bg_id))
     }
 
     /// One `claude agents --json --all` per distinct `command` (it lists
@@ -1529,7 +1716,7 @@ impl Driver for ClaudeDriver {
                 .find(|(command, _)| command == &agent.command)
                 .map(|(_, list)| list);
             phases.push(match list {
-                Some(Ok(list)) => Ok(listed_phase(list, bg_id)),
+                Some(Ok(list)) => Ok(self.phase_noting(list, bg_id)),
                 Some(Err(e)) => Err(e.clone()),
                 None => Err("no session list".to_string()),
             });
@@ -1552,6 +1739,16 @@ impl Driver for ClaudeDriver {
 /// What the session with `bg_id` does, from a `claude agents` listing.
 fn listed_phase(list: &[Value], bg_id: &str) -> AgentPhase {
     idle_phase(find_session(list, bg_id).as_ref())
+}
+
+impl ClaudeDriver {
+    /// [`listed_phase`], remembering the process the listing shows.
+    fn phase_noting(&self, list: &[Value], bg_id: &str) -> AgentPhase {
+        if let Some(listed) = find_session(list, bg_id) {
+            self.exits.note(bg_id, &listed);
+        }
+        listed_phase(list, bg_id)
+    }
 }
 
 #[cfg(test)]
@@ -2023,8 +2220,9 @@ not json
     /// The fake `claude`: logs every call to `calls.log`; `agents` prints
     /// `list.json`, or after a `stop` (when `list-stopped.json` exists)
     /// `list.json` for as many more calls as `alive-after-stop` says, then
-    /// `list-stopped.json`; the n-th `--bg` prints `bg-<n>.out` (and
-    /// `bg-<n>.err` on stderr) when present, else a launch of `abc12345`.
+    /// `list-stopped.json`; `rm` fails while `rm-fails` exists; the n-th
+    /// `--bg` prints `bg-<n>.out` (and `bg-<n>.err` on stderr) when present,
+    /// else a launch of `abc12345`.
     const FAKE_CLAUDE: &str = r#"#!/bin/sh
 d=$(dirname "$0")
 echo "$*" >> "$d/calls.log"
@@ -2041,7 +2239,9 @@ case "$1" in
     if [ -f "$d/alive-after-stop" ]; then cp "$d/alive-after-stop" "$d/stopped"
     else echo 0 > "$d/stopped"; fi
     echo "stopped $2" ;;
-  rm) echo "removed $2" ;;
+  rm)
+    if [ -f "$d/rm-fails" ]; then echo "cannot remove $2" >&2; exit 1; fi
+    echo "removed $2" ;;
   --bg)
     n=$(cat "$d/bg.count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$d/bg.count"
     [ -f "$d/bg-$n.err" ] && cat "$d/bg-$n.err" >&2
@@ -2112,12 +2312,18 @@ esac
             hook_command: "true".into(),
             poll_interval: poll,
             done_grace: grace,
-            stop_poll: Duration::from_millis(5),
-            stop_wait: Duration::from_secs(5),
-            exit_poll: Duration::from_millis(5),
-            settle_grace: Duration::from_millis(1),
+            exits: fast_exits(),
             use_scope: false,
         }
+    }
+
+    fn fast_exits() -> Exits {
+        Exits::new(
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        )
     }
 
     /// A pid no process has (above any `pid_max`): a listed session whose
@@ -2388,6 +2594,7 @@ esac
             vec!["--bg".into(), "--".into(), "hi".into()],
             SessionRef::default(),
             &updates,
+            &fast_exits(),
             false,
             None,
         )
@@ -2402,6 +2609,7 @@ esac
             vec!["--bg".into(), "--".into(), "hi".into()],
             SessionRef::default(),
             &updates,
+            &fast_exits(),
             false,
             None,
         )
@@ -2542,8 +2750,26 @@ esac
         assert_eq!(stat_state("2971692 (claude) S 2971682 1 1 0"), Some('S'));
         assert_eq!(stat_state("42 (a (weird) name) Z 1 0"), Some('Z'));
         assert_eq!(stat_state("garbage"), None);
-        assert!(process_running(std::process::id()));
-        assert!(!process_running(GONE_PID));
+        // Field 22 is the start time, after a name with spaces too.
+        let stat = "2971692 (a (b) c) S 2971682 1 1 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 9 0 \
+                    123456789 1000 2";
+        assert_eq!(stat_start(stat), Some(123_456_789));
+        assert_eq!(stat_start("1 (x) S 1 2"), None);
+        assert!(ListedProcess::running_now(std::process::id()).is_some());
+        assert!(ListedProcess::running_now(GONE_PID).is_none());
+    }
+
+    /// A remembered pid an unrelated process got since (another start time)
+    /// is not taken for the session's process.
+    #[test]
+    fn a_reused_pid_is_not_the_listed_process() {
+        let me = ListedProcess::running_now(std::process::id()).unwrap();
+        assert!(me.running());
+        let reused = ListedProcess {
+            started: me.started + 1,
+            ..me
+        };
+        assert!(!reused.running());
     }
 
     /// A stopped process that never exits fails the turn after the cap
@@ -2552,7 +2778,7 @@ esac
     async fn a_stop_that_never_lands_fails_the_turn() {
         let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
         let mut driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
-        driver.stop_wait = Duration::from_millis(100);
+        driver.exits.stop_wait = Duration::from_millis(100);
         let (updates, _rx) = TurnUpdates::channel();
         let result = driver
             .next_turn(&fake.agent(), &fake.session(), "next", &updates)
@@ -2578,7 +2804,7 @@ esac
     #[tokio::test]
     async fn a_copy_is_removed_and_the_resume_tried_once_more() {
         let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
-        fake.file("list-stopped.json", &entry(None, "done"));
+        fake.file("list-stopped.json", &with_copy(&entry(None, "done"), None));
         fake.file(
             "bg-1.out",
             "backgrounded \u{b7} copy0001 \u{b7} whisrs-jarvis\n",
@@ -2598,11 +2824,22 @@ esac
             .count();
         assert_eq!(resumes, 2, "{calls}");
         let after_copy = calls_after(&calls, "--bg --resume");
-        assert_eq!(after_copy[0], "stop copy0001", "{calls}");
-        assert_eq!(after_copy[1], "rm copy0001", "{calls}");
+        // The copy is listed (its process noted), stopped, waited for, and
+        // only then removed.
+        assert_eq!(
+            after_copy[..4],
+            [
+                "agents --json --all",
+                "stop copy0001",
+                "agents --json --all",
+                "rm copy0001"
+            ],
+            "{calls}"
+        );
         // The original is stopped (harmless when dead) and waited for again.
-        assert_eq!(after_copy[2], "stop abc12345", "{calls}");
-        assert_eq!(after_copy[3], "agents --json --all", "{calls}");
+        assert_eq!(after_copy[4], "stop abc12345", "{calls}");
+        assert_eq!(after_copy[5], "agents --json --all", "{calls}");
+        assert!(!calls.contains("rm abc12345"), "{calls}");
         // Only the original's ids were ever reported.
         while let Ok(update) = rx.try_recv() {
             if let TurnUpdate::Session(s) = update {
@@ -2610,7 +2847,7 @@ esac
             }
         }
         // A copy is also told by its bg id alone, with no note.
-        let fake = FakeClaude::new(&entry(None, "done"));
+        let fake = FakeClaude::new(&with_copy(&entry(None, "done"), None));
         fake.file(
             "bg-1.out",
             "backgrounded \u{b7} copy0001 \u{b7} whisrs-jarvis\n",
@@ -2654,6 +2891,8 @@ esac
         assert!(rx.try_recv().is_err(), "a copy was reported");
     }
 
+    /// The copy is the id its note names, else a printed bg id other than
+    /// the session's; never the session's own bg id.
     #[test]
     fn a_copy_is_told_by_its_bg_id_or_its_note() {
         assert_eq!(parse_copy_note(COPY_NOTE).as_deref(), Some("copy0001"));
@@ -2661,11 +2900,217 @@ esac
             parse_copy_note("note: woke session 9e24892c with its saved options (--model)."),
             None
         );
-        assert!(!resumed_a_copy(Some("abc12345"), "abc12345", false));
-        assert!(resumed_a_copy(Some("abc12345"), "copy0001", false));
-        assert!(resumed_a_copy(Some("abc12345"), "abc12345", true));
-        assert!(resumed_a_copy(None, "abc12345", true));
-        assert!(!resumed_a_copy(None, "abc12345", false));
+        let ours = Some("abc12345");
+        let copy = |session, printed, note| copy_id(session, printed, note);
+        assert_eq!(copy(ours, "abc12345", None), None);
+        assert_eq!(copy(ours, "copy0001", None).as_deref(), Some("copy0001"));
+        // The note names the copy even when the session's own id is printed.
+        assert_eq!(
+            copy(ours, "abc12345", Some("copy0001")).as_deref(),
+            Some("copy0001")
+        );
+        // The note wins over another printed id.
+        assert_eq!(
+            copy(ours, "copy0002", Some("copy0001")).as_deref(),
+            Some("copy0001")
+        );
+        // A note that names the session itself never makes it the copy.
+        assert_eq!(copy(ours, "abc12345", Some("abc12345")), None);
+        assert_eq!(
+            copy(ours, "copy0002", Some("abc12345")).as_deref(),
+            Some("copy0002")
+        );
+        assert_eq!(
+            copy(None, "abc12345", Some("copy0001")).as_deref(),
+            Some("copy0001")
+        );
+        assert_eq!(copy(None, "abc12345", None), None);
+    }
+
+    /// `list` (one entry, as [`entry`] writes it) with a copy `copy0001`
+    /// listed too: `claude agents` lists every session a launch started.
+    fn with_copy(list: &str, pid: Option<u32>) -> String {
+        let copy = entry(pid, "done")
+            .replace("abc12345-1111", "copy0001-2222")
+            .replace("abc12345", "copy0001");
+        format!(
+            "{},{}",
+            list.trim_end_matches(']'),
+            copy.trim_start_matches('[')
+        )
+    }
+
+    /// A resume whose copy note names the session itself (and prints its bg
+    /// id): nothing is stopped or removed for it, and the session is not
+    /// taken for a copy of itself.
+    #[tokio::test]
+    async fn a_copy_note_naming_the_session_never_discards_it() {
+        let fake = FakeClaude::new(&entry(None, "done"));
+        fake.file(
+            "bg-1.err",
+            "note: session abc12345 is already running in the background, so this started a \
+             copy as abc12345.\n",
+        );
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let (updates, _rx) = TurnUpdates::channel();
+        let (session, _) = driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await
+            .unwrap();
+        assert_eq!(session, fake.session());
+        let calls = fake.calls();
+        assert!(!calls.contains("rm "), "{calls}");
+        assert!(!calls.contains("stop "), "{calls}");
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.starts_with("--bg --resume"))
+                .count(),
+            1,
+            "{calls}"
+        );
+    }
+
+    /// A copy is removed only once its process exited (`claude rm` right
+    /// after `claude stop` lands while it still runs), and a removal that
+    /// fails names the copy.
+    #[tokio::test]
+    async fn a_copy_is_removed_after_its_process_exited() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.4")
+            .spawn()
+            .unwrap();
+        let fake = FakeClaude::new(&with_copy(&entry(None, "done"), Some(child.id())));
+        fake.file("list-stopped.json", &with_copy(&entry(None, "done"), None));
+        let exits = fast_exits();
+        let started = Instant::now();
+        exits.discard_copy(&fake.agent(), "copy0001").await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "removed {} ms in, while the copy still ran",
+            started.elapsed().as_millis()
+        );
+        assert!(child.try_wait().unwrap().is_some());
+        let calls = fake.calls();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "agents --json --all",
+                "stop copy0001",
+                "agents --json --all",
+                "rm copy0001"
+            ],
+            "{calls}"
+        );
+        // `claude rm` fails: the error names the copy.
+        fake.file("rm-fails", "");
+        let e = exits
+            .discard_copy(&fake.agent(), "copy0001")
+            .await
+            .unwrap_err();
+        assert!(e.contains("copy0001") && e.contains("cannot remove"), "{e}");
+    }
+
+    /// A session stopped moments ago (`whisrs agent <name> --stop`) is
+    /// listed with no pid while its process still exits: the next turn
+    /// waits for the process the stop's listing showed, then resumes in
+    /// place, with no second `claude stop`.
+    #[tokio::test]
+    async fn a_resume_after_a_stop_waits_for_the_remembered_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.4")
+            .spawn()
+            .unwrap();
+        let fake = FakeClaude::new(&entry(Some(child.id()), "done"));
+        fake.file("list-stopped.json", &entry(None, "done"));
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let (agent, session) = (fake.agent(), fake.session());
+        driver.stop(&agent, &session).await.unwrap();
+        let started = Instant::now();
+        let (updates, _rx) = TurnUpdates::channel();
+        driver
+            .next_turn(&agent, &session, "next", &updates)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "resumed {} ms after the stop, while the process still ran",
+            started.elapsed().as_millis()
+        );
+        assert!(child.try_wait().unwrap().is_some());
+        let calls = fake.calls();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "agents --json --all",
+                "stop abc12345",
+                "agents --json --all",
+                "--bg --resume abc12345-1111 -- next"
+            ],
+            "{calls}"
+        );
+        // Its exit was seen: the turn after it does not wait again.
+        assert!(!driver.exits.remembers("abc12345"));
+    }
+
+    /// A wait that ran out leaves the process remembered: the next turn,
+    /// which finds the session listed with no pid, waits for it too.
+    #[tokio::test]
+    async fn a_wait_that_ran_out_is_waited_for_on_the_next_turn() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.5")
+            .spawn()
+            .unwrap();
+        let fake = FakeClaude::new(&entry(Some(child.id()), "done"));
+        fake.file("list-stopped.json", &entry(None, "done"));
+        let mut driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        driver.exits.stop_wait = Duration::from_millis(50);
+        let (agent, session) = (fake.agent(), fake.session());
+        let (updates, _rx) = TurnUpdates::channel();
+        let result = driver.next_turn(&agent, &session, "next", &updates).await;
+        assert_eq!(
+            result.unwrap_err(),
+            TurnOutcome::Failed(format!("Agent 'jarvis': {STOP_TIMEOUT}"))
+        );
+        assert!(driver.exits.remembers("abc12345"));
+        driver.exits.stop_wait = Duration::from_secs(5);
+        driver
+            .next_turn(&agent, &session, "next", &updates)
+            .await
+            .unwrap();
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "resumed while the stopped process still ran"
+        );
+        assert!(fake.calls().contains("--bg --resume"), "{}", fake.calls());
+    }
+
+    /// A remembered pid that an unrelated process got since does not hold
+    /// up the turn: it resumes at once.
+    #[tokio::test]
+    async fn a_reused_pid_does_not_hold_up_a_turn() {
+        let fake = FakeClaude::new(&entry(None, "done"));
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let me = ListedProcess::running_now(std::process::id()).unwrap();
+        driver.exits.seen().insert(
+            "abc12345".into(),
+            vec![ListedProcess {
+                started: me.started + 1,
+                ..me
+            }],
+        );
+        let started = Instant::now();
+        let (updates, _rx) = TurnUpdates::channel();
+        driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "held up {} ms by an unrelated process",
+            started.elapsed().as_millis()
+        );
+        assert!(!driver.exits.remembers("abc12345"));
     }
 
     /// A turn watched again after a restart that landed before its launch

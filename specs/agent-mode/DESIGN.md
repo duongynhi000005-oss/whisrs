@@ -79,17 +79,22 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 2. **Toggle while Recording for this agent:** stop and transcribe. Recording for anything
    else: refuse as busy, like command mode.
 3. **Toggle while Speaking:** stop playback and start recording for this agent (barge-in, so
-   answering the agent's question is one press). Playback is checked before the busy check: a
-   press while an agent reply or notice plays stops it even while this agent's turn runs, and
-   is then refused with a notification only (no notice is queued in its place), so a press
-   always silences the agent. A selection read-aloud is not stopped for a refused press.
+   answering the agent's question is one press). A press refused because this agent's turn
+   runs stops only this agent's own reply or notice: it is then refused with a notification
+   only (per `[general] notify`; no notice is queued in its place), so a press always silences
+   its agent. Another agent's reply plays on (stopping it would lose it), and the refusal's
+   notice is spoken after it, deduplicated as in 1. A selection read-aloud is not stopped for a
+   refused press.
    - **Fresh session (`--new`, `new_session_hotkey`):** records exactly like a toggle; the
      recording remembers that its press asked for a fresh session
      (`AgentRecordingContext::new_session`), and a second press of either kind stops it. When
      the transcript is ready the session is forgotten (`reset`) and the turn starts a new one;
-     nothing to send forgets nothing. Refused while any whisrs turn of the agent runs (also one
-     that waits for you, which a plain press would answer), at the press and again at the
-     transcript.
+     nothing to send forgets nothing. Refused while any whisrs turn of the agent runs, at the
+     press and again at the transcript. One that waits for you, which a plain press would
+     answer, is refused with the needs-you notice it announced ("Waiting for your approval to
+     use Bash.", spoken once per press burst like the busy notice) and "A plain press answers
+     it; to start fresh, stop it first: whisrs agent <name> --stop"; `--new --text` and
+     `--reset` say the same.
 4. **Transcript ready:** start the turn on a spawned task. The state machine returns to Idle
    at once; dictation keeps working while the agent runs.
 5. **Turn ends:** reply text → spoken text (below) → spoken when the daemon is Idle and no
@@ -175,7 +180,13 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
   process is still alive, `claude stop <bg id>`, then wait until the session's row has no
   `pid` and the process it listed has exited (`/proc/<pid>`, a zombie counts as exited),
   checked every 250 ms (the process every 50 ms once the row lost its pid), plus 250 ms for
-  Claude Code to settle it, capped at ten seconds; then `claude --bg --resume <session id> --
+  Claude Code to settle it, capped at ten seconds. Every pid a listing shows (the next-turn
+  check, the waits, the poll, `whisrs agent`, and a listing just before every `claude stop`)
+  is remembered per bg id with its `/proc/<pid>/stat` start time until it is seen to exit, so
+  a session already listed with no pid (stopped moments ago by `--stop`, a turn stopped
+  during its launch, a wait that ran out, or a listing that failed) is waited for the same
+  way before the resume; a pid whose start time changed belongs to another process and is
+  not waited for. Then `claude --bg --resume <session id> --
   "<text>"` with no other flag: it "wakes" the session in place with its saved options
   (`--settings` hooks, `--remote-control`, `--model`...), while any flag passed with
   `--resume` makes Claude Code start a copy, which comes back without the hooks (measured).
@@ -186,10 +197,13 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
   flags (no `--remote-control`, no hooks, permission mode `auto`). A cap that is hit fails
   the turn ("Claude Code did not stop the session's last run in time, so this turn was not
   sent."). **A copy is never adopted:** a resume that prints another bg id, or says it
-  "started a copy as <id>", has that copy stopped and removed (`claude stop`, `claude rm`; its
-  id came from our own launch output, so it is ours) on the launch's own task, so a `--stop`
-  cannot leave it running, and never reported; the original is stopped and waited for again
-  and the resume tried once more. A second copy fails the turn: "Claude Code could not
+  "started a copy as <id>", has that copy stopped, waited for like the original and removed
+  (`claude stop`, the wait, `claude rm`, which fails while its process runs, warned with its
+  id; its id came from our own launch output, so it is ours) on the launch's own task, so a
+  `--stop` cannot leave it running, and never reported. The copy is the id the note names,
+  else a printed bg id other than the session's: never the session's own bg id (a note that
+  names it, with that id printed, is taken as continued in place). The original is stopped
+  and waited for again and the resume tried once more. A second copy fails the turn: "Claude Code could not
   continue the session, so this turn was not sent. `whisrs agent <name> --new` starts a fresh
   one."
 - **Turn end:** the `Stop` event whose `session_id` matches carries `last_assistant_message`
