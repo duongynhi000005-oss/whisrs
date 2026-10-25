@@ -125,7 +125,7 @@ pub(crate) async fn handle_speak_text(
             }
             State::Recording | State::Transcribing => {
                 return Response::Error {
-                    message: "busy — finish or cancel recording first".to_string(),
+                    message: "busy: finish or cancel recording first".to_string(),
                 };
             }
             State::Idle => {}
@@ -137,7 +137,7 @@ pub(crate) async fn handle_speak_text(
     };
     match speak_text(daemon_state, context, backend, &text, SpeakOrigin::Text).await {
         SpeakAttempt::NotIdle(_) => Response::Error {
-            message: "busy — another command started first; try again".to_string(),
+            message: "busy: another command started first; try again".to_string(),
         },
         SpeakAttempt::Ran(response) => response,
     }
@@ -150,10 +150,10 @@ pub(crate) fn tts_backend(
     let tts_config = match &context.config.tts {
         Some(t) if t.enabled => t.clone(),
         Some(_) => {
-            return Err("TTS is disabled — set [tts] enabled = true in config.toml".to_string());
+            return Err("TTS is disabled: set [tts] enabled = true in config.toml".to_string());
         }
         None => {
-            return Err("TTS is not configured — add a [tts] section to config.toml".to_string());
+            return Err("TTS is not configured: add a [tts] section to config.toml".to_string());
         }
     };
     let api_key = resolve_tts_api_key(&context.config);

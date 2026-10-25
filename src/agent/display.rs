@@ -282,16 +282,16 @@ impl Board {
         }
     }
 
-    /// The turn ended at `now`: with a reply (`ok`) or an error. Ignored
-    /// with no turn running.
+    /// The turn ended at `now`: with a reply (`ok`) or an error. With no
+    /// turn running, a wait shown for the session's own work ends the same
+    /// way (a `Stop` with a reply ended it), timed from the wait's start, so
+    /// it ends Done whether or not that work showed as working first.
+    /// Ignored with neither.
     pub fn turn_ended(&mut self, name: &str, ok: bool, now: Instant) {
         if let Some(slot) = self.slot(name) {
-            if let Some(turn) = slot.turn.take() {
-                slot.ended = Some(Ended {
-                    ok,
-                    since: turn.since,
-                    at: now,
-                });
+            let since = slot.turn.take().map(|turn| turn.since).or(slot.needs_you);
+            if let Some(since) = since {
+                slot.ended = Some(Ended { ok, since, at: now });
             }
             slot.needs_you = None;
         }
@@ -566,6 +566,35 @@ mod tests {
         assert_eq!((e.visual, e.since), (AgentVisual::NeedsYou, t0));
         board.clear("jarvis");
         assert!(board.compose(t0 + secs(5.0)).is_empty());
+    }
+
+    /// A wait shown with no turn running, ended by a reply, ends Done like
+    /// the same work shown working first: held while the reply is pending,
+    /// timed from the wait. An end with neither a turn nor a wait shows
+    /// nothing.
+    #[test]
+    fn an_idle_wait_that_replies_ends_done() {
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + secs(s);
+        let mut board = Board::new(["jarvis", "friday"]);
+        board.needs_you("jarvis", t0);
+        board.turn_started("friday", t0);
+        board.needs_you("friday", t0);
+        for name in ["jarvis", "friday"] {
+            board.turn_ended(name, true, at(5.0));
+        }
+        board.set_pending(&["jarvis", "friday"], at(5.0));
+        let rows = board.compose(at(30.0));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for e in &rows {
+            assert_eq!(e.visual, AgentVisual::Done, "{e:?}");
+            assert_eq!(e.activity.as_deref(), Some("Finished in 0:05"));
+            assert_eq!(e.fading_from, None, "faded while its reply waits");
+        }
+
+        let mut board = Board::new(["jarvis"]);
+        board.turn_ended("jarvis", true, t0);
+        assert!(board.compose(t0).is_empty());
     }
 
     #[test]

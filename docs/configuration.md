@@ -416,8 +416,9 @@ response_format = "wav"     # audio format requested from the API
 
 # Agent mode (optional): talk to a coding agent by voice. Each entry is one
 # agent working in one directory. Its replies are spoken through [tts] above
-# (enable it), and shown as a notification when [general] notify is on. See
-# "Agent mode" below.
+# (enable it), and shown as a notification when [general] notify is on. The
+# daemon reads these entries when it starts: run `whisrs restart` after a
+# change. See "Agent mode" below.
 # [[agents]]
 # name = "jarvis"                # required, unique: lowercase letters, digits, - and _
 # hotkey = "Super+Shift+J"       # optional: records a voice turn, same syntax as [hotkeys]
@@ -431,8 +432,9 @@ response_format = "wav"     # audio format requested from the API
 #                                #   has no ~/.local/bin)
 # args = ["--model", "sonnet"]   # optional: extra arguments for the first turn of a session
 # reply_instruction = "..."      # optional: replaces the built-in voice instruction
-#                                #   (permissions, args and reply_instruction apply from
-#                                #   the next new session: whisrs agent <name> --new)
+#                                #   (permissions, args and reply_instruction apply, after
+#                                #   the restart, from the next new session:
+#                                #   whisrs agent <name> --new)
 # feedback = "brief"             # optional: what the agent says while it works. summary
 #                                #   (the reply only) | brief (default: a short
 #                                #   acknowledgement, then the reply) | conversational
@@ -629,7 +631,8 @@ dir = "~/Projects/whisrs"
 ```
 
 ```
-whisrs agent                       # list the agents: name, harness, idle | working | needs-you, bg id
+whisrs agent                       # list the agents: name, harness, idle | working | needs-you, and
+                                   #   the background id of each session (what claude attach <id> takes)
 whisrs agent jarvis                # record a voice turn (same as the hotkey; press again to stop)
 whisrs agent jarvis --text "..."   # send a typed turn (`--text -` reads stdin)
 whisrs agent jarvis --new          # record a voice turn that starts a fresh session (same as
@@ -647,6 +650,8 @@ What you need:
   prompt. whisrs tells you so when it hits this.
 - `[tts] enabled = true` to hear the replies. Without it they arrive as
   notifications only, and `whisrsd` warns at startup.
+- `whisrs restart` after adding or changing an `[[agents]]` entry: the daemon
+  reads them only when it starts.
 
 How a turn goes:
 
@@ -732,10 +737,12 @@ final reply is never taken for one. They wait under the same rules as a reply
 (not while you dictate or record), are dropped when they waited too long (8
 seconds for an acknowledgement, 12 for an update) or when the reply arrives,
 and are never shown as notifications. `whisrs cancel`, `--stop` and `--reset`
-drop the ones still queued. Like `reply_instruction`, the request is fixed when
-a session starts, so a higher level takes effect at the next fresh session
-(`whisrs agent <name> --new`); a lower one applies at once, since whisrs does
-the filtering. An unknown value gets a warning at startup and means `brief`.
+drop the ones still queued. A change to `feedback` needs `whisrs restart`
+first, like any `[[agents]]` change. A lower level then applies from the
+restart, since whisrs filters what it speaks. A higher one also needs a fresh
+session (`whisrs agent <name> --new`): like `reply_instruction`, the request
+is fixed when a session starts. An unknown value gets a warning at startup and
+means `brief`.
 
 The agent overlay. With an `[[agents]]` entry, whisrs shows a row for each
 agent at work in a screen corner, bottom right by default, apart from the
@@ -747,7 +754,8 @@ for how long.
 
 - States: listening (its voice turn records), transcribing, working,
   speaking (its reply, acknowledgement or notice plays), needs you (it waits
-  for a permission prompt), done and error, each in a color of its own.
+  for a permission prompt), done and error. Each state has its own color,
+  except speaking and done, which share one.
 - The activity line names what the agent does: "Running a command", "Reading
   files", "Editing files", "Searching the code", "Reading a web page",
   "Searching the web", "Working with a helper", "Planning". Tools from an MCP
@@ -764,8 +772,13 @@ for how long.
   about three seconds after it played.
 - Work a session does on its own shows too: a turn refused with "It's still
   running a background task." shows that work as working, and a permission
-  prompt it hits as needs you, until its `Stop` hook arrives or `claude
-  agents` (asked every ten seconds while the row shows) lists it as neither.
+  prompt it hits as needs you, until the work ends: the session's `Stop`
+  hook arrives (the event Claude Code sends when the session stops working;
+  see "How whisrs hears the end of a turn" below), which ends the row as done
+  when it carries a reply, or `claude agents` lists the session as neither
+  working nor waiting. whisrs runs that listing ten seconds after such a row
+  appears, then waits twice as long before each next one, up to two minutes;
+  a new row or a turn you start brings the wait back to ten seconds.
 - `enabled` follows `[general] overlay` unless you set it. An unknown `style`
   or `corner` (an edge center is not a corner) gets a warning at startup and
   the default.
@@ -789,22 +802,28 @@ for how long.
 | `ask` | `--permission-mode default`: asks before acting, even when your own default mode is `auto` |
 
 `permissions` and `args` are passed when a session starts. A later turn resumes
-the session with the options it was started with (its hooks, `--remote-control`
-and the permission mode included), so a change applies from the next new
+the session with the options it was started with (its hooks, the permission
+mode and your `args` included). So a change to them needs `whisrs restart`
+first, like any `[[agents]]` change, and then applies from the next new
 session (`whisrs agent <name> --new`). The same goes for `reply_instruction`:
 the session keeps the instruction it started with.
+
+One option you may want in `args` is `--remote-control` (for example
+`args = ["--remote-control", "jarvis"]`; the name after it is optional).
+Remote Control is a Claude Code option that lets you follow and answer the
+session from the Claude app. whisrs passes it only when you list it in `args`.
 
 How a later turn continues the session: whisrs stops the session's process
 (`claude stop`), waits until that process has exited, then resumes the session
 with no other flag. Claude Code needs both: a resume while the old process
 still runs, or one with any flag, starts a copy of the session instead, which
-comes back without the hooks, Remote Control and the permission mode. whisrs
-remembers the process every `claude agents` listing shows, so a session
-stopped moments before (by `--stop`, say), which Claude Code already lists
-without a process, is waited for the same way. The wait is capped at ten
-seconds; a process that is still running then fails the turn ("Claude Code
-did not stop the session's last run in time, so this turn was not sent."),
-and nothing is sent. whisrs never adopts a copy: if a resume starts one
+comes back without the hooks, the permission mode and your `args` (Remote
+Control among them). whisrs remembers the process every `claude agents`
+listing shows, so a session stopped moments before (by `--stop`, say), which
+Claude Code already lists without a process, is waited for the same way.
+The wait is capped at ten seconds; a process that is still running then fails
+the turn ("Claude Code did not stop the session's last run in time, so this
+turn was not sent."), and nothing is sent. whisrs never adopts a copy: if a resume starts one
 anyway, whisrs stops that copy, waits for it to exit and removes it (never
 the session itself), waits for the original again and resumes once more. If
 that also starts a copy, the turn fails with
@@ -824,7 +843,8 @@ session whisrs cannot find without matching it by name, which it never does:
 it says it lost track of that turn, which may still be running (`claude agents`
 lists it). A session you delete
 (`claude rm`) is forgotten, and the next turn starts a new one. Changing an
-agent's `harness` or `dir` starts a new session too.
+agent's `harness` or `dir` starts a new session too, from the restart that
+applies it.
 
 How whisrs hears the end of a turn: it starts sessions with `--settings`
 holding a `Stop` hook and a permission-prompt `Notification` hook, both running

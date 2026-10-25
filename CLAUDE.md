@@ -350,7 +350,8 @@ machine: hooks, the reply queue), `ui` (Idle while the voice is an agent's, `Dae
 tray, pill, GNOME pill) and `voice` (which agent, for the board). The runtime's board channel
 (`BoardEvent`) and `voice` feed `board_loop`, which owns the `Board` and publishes rows on
 `DaemonContext::agent_board` for the agent overlay; a session working or waiting on its own shows
-there until a `Stop` or `idle_loop`'s listing ends it. `TranscriptTail` (`claude_tail.rs`) sends
+there until a `Stop` or `idle_loop`'s listing ends it (one `session_phases` per harness, 10 s
+backing off to 120 s, reset by a turn start or a row change). `TranscriptTail` (`claude_tail.rs`) sends
 `Activity` and `Interim` updates; `ProgressGate` admits interims per `feedback`.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).

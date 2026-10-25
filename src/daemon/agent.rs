@@ -98,10 +98,16 @@ const WAITING_HINT: &str = "A plain press answers it; to start fresh, stop it fi
 /// reply holds the queue) does not queue it twice.
 const WAITING_KEY: &str = "waiting-for-you";
 
-/// How often a session the overlay shows working or waiting on its own (no
-/// whisrs turn running) is listed, so its row ends without a `Stop` too
-/// ([`idle_loop`]). As often as a turn's fallback poll.
+/// How soon a session the overlay shows working or waiting on its own (no
+/// whisrs turn running) is first listed, so its row ends without a `Stop`
+/// too ([`idle_loop`]). As often as a turn's fallback poll.
 const IDLE_POLL: Duration = Duration::from_secs(10);
+
+/// The longest wait between those listings: each one doubles the wait, up
+/// to this, so a row shown all day (a background dev server) or a listing
+/// that keeps failing costs one `claude agents` every two minutes. It starts
+/// over at [`IDLE_POLL`] when the rows shown change or a turn starts.
+const IDLE_POLL_MAX: Duration = Duration::from_secs(120);
 
 /// Now, on the runtime's clock: what interim expiries and the board's times
 /// are measured in. The same as `Instant::now()` outside a test that pauses
@@ -370,7 +376,8 @@ pub(crate) struct AgentRuntime {
     /// The agents the board was last told have an utterance pending.
     last_pending: std::sync::Mutex<Vec<String>>,
     /// Wakes [`idle_loop`] when a session starts showing work or a wait of
-    /// its own ([`Slot::shows_idle`]).
+    /// its own ([`Slot::shows_idle`]), or a turn starts: either starts its
+    /// wait over.
     idle_shown: Notify,
 }
 
@@ -624,8 +631,25 @@ impl AgentRuntime {
         None
     }
 
-    fn requeue_front(&self, utterance: Utterance) {
+    /// Put a stopped utterance back at the front of the queue (a recording
+    /// start stopped it, or the queue could not speak it yet). A notice of
+    /// the same key and agent queued while it played is newer: that one
+    /// takes the front instead, so only the newest of a key is said.
+    fn requeue_front(&self, mut utterance: Utterance) {
         if let Ok(mut queue) = self.utterances.lock() {
+            if utterance.notice.is_some() {
+                let newer = queue
+                    .iter()
+                    .position(|u| u.agent == utterance.agent && u.notice == utterance.notice)
+                    .and_then(|i| queue.remove(i));
+                if let Some(newer) = newer {
+                    debug!(
+                        "agent '{}': a newer notice of that kind replaces the one put back",
+                        utterance.agent
+                    );
+                    utterance = newer;
+                }
+            }
             queue.push_front(utterance);
         }
         self.pending_changed();
@@ -846,32 +870,47 @@ impl AgentRuntime {
     /// The harness is asked once for every such agent
     /// ([`Driver::session_phases`]).
     async fn list(&self) -> Vec<AgentInfo> {
-        let (mut rows, probes) = {
+        let (mut rows, rows_asked, sessions) = {
             let inner = self.inner.lock().await;
             let rows: Vec<AgentInfo> = self.agents.iter().map(|a| Self::info(&inner, a)).collect();
-            let probes: Vec<(usize, Arc<Agent>, SessionRef)> = self
+            let (rows_asked, sessions): (Vec<usize>, Vec<(Arc<Agent>, SessionRef)>) = self
                 .agents
                 .iter()
                 .enumerate()
-                .filter_map(|(i, a)| Self::idle_session(&inner, a).map(|s| (i, Arc::clone(a), s)))
-                .collect();
-            (rows, probes)
+                .filter_map(|(i, a)| Self::idle_session(&inner, a).map(|s| (i, (Arc::clone(a), s))))
+                .unzip();
+            (rows, rows_asked, sessions)
         };
+        let phases = self.idle_phases(&sessions).await;
+        for (i, phase) in rows_asked.into_iter().zip(phases) {
+            if let Some(phase) = phase {
+                rows[i].phase = phase;
+            }
+        }
+        rows
+    }
+
+    /// What each of `sessions` does while no whisrs turn runs, asked once
+    /// per harness ([`Driver::session_phases`]), and followed by the rows
+    /// the overlay shows for them ([`AgentRuntime::idle_phase_seen`]). One
+    /// answer per entry, in order: `None` when the harness could not tell.
+    async fn idle_phases(&self, sessions: &[(Arc<Agent>, SessionRef)]) -> Vec<Option<AgentPhase>> {
+        let mut phases = vec![None; sessions.len()];
         for harness in Harness::ALL {
-            let group: Vec<&(usize, Arc<Agent>, SessionRef)> =
-                probes.iter().filter(|p| p.1.harness == *harness).collect();
+            let group: Vec<usize> = (0..sessions.len())
+                .filter(|&i| sessions[i].0.harness == *harness)
+                .collect();
             if group.is_empty() {
                 continue;
             }
-            let sessions: Vec<(Arc<Agent>, SessionRef)> = group
-                .iter()
-                .map(|(_, agent, session)| (Arc::clone(agent), session.clone()))
-                .collect();
-            let phases = self.driver(*harness).session_phases(&sessions).await;
-            for ((i, agent, _), phase) in group.into_iter().zip(phases) {
-                match phase {
+            let asked: Vec<(Arc<Agent>, SessionRef)> =
+                group.iter().map(|&i| sessions[i].clone()).collect();
+            let answers = self.driver(*harness).session_phases(&asked).await;
+            for (i, answer) in group.into_iter().zip(answers) {
+                let agent = &sessions[i].0;
+                match answer {
                     Ok(phase) => {
-                        rows[*i].phase = phase;
+                        phases[i] = Some(phase);
                         self.idle_phase_seen(agent, phase).await;
                     }
                     Err(e) => debug!(
@@ -881,7 +920,7 @@ impl AgentRuntime {
                 }
             }
         }
-        rows
+        phases
     }
 
     /// Show the session's own work as working, with no whisrs turn running:
@@ -1360,30 +1399,57 @@ fn apply_board_event(board: &mut Board, event: BoardEvent) {
 }
 
 /// List the sessions the overlay shows working or waiting on their own
-/// ([`Slot::shows_idle`]) every [`IDLE_POLL`], so such a row ends once the
-/// session neither works nor waits, also without a `Stop` (a session
-/// stopped from a terminal sends none). Sleeps while there is none.
+/// ([`Slot::shows_idle`]), so such a row ends once the session neither
+/// works nor waits, also without a `Stop` (a session stopped from a
+/// terminal sends none). One listing per harness answers for all of them
+/// ([`AgentRuntime::idle_phases`]).
+///
+/// The first listing comes [`IDLE_POLL`] after the rows shown changed, and
+/// each one doubles the wait up to [`IDLE_POLL_MAX`]: a row shown all day
+/// (a background dev server keeps its session working) or a listing that
+/// keeps failing is not listed every ten seconds forever. The rows shown
+/// changing, or a turn starting, starts the wait over. Sleeps while there
+/// is none.
 async fn idle_loop(context: Arc<DaemonContext>) {
     let rt = &context.agents;
+    let mut shown: Vec<String> = Vec::new();
+    let mut wait = IDLE_POLL;
+    // When the next listing is due, kept across a wake-up so that one
+    // never puts it off.
+    let mut due: Option<tokio::time::Instant> = None;
     loop {
-        if rt.idle_shown_sessions().await.is_empty() {
+        let names: Vec<String> = rt
+            .idle_shown_sessions()
+            .await
+            .into_iter()
+            .map(|(agent, _)| agent.name.clone())
+            .collect();
+        if names.is_empty() {
+            shown.clear();
+            due = None;
             rt.idle_shown.notified().await;
             continue;
         }
-        tokio::time::sleep(IDLE_POLL).await;
-        for (agent, session) in rt.idle_shown_sessions().await {
-            match rt
-                .driver(agent.harness)
-                .session_phase(&agent, &session)
-                .await
-            {
-                Ok(phase) => rt.idle_phase_seen(&agent, phase).await,
-                Err(e) => debug!(
-                    "agent '{}': cannot tell what its session does: {e}",
-                    agent.name
-                ),
+        if names != shown {
+            shown = names;
+            wait = IDLE_POLL;
+        }
+        let next = tokio::time::Instant::now() + wait;
+        let at = due.map_or(next, |due| due.min(next));
+        tokio::select! {
+            _ = tokio::time::sleep_until(at) => {}
+            // A turn started, or a row started showing: the wait starts
+            // over, and is never longer than it was.
+            _ = rt.idle_shown.notified() => {
+                wait = IDLE_POLL;
+                due = Some(at);
+                continue;
             }
         }
+        due = None;
+        let sessions = rt.idle_shown_sessions().await;
+        rt.idle_phases(&sessions).await;
+        wait = (wait * 2).min(IDLE_POLL_MAX);
     }
 }
 
@@ -1770,6 +1836,9 @@ fn spawn_turn(
         agent: agent.name.clone(),
         since: instant_at(request.started_at),
     });
+    // The rows of sessions working on their own are listed soon again
+    // ([`idle_loop`]): the user is at it.
+    context.agents.idle_shown.notify_one();
     let task = tokio::spawn(async move {
         run_turn_task(
             ctx, task_agent, generation, session, request, io, updates_rx, rewatch,
@@ -4262,8 +4331,12 @@ mod tests {
     /// own.
     struct IdleListingDriver {
         phase: std::sync::Mutex<AgentPhase>,
-        /// How often [`Driver::session_phase`] was asked.
+        /// How often [`Driver::session_phase`] or
+        /// [`Driver::session_phases`] was asked.
         asked: AtomicUsize,
+        /// When each [`Driver::session_phases`] listing ran, with how many
+        /// sessions it answered for.
+        listings: std::sync::Mutex<Vec<(Instant, usize)>>,
     }
 
     impl IdleListingDriver {
@@ -4271,6 +4344,7 @@ mod tests {
             Self {
                 phase: std::sync::Mutex::new(phase),
                 asked: AtomicUsize::new(0),
+                listings: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -4324,6 +4398,8 @@ mod tests {
             &self,
             sessions: &[(Arc<Agent>, SessionRef)],
         ) -> Vec<Result<AgentPhase, String>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.listings.lock().unwrap().push((now(), sessions.len()));
             let phase = *self.phase.lock().unwrap();
             sessions.iter().map(|_| Ok(phase)).collect()
         }
@@ -4347,10 +4423,15 @@ mod tests {
         }
     }
 
-    /// A one-agent context on `driver`, its session stored (`sid-1`, bg
-    /// `bg1`), with the board and the idle poll running.
-    async fn idle_context(dir: &Path, driver: &Arc<IdleListingDriver>) -> Arc<DaemonContext> {
-        let mut context = test_context(&["jarvis"], dir);
+    /// A context for `names` (the first is `jarvis`) on `driver`, jarvis's
+    /// session stored (`sid-1`, bg `bg1`), with the board and the idle poll
+    /// running.
+    async fn idle_context(
+        names: &[&str],
+        dir: &Path,
+        driver: &Arc<IdleListingDriver>,
+    ) -> Arc<DaemonContext> {
+        let mut context = test_context(names, dir);
         Arc::get_mut(&mut context)
             .unwrap()
             .agents
@@ -4391,7 +4472,7 @@ mod tests {
         use AgentVisual::{Done, NeedsYou, Working};
         let dir = tempfile::tempdir().unwrap();
         let driver = Arc::new(IdleListingDriver::new(AgentPhase::NeedsYou));
-        let context = idle_context(dir.path(), &driver).await;
+        let context = idle_context(&["jarvis"], dir.path(), &driver).await;
         let rt = &context.agents;
 
         handle_agent_event(&context, permission_prompt()).await;
@@ -4430,8 +4511,113 @@ mod tests {
         let rows = rt.list().await;
         assert_eq!(rows[0].phase, AgentPhase::Idle);
         assert_eq!(rt.phase("jarvis").await, AgentPhase::Idle);
-        assert_eq!(driver.asked.load(Ordering::SeqCst), asked, "the poll ran");
+        // The listing's own question, and no poll's.
+        assert_eq!(
+            driver.asked.load(Ordering::SeqCst),
+            asked + 1,
+            "the poll ran"
+        );
         board_shows(&context, &[]).await;
+    }
+
+    /// A wait with no whisrs turn running that ends on a Stop with a reply
+    /// ends Done while the reply waits, as the same work shown working
+    /// first does.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_wait_that_replies_ends_done() {
+        use AgentVisual::{Done, NeedsYou};
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(IdleListingDriver::new(AgentPhase::NeedsYou));
+        let context = idle_context(&["jarvis"], dir.path(), &driver).await;
+        let rt = &context.agents;
+
+        handle_agent_event(&context, permission_prompt()).await;
+        board_shows(&context, &[("jarvis", NeedsYou)]).await;
+        handle_agent_event(&context, stop_hook("Ran it. <spoken>Tests pass.</spoken>")).await;
+        let rows = board_shows(&context, &[("jarvis", Done)]).await;
+        assert_eq!(rows[0].fading_from, None, "faded while its reply waits");
+        assert_eq!(rt.phase("jarvis").await, AgentPhase::Idle);
+        assert_eq!(
+            queued(rt),
+            ["Waiting for your approval to use Bash.", "Tests pass."]
+        );
+        // Spoken (the queue tells the board when a playback ends): nothing
+        // is pending, so it fades and is gone.
+        rt.pending_changed();
+        board_shows(&context, &[]).await;
+    }
+
+    /// The driver's listings once there are `n` of them.
+    async fn listings(driver: &IdleListingDriver, n: usize) -> Vec<(Instant, usize)> {
+        loop {
+            let listings = driver.listings.lock().unwrap().clone();
+            if listings.len() >= n {
+                return listings;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// The time from `from` to the first listing, then between each two.
+    fn gaps(from: Instant, listings: &[(Instant, usize)]) -> Vec<Duration> {
+        let mut last = from;
+        listings
+            .iter()
+            .map(|&(at, _)| {
+                let gap = at.duration_since(last);
+                last = at;
+                gap
+            })
+            .collect()
+    }
+
+    fn secs(list: &[u64]) -> Vec<Duration> {
+        list.iter().copied().map(Duration::from_secs).collect()
+    }
+
+    /// While a session works on its own all along (a dev server), its row's
+    /// listing backs off: ten seconds, then twice as long each time, up to
+    /// two minutes. A turn starting, or another row starting to show,
+    /// starts the wait over; one listing answers for every row shown.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_listing_backs_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(IdleListingDriver::new(AgentPhase::Working));
+        let context = idle_context(&["jarvis", "friday", "kitt"], dir.path(), &driver).await;
+        let rt = &context.agents;
+        {
+            let mut inner = rt.inner.lock().await;
+            let mut record = AgentRecord::new("claude", Path::new("/proj"));
+            record.session_id = Some("sid-2".into());
+            record.bg_id = Some("bg2".into());
+            inner.store.agents.insert("friday".into(), record);
+        }
+        let [jarvis, friday, kitt] = [0, 1, 2].map(|i| Arc::clone(&rt.agents[i]));
+
+        let refused = start_turn(&context, &jarvis, "add a test".into()).await;
+        assert_eq!(refused, Err(Busy::Background));
+        let t0 = now();
+        let seen = listings(&driver, 6).await;
+        assert_eq!(gaps(t0, &seen), secs(&[10, 20, 40, 80, 120, 120]));
+        assert!(seen.iter().all(|&(_, n)| n == 1), "{seen:?}");
+
+        // Kitt's turn starts (it has no session yet, so its own work shows
+        // no row to list): the wait starts over.
+        start_turn(&context, &kitt, "check it".into())
+            .await
+            .unwrap();
+        let t1 = now();
+        let seen = listings(&driver, 8).await;
+        assert_eq!(gaps(t1, &seen[6..]), secs(&[10, 20]));
+
+        // Friday's session works on its own too: its row starts the wait
+        // over, and each listing answers for both rows.
+        let refused = start_turn(&context, &friday, "ship it".into()).await;
+        assert_eq!(refused, Err(Busy::Background));
+        let t2 = now();
+        let seen = listings(&driver, 10).await;
+        assert_eq!(gaps(t2, &seen[8..]), secs(&[10, 20]));
+        assert!(seen[8..].iter().all(|&(_, n)| n == 2), "{seen:?}");
     }
 
     /// A turn refused because the session works on its own shows that work
@@ -4442,7 +4628,7 @@ mod tests {
         use AgentVisual::Working;
         let dir = tempfile::tempdir().unwrap();
         let driver = Arc::new(IdleListingDriver::new(AgentPhase::Working));
-        let context = idle_context(dir.path(), &driver).await;
+        let context = idle_context(&["jarvis"], dir.path(), &driver).await;
         let rt = &context.agents;
         let agent = Arc::clone(&rt.agents[0]);
 
@@ -4504,6 +4690,36 @@ mod tests {
         rt.say_keyed("jarvis", WAITING_KEY, write.into());
         assert_eq!(queued(&rt), [write]);
         rt.set_playing(None);
+    }
+
+    /// A notice put back at the front (a recording start stopped it, or the
+    /// queue could not start it) gives way to a newer one of its key queued
+    /// while it played: only the newest is said, first. With none, it comes
+    /// back as it was, and other keys and agents are left alone.
+    #[test]
+    fn a_notice_put_back_gives_way_to_a_newer_one() {
+        let mut rt = AgentRuntime::disabled();
+        rt.speak = true;
+        rt.agents = vec![Arc::new(test_agent("jarvis"))];
+        let bash = "Waiting for your approval to use Bash.";
+        let edit = "Waiting for your approval to use Edit.";
+        rt.say_keyed("jarvis", WAITING_KEY, bash.into());
+        let playing = rt.next_utterance().unwrap();
+        rt.set_playing(Some(playing.clone()));
+        rt.say_keyed("jarvis", WAITING_KEY, edit.into());
+        rt.say("friday", "A reply.".into());
+        rt.requeue_front(playing);
+        rt.set_playing(None);
+        assert_eq!(queued(&rt), [edit, "A reply."]);
+
+        rt.say_keyed("jarvis", WAITING_KEY, bash.into());
+        let playing = rt.next_utterance().unwrap();
+        rt.set_playing(Some(playing.clone()));
+        rt.say_notice("jarvis", STILL_WORKING);
+        rt.say_keyed("friday", WAITING_KEY, edit.into());
+        rt.requeue_front(playing);
+        rt.set_playing(None);
+        assert_eq!(queued(&rt), [bash, STILL_WORKING, edit]);
     }
 
     /// `--stop` and `--reset` drop the agent's acknowledgements and updates

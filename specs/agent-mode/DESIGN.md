@@ -34,20 +34,24 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
   bypassPermissions`, `ask` → `--permission-mode default`. `ask` passes the flag rather than
   none: without it a session starts in the user's `permissions.defaultMode`, which may be
   `auto`, and `ask` would not ask.
+- `[[agents]]` (and `[agent_overlay]`) is read once, when the daemon starts
+  (`AgentRuntime::new`): any change needs `whisrs restart` first.
 - `permissions`, `args` and `reply_instruction` are fixed when a session starts (a resume
-  passes no flag, see below), so a change applies from the next `--new`.
-- Validation warns (and skips the entry) on a missing/duplicate name, unknown harness or
-  missing dir; a hotkey clash is reported like the `[[llm_commands]]` clashes. Agents with
-  `[tts] enabled = false` get one warning: replies arrive as notifications only.
+  passes no flag, see below), so after the restart a change applies from the next `--new`.
+- Validation warns (and skips the entry, `resolve_agents`) on a missing, invalid (not
+  `[a-z0-9_-]`) or duplicate name, an unknown harness or `permissions` value, and a missing
+  or nonexistent dir; a hotkey clash is reported like the `[[llm_commands]]` clashes. Agents
+  with `[tts] enabled = false` get one warning: replies arrive as notifications only.
 - `new_session_hotkey` has the syntax and clash checks of `hotkey` (it is one more binding
   source, so it also clashes with the agent's own `hotkey`), and starts the hotkey listener on
   its own.
 - `command` exists because a systemd user unit often lacks `~/.local/bin` on PATH. A spawn
   failure names it.
-- `feedback` is fixed at session start like `reply_instruction` (its request is appended
-  to the instruction), so a higher level applies from the next `--new`; a lower one at
-  once, since the daemon's gate enforces the configured level. An unknown value warns
-  and means `brief`; the entry is kept.
+- `feedback` needs the restart like every key. Its request is appended to the instruction,
+  so it is fixed at session start like `reply_instruction`: a higher level applies from
+  the next `--new` after the restart. A lower one applies from the restart, since the
+  daemon's gate (`ProgressGate`, built per turn from the configured level) filters what is
+  spoken. An unknown value warns and means `brief`; the entry is kept.
 - `[agent_overlay]`: an unknown `style` or `corner` (an edge center too) gets one warning
   and the default. The keys are known to the unknown-key check.
 
@@ -365,12 +369,20 @@ active agent in a screen corner.
   working, matching `whisrs agent`, not as a failed turn; a permission prompt with no turn
   running shows needs-you. Either row ends on any `Stop` for the session (with a message:
   a Done row while the reply plays; without one, `IdleEvent::Ended`: gone), or when a
-  listing shows the session neither working nor waiting: `idle_loop` asks
-  `Driver::session_phase` every 10 s while such a row shows, and `whisrs agent` listings
-  count too. A listing only follows a row, never starts one.
+  listing shows the session neither working nor waiting: while such a row shows,
+  `idle_loop` asks `Driver::session_phases` (one `claude agents` for every such agent)
+  10 s after the rows shown changed, then doubles the wait up to 120 s (`IDLE_POLL`,
+  `IDLE_POLL_MAX`), so a row shown all day (a dev server) or a listing that keeps failing
+  is not listed every 10 s forever. The rows shown changing, or a turn starting, starts
+  the wait over (never later than it was due). `whisrs agent` listings count too. A
+  listing only follows a row, never starts one. A wait shown with no turn running that
+  a `Stop` with a reply ends is Done while the reply plays, like the same work shown
+  working first (`Board::turn_ended` times it from the wait).
 - **Needs-you notice:** queued under `WAITING_KEY`, one per agent; a newer prompt replaces
   the queued notice's text, and one already playing plays on with the newer text queued
-  once after it.
+  once after it. When the one playing is stopped and put back (`requeue_front`: a
+  recording start, or `NotIdle`), a newer one of its key queued meanwhile takes the front
+  instead, so two are never queued.
 - **Hosts** (`src/overlay/`, each on its own thread and display connection, apart from the
   pill): Wayland: a layer-shell surface (namespace `whisrs-agents`, `Layer::Overlay`,
   anchored to the corner's two edges, no input region, no keyboard), a fixed logical
