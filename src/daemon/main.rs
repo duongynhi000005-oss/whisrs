@@ -140,12 +140,9 @@ async fn main() -> Result<()> {
     // The agent overlay exists only with agents; it follows `[general]
     // overlay` unless `[agent_overlay] enabled` says otherwise. Either
     // overlay gets the mic and TTS levels.
-    let agent_overlay_enabled = agents.is_enabled()
-        && config
-            .agent_overlay
-            .clone()
-            .unwrap_or_default()
-            .enabled(overlay_enabled);
+    let agent_overlay_config = config.agent_overlay.clone().unwrap_or_default();
+    let agent_overlay_enabled =
+        agents.is_enabled() && agent_overlay_config.enabled(overlay_enabled);
     let context = Arc::new(DaemonContext {
         config,
         window_tracker,
@@ -250,14 +247,46 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Start bottom recording overlay if enabled.
-    // Spawned as a background task so desktop integration failures do not stop the daemon.
-    if overlay_enabled {
-        tokio::spawn(whisrs::overlay::spawn_overlay(
-            context.state_tx.subscribe_ui(),
-            overlay_level_rx,
-            overlay_config,
-        ));
+    // The recording pill and the agent overlay, if enabled, each on a
+    // thread of its own so desktop integration failures do not stop the
+    // daemon. Without agents there is no agent overlay. While it is on
+    // screen it stands in for the agent progress toasts.
+    if overlay_enabled || agent_overlay_enabled {
+        let feeds = whisrs::overlay::OverlayFeeds {
+            pill: overlay_enabled.then(|| whisrs::overlay::PillFeed {
+                state_rx: context.state_tx.subscribe_ui(),
+                level_rx: overlay_level_rx.clone(),
+                config: overlay_config,
+            }),
+            agents: agent_overlay_enabled.then(|| whisrs::overlay::AgentsFeed {
+                entries_rx: context.agent_board.subscribe(),
+                level_rx: overlay_level_rx.clone(),
+                config: agent_overlay_config,
+            }),
+        };
+        let mut shown = whisrs::overlay::spawn_overlays(feeds);
+        if agent_overlay_enabled {
+            let shown_ctx = Arc::clone(&context);
+            tokio::spawn(async move {
+                loop {
+                    let on = shown.get();
+                    shown_ctx
+                        .agent_overlay_shown
+                        .store(on, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        "agent overlay {}",
+                        if on {
+                            "on screen: agent progress toasts off"
+                        } else {
+                            "not on screen: agent progress toasts on"
+                        }
+                    );
+                    if !shown.changed().await {
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     let sock_path = socket_path();

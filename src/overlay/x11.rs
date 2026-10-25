@@ -42,7 +42,7 @@ pub(super) fn run_x11_overlay(
     let colormap = conn.generate_id()?;
     conn.create_colormap(ColormapAlloc::NONE, colormap, screen.root, visual.visual_id)?;
 
-    let (x, y) = screen_position(screen, width, height, position);
+    let (x, y) = screen_position(screen, width, height, position, EDGE_MARGIN);
     let window = conn.generate_id()?;
     conn.create_window(
         visual.depth,
@@ -63,7 +63,7 @@ pub(super) fn run_x11_overlay(
             .event_mask(EventMask::EXPOSURE),
     )?;
 
-    set_x11_window_hints(&conn, window, &atoms)?;
+    set_x11_window_hints(&conn, window, &atoms, b"whisrs overlay")?;
     let shape_supported = make_x11_window_click_through(&conn, window)?;
 
     let gc = conn.generate_id()?;
@@ -116,7 +116,14 @@ pub(super) fn run_x11_overlay(
         }
         copy_pixmap_to_x11_zpixmap(&renderer.pixmap, visual, &mut frame);
         if !mapped {
-            let (x, y) = x11_overlay_position(&conn, screen, &atoms, width, height, position);
+            let (x, y) = x11_overlay_position(
+                &conn,
+                screen,
+                &atoms,
+                (width, height),
+                position,
+                EDGE_MARGIN,
+            );
             conn.configure_window(
                 window,
                 &ConfigureWindowAux::default()
@@ -151,16 +158,16 @@ pub(super) fn run_x11_overlay(
 }
 
 #[derive(Clone, Copy)]
-struct X11ArgbVisual {
-    depth: u8,
-    visual_id: Visualid,
+pub(super) struct X11ArgbVisual {
+    pub(super) depth: u8,
+    pub(super) visual_id: Visualid,
     red_mask: u32,
     green_mask: u32,
     blue_mask: u32,
     alpha_mask: u32,
 }
 
-fn find_argb_visual(screen: &Screen) -> Option<X11ArgbVisual> {
+pub(super) fn find_argb_visual(screen: &Screen) -> Option<X11ArgbVisual> {
     screen.allowed_depths.iter().find_map(|depth| {
         if depth.depth != 32 {
             return None;
@@ -192,7 +199,7 @@ fn depth_mask(depth: u8) -> u32 {
     }
 }
 
-struct X11Atoms {
+pub(super) struct X11Atoms {
     atom: u32,
     net_active_window: u32,
     net_wm_name: u32,
@@ -208,7 +215,7 @@ struct X11Atoms {
 }
 
 impl X11Atoms {
-    fn new(conn: &RustConnection) -> Result<Self, OverlayError> {
+    pub(super) fn new(conn: &RustConnection) -> Result<Self, OverlayError> {
         Ok(Self {
             atom: u32::from(AtomEnum::ATOM),
             net_active_window: intern_atom(conn, b"_NET_ACTIVE_WINDOW")?,
@@ -233,24 +240,27 @@ fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<u32, OverlayError> 
     Ok(conn.intern_atom(false, name)?.reply()?.atom)
 }
 
-fn set_x11_window_hints(
+/// Name the window `name` and ask for an always-on-top notification that
+/// no pager or taskbar lists.
+pub(super) fn set_x11_window_hints(
     conn: &RustConnection,
     window: Window,
     atoms: &X11Atoms,
+    name: &[u8],
 ) -> Result<(), OverlayError> {
     conn.change_property8(
         PropMode::REPLACE,
         window,
         atoms.net_wm_name,
         atoms.utf8_string,
-        b"whisrs overlay",
+        name,
     )?;
     conn.change_property8(
         PropMode::REPLACE,
         window,
         AtomEnum::WM_NAME,
         AtomEnum::STRING,
-        b"whisrs overlay",
+        name,
     )?;
     conn.change_property32(
         PropMode::REPLACE,
@@ -281,7 +291,7 @@ fn set_x11_window_hints(
     Ok(())
 }
 
-fn make_x11_window_click_through(
+pub(super) fn make_x11_window_click_through(
     conn: &RustConnection,
     window: Window,
 ) -> Result<bool, OverlayError> {
@@ -302,7 +312,7 @@ fn make_x11_window_click_through(
     Ok(true)
 }
 
-fn set_x11_bounding_shape(
+pub(super) fn set_x11_bounding_shape(
     conn: &RustConnection,
     window: Window,
     rectangles: &[Rectangle],
@@ -319,7 +329,7 @@ fn set_x11_bounding_shape(
     Ok(())
 }
 
-fn shape_rectangles_eq(a: &[Rectangle], b: &[Rectangle]) -> bool {
+pub(super) fn shape_rectangles_eq(a: &[Rectangle], b: &[Rectangle]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -351,13 +361,16 @@ fn alpha_shape_rectangles(pixmap: &Pixmap) -> Vec<Rectangle> {
     rectangles
 }
 
-fn x11_overlay_position(
+/// Where a `size` window goes at `position`, `margin` px from the edges:
+/// on the monitor holding the active window's center, else the primary
+/// (or first) monitor, else the whole screen.
+pub(super) fn x11_overlay_position(
     conn: &RustConnection,
     screen: &Screen,
     atoms: &X11Atoms,
-    width: u16,
-    height: u16,
+    (width, height): (u16, u16),
     position: OverlayPosition,
+    margin: i32,
 ) -> (i16, i16) {
     let monitors = match active_x11_monitors(conn, screen.root) {
         Ok(monitors) => monitors,
@@ -383,9 +396,9 @@ fn x11_overlay_position(
                 i32::from(monitor.y),
                 u32::from(monitor.width),
                 u32::from(monitor.height),
-                width,
-                height,
+                (width, height),
                 position,
+                margin,
             );
         }
     }
@@ -400,13 +413,13 @@ fn x11_overlay_position(
             i32::from(monitor.y),
             u32::from(monitor.width),
             u32::from(monitor.height),
-            width,
-            height,
+            (width, height),
             position,
+            margin,
         );
     }
 
-    screen_position(screen, width, height, position)
+    screen_position(screen, width, height, position, margin)
 }
 
 fn active_x11_monitors(
@@ -465,9 +478,9 @@ fn position_in_rect(
     y: i32,
     rect_width: u32,
     rect_height: u32,
-    width: u16,
-    height: u16,
+    (width, height): (u16, u16),
     position: OverlayPosition,
+    margin: i32,
 ) -> (i16, i16) {
     let width = i32::from(width);
     let height = i32::from(height);
@@ -480,9 +493,9 @@ fn position_in_rect(
         .saturating_sub(width)
         .max(min_x);
     let px = match position.h_align() {
-        OverlayHAlign::Left => x.saturating_add(EDGE_MARGIN),
+        OverlayHAlign::Left => x.saturating_add(margin),
         OverlayHAlign::Center => x.saturating_add((rect_width - width) / 2),
-        OverlayHAlign::Right => max_x.saturating_sub(EDGE_MARGIN),
+        OverlayHAlign::Right => max_x.saturating_sub(margin),
     };
 
     let min_y = y;
@@ -491,9 +504,9 @@ fn position_in_rect(
         .saturating_sub(height)
         .max(min_y);
     let py = if position.is_top() {
-        y.saturating_add(EDGE_MARGIN)
+        y.saturating_add(margin)
     } else {
-        max_y.saturating_sub(EDGE_MARGIN)
+        max_y.saturating_sub(margin)
     };
 
     (
@@ -503,20 +516,21 @@ fn position_in_rect(
 }
 
 /// Placement on the whole X screen, for when XRandR reports no monitors.
-fn screen_position(
+pub(super) fn screen_position(
     screen: &Screen,
     width: u16,
     height: u16,
     position: OverlayPosition,
+    margin: i32,
 ) -> (i16, i16) {
     position_in_rect(
         0,
         0,
         u32::from(screen.width_in_pixels),
         u32::from(screen.height_in_pixels),
-        width,
-        height,
+        (width, height),
         position,
+        margin,
     )
 }
 
@@ -524,7 +538,11 @@ fn to_i16_coord(value: i32) -> i16 {
     value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
-fn copy_pixmap_to_x11_zpixmap(pixmap: &Pixmap, visual: X11ArgbVisual, canvas: &mut [u8]) {
+pub(super) fn copy_pixmap_to_x11_zpixmap(
+    pixmap: &Pixmap,
+    visual: X11ArgbVisual,
+    canvas: &mut [u8],
+) {
     let src = pixmap.pixels();
     debug_assert_eq!(src.len() * 4, canvas.len());
     for (i, px) in src.iter().enumerate() {
@@ -562,11 +580,11 @@ mod tests {
     fn x11_position_in_rect_uses_monitor_bounds() {
         let bc = OverlayPosition::BottomCenter;
         assert_eq!(
-            position_in_rect(1920, 360, 1920, 1200, 100, 40, bc),
+            position_in_rect(1920, 360, 1920, 1200, (100, 40), bc, EDGE_MARGIN),
             (2830, 1504)
         );
         assert_eq!(
-            position_in_rect(3840, 0, 1200, 1920, 100, 40, bc),
+            position_in_rect(3840, 0, 1200, 1920, (100, 40), bc, EDGE_MARGIN),
             (4390, 1864)
         );
     }
@@ -574,7 +592,7 @@ mod tests {
     #[test]
     fn x11_position_in_rect_honors_every_position() {
         // 1920x1200 monitor at (1920, 360), 100x40 pill, 16 px margins.
-        let at = |p| position_in_rect(1920, 360, 1920, 1200, 100, 40, p);
+        let at = |p| position_in_rect(1920, 360, 1920, 1200, (100, 40), p, EDGE_MARGIN);
         assert_eq!(at(OverlayPosition::BottomLeft), (1936, 1504));
         assert_eq!(at(OverlayPosition::BottomCenter), (2830, 1504));
         assert_eq!(at(OverlayPosition::BottomRight), (3724, 1504));
@@ -587,7 +605,15 @@ mod tests {
     fn x11_position_in_rect_stays_on_a_tiny_monitor() {
         // Smaller than pill + margins: clamp inside, never off-screen.
         assert_eq!(
-            position_in_rect(0, 0, 100, 40, 100, 40, OverlayPosition::TopRight),
+            position_in_rect(
+                0,
+                0,
+                100,
+                40,
+                (100, 40),
+                OverlayPosition::TopRight,
+                EDGE_MARGIN
+            ),
             (0, 0)
         );
     }

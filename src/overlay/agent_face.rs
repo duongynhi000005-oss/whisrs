@@ -22,6 +22,12 @@ const OUTLINE: f32 = 1.6;
 const FACE_BG: [u8; 3] = [0x1E, 0x22, 0x2B];
 /// A drawn feature's line: mouth ring, brow, ^^ eyes, smile, x eyes.
 const FEATURE_W: f32 = 1.4;
+/// The working face's dots: the first one's center at rest (box px), the
+/// gap between centers, how high they bounce and their radius.
+const WORK_DOTS: (f32, f32) = (24.8, 9.4);
+const WORK_DOT_GAP: f32 = 4.0;
+const WORK_DOT_BOUNCE: f32 = 1.6;
+const WORK_DOT_R: f32 = 1.4;
 /// The needs-you badge's "?" and its color.
 const BADGE_MARK: TextStyle = TextStyle::new(Weight::SemiBold, 10.0);
 const BADGE_INK: [u8; 3] = [0x0E, 0x10, 0x14];
@@ -99,14 +105,18 @@ pub(super) fn draw(pixmap: &mut Pixmap, visual: AgentVisual, f: &ShapeFrame) {
             bar(pixmap, u(40.0), u(76.0), u(86.0), 1.5);
         }
         AgentVisual::Working => {
-            // Pupils up and to the side, three dots bouncing 0.2 s apart.
+            // Pupils up and to the side, at three dots bouncing 0.2 s apart
+            // in the face's upper corner. The mockup has them over the
+            // face's corner, outside a 44 px box; inside it they stay in
+            // the shape's own area, clear of the outline and the pupils.
             dot(pixmap, u(41.0), u(39.0), len(7.0), a);
             dot(pixmap, u(87.0), u(39.0), len(7.0), a);
             bar(pixmap, u(46.0), u(70.0), u(86.0), 1.5);
             for i in 0..3 {
                 let b = wave(f.t - 0.2 * i as f32, 1.2);
-                let x = 32.7 + 4.4 * i as f32;
-                dot(pixmap, x, 1.0 - 1.6 * b, 1.5, a * (0.25 + 0.75 * b));
+                let x = WORK_DOTS.0 + WORK_DOT_GAP * i as f32;
+                let y = WORK_DOTS.1 - WORK_DOT_BOUNCE * b;
+                dot(pixmap, x, y, WORK_DOT_R, a * (0.25 + 0.75 * b));
             }
         }
         AgentVisual::Speaking => {
@@ -167,6 +177,49 @@ pub(super) fn draw(pixmap: &mut Pixmap, visual: AgentVisual, f: &ShapeFrame) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_dots_stay_inside_the_box_and_the_face() {
+        // Over a whole bounce, nothing reaches the box's outer 2 px, and
+        // above the face's top edge (the outline's outer side) stays clear.
+        let top_clear = (FACE_AT - OUTLINE / 2.0).floor() as usize;
+        for step in 0..24 {
+            let mut pm = Pixmap::new(SHAPE as u32, SHAPE as u32).unwrap();
+            let frame = ShapeFrame {
+                origin: (0.0, 0.0),
+                scale: 1.0,
+                alpha: 1.0,
+                t: step as f32 * 0.05,
+                level: 0.0,
+            };
+            draw(&mut pm, AgentVisual::Working, &frame);
+            let n = SHAPE as usize;
+            let alpha = |x: usize, y: usize| pm.pixels()[y * n + x].alpha();
+            for i in 0..n {
+                for edge in [0, 1, n - 2, n - 1] {
+                    assert_eq!(alpha(i, edge), 0, "row {edge}, x {i}, step {step}");
+                    assert_eq!(alpha(edge, i), 0, "column {edge}, y {i}, step {step}");
+                }
+                for y in 0..top_clear {
+                    assert_eq!(alpha(i, y), 0, "above the face: {i},{y}, step {step}");
+                }
+            }
+        }
+        // The dots clear the outline's inner side, at the top and at the
+        // rounded corner they sit under.
+        let inner = FACE_AT + OUTLINE / 2.0;
+        let corner = (FACE_AT + FACE - FACE_R, FACE_AT + FACE_R);
+        for i in 0..3 {
+            let x = WORK_DOTS.0 + WORK_DOT_GAP * i as f32;
+            let y = WORK_DOTS.1 - WORK_DOT_BOUNCE;
+            assert!(y - WORK_DOT_R >= inner + 1.0, "dot {i} under the top edge");
+            let d = ((x - corner.0).max(0.0).powi(2) + (corner.1 - y).max(0.0).powi(2)).sqrt();
+            assert!(
+                d + WORK_DOT_R <= FACE_R - OUTLINE / 2.0 - 1.0,
+                "dot {i} in the corner"
+            );
+        }
+    }
 
     #[test]
     fn mockup_coordinates_fill_the_face() {
