@@ -172,8 +172,8 @@ fn new_pixmap(scale: f32) -> Result<Pixmap, OverlayError> {
 }
 
 /// Says the agent overlay is on screen ([`super::AgentOverlayShown`]):
-/// `set` once the host's window exists; false again when dropped, as the
-/// host ends.
+/// `set` once the host's window exists, `clear` while it has none (the
+/// compositor closed it); false again when dropped, as the host ends.
 pub(super) struct ShownFlag(watch::Sender<bool>);
 
 impl ShownFlag {
@@ -184,6 +184,11 @@ impl ShownFlag {
     pub(super) fn set(&self) {
         self.0
             .send_if_modified(|shown| !std::mem::replace(shown, true));
+    }
+
+    pub(super) fn clear(&self) {
+        self.0
+            .send_if_modified(|shown| std::mem::replace(shown, false));
     }
 }
 
@@ -283,5 +288,32 @@ mod tests {
         assert!(*rx.borrow());
         drop(flag);
         assert!(!*rx.borrow());
+    }
+
+    /// A surface the compositor closed is off screen until the next one is
+    /// configured: the flag follows, and only real changes are published.
+    #[test]
+    fn the_shown_flag_clears_while_the_surface_is_closed() {
+        let (tx, mut rx) = watch::channel(false);
+        let flag = ShownFlag::new(tx);
+        flag.set();
+        assert!(rx.has_changed().unwrap());
+        assert!(*rx.borrow_and_update());
+        flag.clear();
+        assert!(!*rx.borrow_and_update());
+        flag.clear();
+        assert!(!rx.has_changed().unwrap(), "cleared twice, published once");
+        flag.set();
+        assert!(*rx.borrow_and_update());
+    }
+
+    /// A new surface draws at scale 1 again (the Wayland host resets it):
+    /// the pixmap is back to its 1x size.
+    #[test]
+    fn a_scale_goes_back_to_one() {
+        let (_board, _level, mut f) = frames();
+        f.set_scale(2.0).unwrap();
+        assert!(f.set_scale(1.0).unwrap());
+        assert_eq!(f.size(), canvas_size(1.0));
     }
 }

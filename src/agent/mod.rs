@@ -510,6 +510,9 @@ pub enum TurnOutcome {
 pub enum IdleEvent {
     /// The session finished work it did on its own: its raw final message.
     Reply(String),
+    /// That work ended with no message (a `Stop` with nothing in it): no
+    /// longer working or waiting, and nothing to say.
+    Ended,
     /// Work the session does on its own waits for a permission prompt. The
     /// text is a short spoken notice.
     NeedsYou(String),
@@ -681,8 +684,8 @@ pub trait Driver: Send + Sync {
 
     /// What a hook payload for `session` means while no whisrs turn runs:
     /// the final message of work the session finished on its own (spoken
-    /// like a reply), a permission prompt that work waits on (needs-you), or
-    /// nothing.
+    /// like a reply), that work ending with nothing to say, a permission
+    /// prompt it waits on (needs-you), or nothing.
     async fn idle_event(&self, payload: &serde_json::Value, session: &SessionRef) -> IdleEvent;
 }
 

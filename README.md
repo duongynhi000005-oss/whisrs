@@ -279,7 +279,10 @@ name = "jarvis"
 hotkey = "Super+Shift+J"
 dir = "~/Projects/whisrs"
 permissions = "auto"   # auto | bypass | ask
+feedback = "brief"     # summary | brief | conversational
 ```
+
+While it works, a small overlay in a screen corner (`[agent_overlay]`, an orb or a face) shows each agent listening, working, waiting for your approval or speaking, with what it does ("Running a command") and for how long. `feedback` sets what you hear before the reply: nothing (`summary`), a short "On it." (`brief`, the default), or that and short updates at milestones (`conversational`).
 
 `whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn, and `whisrs agent jarvis --new` (or an optional `new_session_hotkey`) records one that starts a fresh session. Sessions show up in `claude agents` as `whisrs-<name>`, and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
 

@@ -22,7 +22,9 @@
 //! The agent overlay's model ([`Board`]) is owned by one task
 //! ([`board_loop`]), fed by the turns, the reply queue and the agent the
 //! voice belongs to ([`crate::context::StateBus`]); it publishes the rows on
-//! `DaemonContext::agent_board`.
+//! `DaemonContext::agent_board`. A session that works or waits on its own,
+//! with no whisrs turn running, shows there too, until a `Stop` or a listing
+//! ([`idle_loop`]) says that ended.
 //!
 //! The runtime is harness-neutral: it calls [`Driver`] and never names a
 //! harness outside [`AgentRuntime::new`].
@@ -95,6 +97,11 @@ const WAITING_HINT: &str = "A plain press answers it; to start fresh, stop it fi
 /// agent, so a refusal while the announcement still waits (another agent's
 /// reply holds the queue) does not queue it twice.
 const WAITING_KEY: &str = "waiting-for-you";
+
+/// How often a session the overlay shows working or waiting on its own (no
+/// whisrs turn running) is listed, so its row ends without a `Stop` too
+/// ([`idle_loop`]). As often as a turn's fallback poll.
+const IDLE_POLL: Duration = Duration::from_secs(10);
 
 /// Now, on the runtime's clock: what interim expiries and the board's times
 /// are measured in. The same as `Instant::now()` outside a test that pauses
@@ -208,6 +215,11 @@ struct Slot {
     /// ("Waiting for your approval to use Bash."). Meant only while `phase`
     /// is needs-you.
     needs_you: Option<String>,
+    /// With no whisrs turn running, the overlay shows the session working
+    /// on its own: a turn was refused because it does, as `whisrs agent`
+    /// lists it. `phase` stays idle, so a press is refused as before, at
+    /// its transcript.
+    own_work: bool,
 }
 
 impl Default for Slot {
@@ -217,6 +229,7 @@ impl Default for Slot {
             turn: None,
             polled_reply: None,
             needs_you: None,
+            own_work: false,
         }
     }
 }
@@ -226,6 +239,23 @@ impl Slot {
     fn wait_for_you(&mut self, notice: &str) {
         self.phase = AgentPhase::NeedsYou;
         self.needs_you = Some(notice.to_string());
+    }
+
+    /// Whether the overlay shows the session's own work, or a permission
+    /// prompt it waits on, with no whisrs turn running: until a `Stop`, or
+    /// a listing that shows it neither works nor waits ([`idle_loop`]).
+    fn shows_idle(&self) -> bool {
+        self.turn.is_none() && (self.own_work || self.phase == AgentPhase::NeedsYou)
+    }
+
+    /// End what [`Slot::shows_idle`] shows: `true` when it showed something.
+    fn end_idle(&mut self) -> bool {
+        let shown = self.shows_idle();
+        if shown {
+            self.phase = AgentPhase::Idle;
+            self.own_work = false;
+        }
+        shown
     }
 
     /// The needs-you notice while a whisrs turn of the agent waits for you.
@@ -249,8 +279,9 @@ struct Utterance {
     agent: String,
     text: String,
     /// The refusal notice this speaks, as its key ([`Busy::notice`], or
-    /// [`WAITING_KEY`]): one of a kind per agent at a time, queued or
-    /// playing. `None` for replies and every other line, which are never
+    /// [`WAITING_KEY`]): one of a kind per agent queued at a time, and none
+    /// that says what the one playing says ([`AgentRuntime::say_keyed`]).
+    /// `None` for replies and every other line, which are never
     /// deduplicated.
     notice: Option<&'static str>,
     /// An acknowledgement or a progress update, and until when it is worth
@@ -272,13 +303,14 @@ struct Interim {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BoardEvent {
     /// A turn started at `since` (for one watched again after a restart,
-    /// when it first started).
+    /// when it first started), or the overlay shows the session's own work
+    /// from then ([`Slot::own_work`]).
     TurnStarted { agent: String, since: Instant },
     /// What the running turn does now.
     Activity { agent: String, label: String },
     /// The turn, or the session's own work, waits for a permission prompt.
     NeedsYou { agent: String, at: Instant },
-    /// It runs again after a wait (or the wait ended with no turn running).
+    /// It runs again after a wait.
     Working { agent: String },
     /// The turn ended, with a reply (`ok`) or an error.
     TurnEnded {
@@ -288,7 +320,8 @@ enum BoardEvent {
     },
     /// The agents with an utterance queued or playing.
     Pending { agents: Vec<String>, at: Instant },
-    /// Forget what is shown for the agent (`--stop`, `--reset`).
+    /// Forget what is shown for the agent (`--stop`, `--reset`, the end of
+    /// its session's own work or wait). Its voice stays.
     Clear { agent: String },
 }
 
@@ -336,6 +369,9 @@ pub(crate) struct AgentRuntime {
     board_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BoardEvent>>>,
     /// The agents the board was last told have an utterance pending.
     last_pending: std::sync::Mutex<Vec<String>>,
+    /// Wakes [`idle_loop`] when a session starts showing work or a wait of
+    /// its own ([`Slot::shows_idle`]).
+    idle_shown: Notify,
 }
 
 impl AgentRuntime {
@@ -412,6 +448,7 @@ impl AgentRuntime {
             board_tx: Some(board_tx),
             board_rx: std::sync::Mutex::new(Some(board_rx)),
             last_pending: std::sync::Mutex::new(Vec::new()),
+            idle_shown: Notify::new(),
         }
     }
 
@@ -438,6 +475,7 @@ impl AgentRuntime {
             board_tx: None,
             board_rx: std::sync::Mutex::new(None),
             last_pending: std::sync::Mutex::new(Vec::new()),
+            idle_shown: Notify::new(),
         }
     }
 
@@ -523,8 +561,9 @@ impl AgentRuntime {
     }
 
     /// Queue the refusal notice `text` under `key`, named after the agent
-    /// when there are several, unless one of that key is queued or playing
-    /// for this agent.
+    /// when there are several: one of that key per agent at a time. One
+    /// queued already takes the newer text (a newer permission prompt); one
+    /// playing plays on, and a different text is queued once after it.
     fn say_keyed(&self, agent: &str, key: &'static str, text: String) {
         self.enqueue(Utterance {
             agent: agent.to_string(),
@@ -544,17 +583,22 @@ impl AgentRuntime {
                     && u.agent == utterance.agent
                     && u.notice == utterance.notice
             };
+            if let Some(queued) = queue.iter_mut().find(|u| same_notice(u)) {
+                debug!(
+                    "agent '{}': that notice is already queued; it says the newer text",
+                    utterance.agent
+                );
+                queued.text = utterance.text;
+                return;
+            }
             let playing = self
                 .playing
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-                .is_some_and(same_notice);
-            if playing || queue.iter().any(same_notice) {
-                debug!(
-                    "agent '{}': that notice is already queued or playing",
-                    utterance.agent
-                );
+                .is_some_and(|u| same_notice(u) && u.text == utterance.text);
+            if playing {
+                debug!("agent '{}': that notice is playing", utterance.agent);
                 return;
             }
             queue.push_back(utterance);
@@ -826,7 +870,10 @@ impl AgentRuntime {
             let phases = self.driver(*harness).session_phases(&sessions).await;
             for ((i, agent, _), phase) in group.into_iter().zip(phases) {
                 match phase {
-                    Ok(phase) => rows[*i].phase = phase,
+                    Ok(phase) => {
+                        rows[*i].phase = phase;
+                        self.idle_phase_seen(agent, phase).await;
+                    }
                     Err(e) => debug!(
                         "agent '{}': cannot tell what its session does: {e}",
                         agent.name
@@ -835,6 +882,78 @@ impl AgentRuntime {
             }
         }
         rows
+    }
+
+    /// Show the session's own work as working, with no whisrs turn running:
+    /// a turn was refused because the session works on its own, as `whisrs
+    /// agent` lists it. Shown until a `Stop`, or a listing that shows it no
+    /// longer works ([`idle_loop`]). A wait it showed is over: it works.
+    fn show_own_work(&self, inner: &mut Inner, agent: &Agent) {
+        let slot = inner.slots.entry(agent.name.clone()).or_default();
+        if slot.turn.is_some() || slot.own_work {
+            return;
+        }
+        slot.phase = AgentPhase::Idle;
+        slot.own_work = true;
+        self.board(BoardEvent::TurnStarted {
+            agent: agent.name.clone(),
+            since: now(),
+        });
+        self.idle_shown.notify_one();
+    }
+
+    /// What a listing showed the session of `agent` doing while no whisrs
+    /// turn runs ([`Driver::session_phase`]). A row the overlay shows for
+    /// its own work or a wait of it ([`Slot::shows_idle`]) follows it, and
+    /// ends once the session neither works nor waits. A listing never
+    /// starts such a row: a refusal or a hook does.
+    async fn idle_phase_seen(&self, agent: &Agent, phase: AgentPhase) {
+        let mut inner = self.inner.lock().await;
+        let Some(slot) = inner.slots.get_mut(&agent.name).filter(|s| s.shows_idle()) else {
+            return;
+        };
+        let name = agent.name.clone();
+        match phase {
+            AgentPhase::Idle => {
+                slot.end_idle();
+                info!("agent '{name}': its session no longer works or waits on its own");
+                self.board(BoardEvent::Clear { agent: name });
+            }
+            // Answered elsewhere (in a terminal): the work goes on.
+            AgentPhase::Working if slot.phase == AgentPhase::NeedsYou => {
+                slot.phase = AgentPhase::Idle;
+                if slot.own_work {
+                    self.board(BoardEvent::Working { agent: name });
+                } else {
+                    slot.own_work = true;
+                    self.board(BoardEvent::TurnStarted {
+                        agent: name,
+                        since: now(),
+                    });
+                }
+            }
+            // The hook that announces a prompt came first so far; this
+            // only shows it.
+            AgentPhase::NeedsYou if slot.phase != AgentPhase::NeedsYou => {
+                slot.wait_for_you(WAITING_FOR_YOU);
+                self.board(BoardEvent::NeedsYou {
+                    agent: name,
+                    at: now(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// The sessions [`idle_loop`] lists: those shown working or waiting on
+    /// their own ([`Slot::shows_idle`]) that have one to ask about.
+    async fn idle_shown_sessions(&self) -> Vec<(Arc<Agent>, SessionRef)> {
+        let inner = self.inner.lock().await;
+        self.agents
+            .iter()
+            .filter(|a| inner.slots.get(&a.name).is_some_and(Slot::shows_idle))
+            .filter_map(|a| Self::idle_session(&inner, a).map(|s| (Arc::clone(a), s)))
+            .collect()
     }
 
     #[cfg(test)]
@@ -941,6 +1060,7 @@ pub(crate) async fn start_background(
             events,
             context.state_tx.subscribe_voice(),
         ));
+        tokio::spawn(idle_loop(Arc::clone(&context)));
     }
 
     let rt = &context.agents;
@@ -1239,6 +1359,34 @@ fn apply_board_event(board: &mut Board, event: BoardEvent) {
     }
 }
 
+/// List the sessions the overlay shows working or waiting on their own
+/// ([`Slot::shows_idle`]) every [`IDLE_POLL`], so such a row ends once the
+/// session neither works nor waits, also without a `Stop` (a session
+/// stopped from a terminal sends none). Sleeps while there is none.
+async fn idle_loop(context: Arc<DaemonContext>) {
+    let rt = &context.agents;
+    loop {
+        if rt.idle_shown_sessions().await.is_empty() {
+            rt.idle_shown.notified().await;
+            continue;
+        }
+        tokio::time::sleep(IDLE_POLL).await;
+        for (agent, session) in rt.idle_shown_sessions().await {
+            match rt
+                .driver(agent.harness)
+                .session_phase(&agent, &session)
+                .await
+            {
+                Ok(phase) => rt.idle_phase_seen(&agent, phase).await,
+                Err(e) => debug!(
+                    "agent '{}': cannot tell what its session does: {e}",
+                    agent.name
+                ),
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
@@ -1370,6 +1518,19 @@ pub(crate) async fn handle_agent_event(context: &DaemonContext, payload: serde_j
                 .await
             {
                 IdleEvent::Reply(raw) => own_reply(context, &agent, raw).await,
+                IdleEvent::Ended => {
+                    let mut inner = rt.inner.lock().await;
+                    let slot = inner.slots.entry(agent.name.clone()).or_default();
+                    if slot.end_idle() {
+                        info!(
+                            "agent '{}': the work its session did on its own ended",
+                            agent.name
+                        );
+                        rt.board(BoardEvent::Clear {
+                            agent: agent.name.clone(),
+                        });
+                    }
+                }
                 IdleEvent::NeedsYou(notice) => {
                     {
                         let mut inner = rt.inner.lock().await;
@@ -1380,6 +1541,7 @@ pub(crate) async fn handle_agent_event(context: &DaemonContext, payload: serde_j
                                 agent: agent.name.clone(),
                                 at: now(),
                             });
+                            rt.idle_shown.notify_one();
                         }
                     }
                     info!(
@@ -1417,6 +1579,15 @@ async fn own_reply(context: &DaemonContext, agent: &Agent, raw: String) {
     {
         let mut inner = context.agents.inner.lock().await;
         let slot = inner.slots.entry(agent.name.clone()).or_default();
+        // The work it showed as its own (or a wait of it) ended: Done, held
+        // while the reply plays.
+        if slot.end_idle() {
+            context.agents.board(BoardEvent::TurnEnded {
+                agent: agent.name.clone(),
+                ok: true,
+                at: now(),
+            });
+        }
         if slot
             .polled_reply
             .take()
@@ -1427,12 +1598,6 @@ async fn own_reply(context: &DaemonContext, agent: &Agent, raw: String) {
                 agent.name
             );
             return;
-        }
-        if slot.turn.is_none() && slot.phase == AgentPhase::NeedsYou {
-            slot.phase = AgentPhase::Idle;
-            context.agents.board(BoardEvent::Working {
-                agent: agent.name.clone(),
-            });
         }
     }
     info!("agent '{}': the session replied on its own", agent.name);
@@ -1516,6 +1681,7 @@ async fn start_turn(
                     "agent '{}': its session is working on its own; not stopped for a new turn",
                     agent.name
                 );
+                rt.show_own_work(&mut *rt.inner.lock().await, agent);
                 return Err(Busy::Background);
             }
             Ok(_) => {}
@@ -1612,6 +1778,7 @@ fn spawn_turn(
     });
     let slot = inner.slots.entry(agent.name.clone()).or_default();
     slot.phase = AgentPhase::Working;
+    slot.own_work = false;
     slot.turn = Some(RunningTurn {
         generation,
         started,
@@ -1839,12 +2006,17 @@ async fn finish_turn(
         record.updated_at = Utc::now();
         rt.save(&inner);
         // Under the lock a next turn starts under, so the board sees this
-        // end before that start.
-        rt.board(BoardEvent::TurnEnded {
-            agent: agent.name.clone(),
-            ok: matches!(outcome, TurnOutcome::Reply(_) | TurnOutcome::PolledReply(_)),
-            at: now(),
-        });
+        // end before that start. A turn refused because the session works
+        // on its own did not fail: the row shows that work instead.
+        if outcome == TurnOutcome::Busy {
+            rt.show_own_work(&mut inner, agent);
+        } else {
+            rt.board(BoardEvent::TurnEnded {
+                agent: agent.name.clone(),
+                ok: matches!(outcome, TurnOutcome::Reply(_) | TurnOutcome::PolledReply(_)),
+                at: now(),
+            });
+        }
         text
     };
     match outcome {
@@ -1882,12 +2054,17 @@ fn reset_refusal(agent: &Agent, waiting: Option<&str>) -> String {
     }
 }
 
-/// Forget the agent's session. Refused while a turn runs.
+/// Forget the agent's session. Refused while a turn runs. What it showed
+/// of the session's own work goes with it, and so do its acknowledgements
+/// and updates still queued.
 async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     let rt = &context.agents;
     let mut inner = rt.inner.lock().await;
     if let Some(slot) = inner.slots.get(&agent.name).filter(|s| s.turn.is_some()) {
         return Err(reset_refusal(agent, slot.waiting()));
+    }
+    if let Some(slot) = inner.slots.get_mut(&agent.name) {
+        slot.end_idle();
     }
     let record = record_mut(&mut inner, agent);
     // The driver forgets it too (what it remembered to resume it); it keeps
@@ -1906,11 +2083,26 @@ async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     rt.board(BoardEvent::Clear {
         agent: agent.name.clone(),
     });
+    drop(inner);
+    drop_interims_for(rt, agent);
     Ok(())
 }
 
-/// Stop the running turn and keep the session. With no whisrs turn
-/// running, stop the session's own work, if it does any.
+/// Drop the agent's queued acknowledgements and updates (`--stop`,
+/// `--reset`): what they said is moot.
+fn drop_interims_for(rt: &AgentRuntime, agent: &Agent) {
+    let dropped = rt.drop_interims_of(Some(&agent.name));
+    if dropped > 0 {
+        info!(
+            "agent '{}': dropped {dropped} queued acknowledgement(s) or update(s)",
+            agent.name
+        );
+    }
+}
+
+/// Stop the running turn and keep the session, dropping its queued
+/// acknowledgements and updates. With no whisrs turn running, stop the
+/// session's own work, if it does any.
 async fn stop_turn(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     let rt = &context.agents;
     let session = {
@@ -1942,6 +2134,7 @@ async fn stop_turn(context: &DaemonContext, agent: &Agent) -> Result<(), String>
         });
         session
     };
+    drop_interims_for(rt, agent);
     info!("agent '{}': turn stopped", agent.name);
     if let Err(e) = rt.driver(agent.harness).stop(agent, &session).await {
         warn!("agent '{}': {e}", agent.name);
@@ -1981,7 +2174,7 @@ async fn stop_idle_session(
             let mut inner = context.agents.inner.lock().await;
             if let Some(slot) = inner.slots.get_mut(&agent.name) {
                 if slot.turn.is_none() {
-                    slot.phase = AgentPhase::Idle;
+                    slot.end_idle();
                     context.agents.board(BoardEvent::Clear {
                         agent: agent.name.clone(),
                     });
@@ -1989,7 +2182,13 @@ async fn stop_idle_session(
             }
             Ok(())
         }
-        Ok(AgentPhase::Idle) => Err(nothing()),
+        Ok(AgentPhase::Idle) => {
+            context
+                .agents
+                .idle_phase_seen(agent, AgentPhase::Idle)
+                .await;
+            Err(nothing())
+        }
         Err(e) => Err(format!(
             "{}; cannot tell whether its session works: {e}",
             nothing()
@@ -4054,6 +4253,278 @@ mod tests {
         board_shows(&context, &[("jarvis", AgentVisual::Working)]).await;
         let _ = stop_turn(&context, &agent).await;
         board_shows(&context, &[]).await;
+    }
+
+    /// A harness whose session, with no whisrs turn running, is listed in
+    /// `phase` (the test sets it), and whose hooks mean what Claude's do: a
+    /// Stop with a message is a reply, one without ends the work, a
+    /// permission prompt waits. Every turn finds the session working on its
+    /// own.
+    struct IdleListingDriver {
+        phase: std::sync::Mutex<AgentPhase>,
+        /// How often [`Driver::session_phase`] was asked.
+        asked: AtomicUsize,
+    }
+
+    impl IdleListingDriver {
+        fn new(phase: AgentPhase) -> Self {
+            Self {
+                phase: std::sync::Mutex::new(phase),
+                asked: AtomicUsize::new(0),
+            }
+        }
+
+        fn set(&self, phase: AgentPhase) {
+            *self.phase.lock().unwrap() = phase;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Driver for IdleListingDriver {
+        async fn run_turn(
+            &self,
+            _agent: &Agent,
+            _session: SessionRef,
+            _request: TurnRequest,
+            _io: TurnIo,
+        ) -> TurnOutcome {
+            TurnOutcome::Busy
+        }
+
+        async fn rewatch(
+            &self,
+            _agent: &Agent,
+            _session: SessionRef,
+            _request: TurnRequest,
+            _io: TurnIo,
+        ) -> TurnOutcome {
+            unreachable!("no turn is watched again")
+        }
+
+        async fn stop(&self, _agent: &Agent, _session: &SessionRef) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn forget(&self, _session: &SessionRef) {}
+
+        fn hook_matches(&self, payload: &serde_json::Value, _session: &SessionRef) -> bool {
+            payload["session_id"] == "sid-1"
+        }
+
+        async fn session_phase(
+            &self,
+            _agent: &Agent,
+            _session: &SessionRef,
+        ) -> Result<AgentPhase, String> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(*self.phase.lock().unwrap())
+        }
+
+        async fn session_phases(
+            &self,
+            sessions: &[(Arc<Agent>, SessionRef)],
+        ) -> Vec<Result<AgentPhase, String>> {
+            let phase = *self.phase.lock().unwrap();
+            sessions.iter().map(|_| Ok(phase)).collect()
+        }
+
+        async fn idle_event(
+            &self,
+            payload: &serde_json::Value,
+            _session: &SessionRef,
+        ) -> IdleEvent {
+            use whisrs::agent::claude::{classify_hook, HookKind};
+            match classify_hook(payload) {
+                HookKind::Stop {
+                    message: Some(m), ..
+                } if !m.trim().is_empty() => IdleEvent::Reply(m),
+                HookKind::Stop { .. } => IdleEvent::Ended,
+                HookKind::PermissionPrompt => {
+                    IdleEvent::NeedsYou("Waiting for your approval to use Bash.".into())
+                }
+                HookKind::Other => IdleEvent::Ignored,
+            }
+        }
+    }
+
+    /// A one-agent context on `driver`, its session stored (`sid-1`, bg
+    /// `bg1`), with the board and the idle poll running.
+    async fn idle_context(dir: &Path, driver: &Arc<IdleListingDriver>) -> Arc<DaemonContext> {
+        let mut context = test_context(&["jarvis"], dir);
+        Arc::get_mut(&mut context)
+            .unwrap()
+            .agents
+            .drivers
+            .insert(Harness::Claude, Arc::clone(driver) as Arc<dyn Driver>);
+        with_board(&mut context);
+        {
+            let mut inner = context.agents.inner.lock().await;
+            let mut record = AgentRecord::new("claude", Path::new("/proj"));
+            record.session_id = Some("sid-1".into());
+            record.bg_id = Some("bg1".into());
+            inner.store.agents.insert("jarvis".into(), record);
+        }
+        tokio::spawn(board_loop(
+            Arc::clone(&context),
+            context.agents.take_board_events().unwrap(),
+            context.state_tx.subscribe_voice(),
+        ));
+        tokio::spawn(idle_loop(Arc::clone(&context)));
+        context
+    }
+
+    fn permission_prompt() -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "sid-1",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+        })
+    }
+
+    /// A permission prompt with no whisrs turn running shows needs-you
+    /// until the wait ends: on any Stop (with nothing in it too), or when a
+    /// listing shows the session no longer waiting (stopped in a terminal,
+    /// which sends no Stop). Answered elsewhere, the session's work shows
+    /// as working, and its reply ends it as Done.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_wait_ends_on_any_stop_or_a_listing() {
+        use AgentVisual::{Done, NeedsYou, Working};
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(IdleListingDriver::new(AgentPhase::NeedsYou));
+        let context = idle_context(dir.path(), &driver).await;
+        let rt = &context.agents;
+
+        handle_agent_event(&context, permission_prompt()).await;
+        board_shows(&context, &[("jarvis", NeedsYou)]).await;
+        handle_agent_event(&context, stop_hook("")).await;
+        board_shows(&context, &[]).await;
+        assert_eq!(rt.phase("jarvis").await, AgentPhase::Idle);
+
+        // No Stop: the idle poll sees it gone.
+        handle_agent_event(&context, permission_prompt()).await;
+        board_shows(&context, &[("jarvis", NeedsYou)]).await;
+        driver.set(AgentPhase::Idle);
+        board_shows(&context, &[]).await;
+        assert_eq!(rt.phase("jarvis").await, AgentPhase::Idle);
+
+        // Answered in a terminal: it works on, then replies.
+        driver.set(AgentPhase::NeedsYou);
+        handle_agent_event(&context, permission_prompt()).await;
+        board_shows(&context, &[("jarvis", NeedsYou)]).await;
+        driver.set(AgentPhase::Working);
+        board_shows(&context, &[("jarvis", Working)]).await;
+        handle_agent_event(&context, stop_hook("Ran it. <spoken>Tests pass.</spoken>")).await;
+        board_shows(&context, &[("jarvis", Done)]).await;
+        assert_eq!(
+            queued(rt),
+            ["Waiting for your approval to use Bash.", "Tests pass."]
+        );
+        assert_eq!(rt.phase("jarvis").await, AgentPhase::Idle);
+
+        // `whisrs agent` lists it idle: that ends a wait too, at once.
+        driver.set(AgentPhase::NeedsYou);
+        handle_agent_event(&context, permission_prompt()).await;
+        board_shows(&context, &[("jarvis", NeedsYou)]).await;
+        driver.set(AgentPhase::Idle);
+        let asked = driver.asked.load(Ordering::SeqCst);
+        let rows = rt.list().await;
+        assert_eq!(rows[0].phase, AgentPhase::Idle);
+        assert_eq!(rt.phase("jarvis").await, AgentPhase::Idle);
+        assert_eq!(driver.asked.load(Ordering::SeqCst), asked, "the poll ran");
+        board_shows(&context, &[]).await;
+    }
+
+    /// A turn refused because the session works on its own shows that work
+    /// as working, as `whisrs agent` lists it (not as a failed turn), until
+    /// the work ends: refused at the start, or by the driver.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_refused_for_the_sessions_own_work_shows_it_working() {
+        use AgentVisual::Working;
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(IdleListingDriver::new(AgentPhase::Working));
+        let context = idle_context(dir.path(), &driver).await;
+        let rt = &context.agents;
+        let agent = Arc::clone(&rt.agents[0]);
+
+        let refused = start_turn(&context, &agent, "add a test".into()).await;
+        assert_eq!(refused, Err(Busy::Background));
+        let rows = board_shows(&context, &[("jarvis", Working)]).await;
+        assert_eq!(rows[0].activity, None);
+        handle_agent_event(&context, stop_hook("")).await;
+        board_shows(&context, &[]).await;
+
+        // The start's check saw it idle; the driver finds it working.
+        driver.set(AgentPhase::Idle);
+        start_turn(&context, &agent, "add a test".into())
+            .await
+            .unwrap();
+        while rt.has_turn("jarvis").await {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let shown: Vec<_> = context
+            .agent_board
+            .borrow()
+            .iter()
+            .map(|e| (e.name.clone(), e.visual))
+            .collect();
+        assert_eq!(shown, [("jarvis".to_string(), Working)]);
+        assert_eq!(queued(rt), [BACKGROUND_TASK]);
+        // Listed idle by the poll: gone.
+        board_shows(&context, &[]).await;
+        assert!(driver.asked.load(Ordering::SeqCst) >= 3);
+    }
+
+    /// A newer permission prompt replaces the text of its notice still
+    /// queued; one playing plays on, and a newer text is queued once after
+    /// it.
+    #[test]
+    fn a_newer_permission_prompt_replaces_the_queued_notice() {
+        let mut rt = AgentRuntime::disabled();
+        rt.speak = true;
+        rt.agents = vec![Arc::new(test_agent("jarvis"))];
+        let bash = "Waiting for your approval to use Bash.";
+        let edit = "Waiting for your approval to use Edit.";
+        let write = "Waiting for your approval to use Write.";
+        rt.say_keyed("jarvis", WAITING_KEY, bash.into());
+        rt.say_keyed("jarvis", WAITING_KEY, edit.into());
+        assert_eq!(queued(&rt), [edit]);
+
+        rt.set_playing(Some(Utterance {
+            agent: "jarvis".into(),
+            text: bash.into(),
+            notice: Some(WAITING_KEY),
+            interim: None,
+        }));
+        rt.say_keyed("jarvis", WAITING_KEY, bash.into());
+        assert!(!rt.has_utterances(), "the one playing says it");
+        rt.say_keyed("jarvis", WAITING_KEY, edit.into());
+        rt.say_keyed("jarvis", WAITING_KEY, write.into());
+        assert_eq!(queued(&rt), [write]);
+        rt.set_playing(None);
+    }
+
+    /// `--stop` and `--reset` drop the agent's acknowledgements and updates
+    /// still queued; its replies and other agents' interims stay.
+    #[tokio::test]
+    async fn stop_and_reset_drop_the_agents_interims() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis", "friday"], dir.path());
+        let rt = &context.agents;
+        let agent = Arc::clone(&rt.agents[0]);
+        install_turn(&context, "jarvis", 1, "check it").await;
+        rt.say_interim("jarvis", "On it.".into(), InterimKind::Ack, now());
+        rt.say_interim("friday", "Let me check.".into(), InterimKind::Ack, now());
+        rt.say("jarvis", "jarvis: An earlier reply.".into());
+        stop_turn(&context, &agent).await.unwrap();
+        assert_eq!(queued(rt), ["Let me check.", "jarvis: An earlier reply."]);
+
+        rt.say_interim("jarvis", "On it.".into(), InterimKind::Ack, now());
+        rt.say("jarvis", "jarvis: Another reply.".into());
+        reset(&context, &agent).await.unwrap();
+        assert_eq!(queued(rt), ["jarvis: Another reply."]);
     }
 
     /// No agents: no board channel for a task to own, and nothing is ever

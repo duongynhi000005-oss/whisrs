@@ -284,11 +284,26 @@ impl AgentOverlay {
         );
         // No buffer may be attached before the new surface's first
         // configure, which draws. The old surface's callback never comes.
+        // A new surface starts at scale 1, and sctk reports a scale only
+        // when it differs from 1: the old surface's scale would draw a 1x
+        // output at 2x, downscaled.
+        self.reset_scale();
         self.first_configure = true;
         self.layer_closed = false;
         self.outputs_changed = false;
         self.frame_pending = false;
         self.dirty = true;
+    }
+
+    /// Draw at scale 1, as a new surface starts.
+    fn reset_scale(&mut self) {
+        match self.frames.set_scale(1.0) {
+            Ok(_) => self.buffer_scale = 1,
+            Err(e) => warn!(
+                "agent overlay stays at scale {} for a new surface: {e}",
+                self.buffer_scale
+            ),
+        }
     }
 
     /// Outputs still advertised, minus `leaving`.
@@ -488,6 +503,9 @@ impl LayerShellHandler for AgentOverlay {
         }
         self.layer_closed = true;
         self.frame_pending = false;
+        // Not on screen until a surface is configured again: agent toasts
+        // stand in meanwhile.
+        self.shown.clear();
         if self.on_layer_event(qh, LayerEvent::Closed, None) == LayerAction::Keep {
             info!("agent overlay surface closed by the compositor, waiting for an output change");
         }
@@ -507,7 +525,7 @@ impl LayerShellHandler for AgentOverlay {
         if self.first_configure {
             self.first_configure = false;
             // The first buffer maps the surface: a transparent one when no
-            // row is shown.
+            // row is shown. On screen (again, after a close).
             self.draw(qh, Instant::now());
             self.shown.set();
         }

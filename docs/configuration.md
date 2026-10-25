@@ -433,6 +433,17 @@ response_format = "wav"     # audio format requested from the API
 # reply_instruction = "..."      # optional: replaces the built-in voice instruction
 #                                #   (permissions, args and reply_instruction apply from
 #                                #   the next new session: whisrs agent <name> --new)
+# feedback = "brief"             # optional: what the agent says while it works. summary
+#                                #   (the reply only) | brief (default: a short
+#                                #   acknowledgement, then the reply) | conversational
+#                                #   (also short updates at milestones). See "Feedback levels"
+
+# The agent overlay (optional): a row per agent at work, in a screen corner of
+# its own. Drawn only with an [[agents]] entry. See "The agent overlay" below.
+# [agent_overlay]
+# enabled = true                 # default: follows [general] overlay
+# style = "orb"                  # orb (default) | face
+# corner = "bottom-right"        # bottom-right (default) | bottom-left | top-right | top-left
 
 # Recording (optional). Records your mic and the system audio as two tracks,
 # then transcribes them after you stop. Every key is optional; see "Recording"
@@ -639,9 +650,10 @@ What you need:
 
 How a turn goes:
 
-- The voice instruction is recorded like command mode's: the overlay, the
-  cues, the silence auto-stop, and every transcription backend. Dictation is
-  back to normal as soon as the transcript is ready, while the agent works.
+- The voice instruction is recorded like command mode's: the cues, the
+  silence auto-stop, and every transcription backend. It shows on the agent
+  overlay (below), not on the dictation overlay. Dictation is back to normal
+  as soon as the transcript is ready, while the agent works.
 - The reply is spoken when whisrs is idle. A reply that arrives while you
   dictate waits for the dictation to finish, and one that arrives during a
   `whisrs recording` waits until the recording stops (it would play into the
@@ -702,6 +714,71 @@ replaces that instruction). It does not rely on the model: it takes the last
 links, file paths and markdown, and caps it at 400 characters. Anything outside
 the tags stays in the session for when you look at it. When nothing speakable
 is left, it says "Done."
+
+Feedback levels. `feedback` sets what an agent says while it works, before its
+reply:
+
+| `feedback` | What you hear |
+|---|---|
+| `summary` | the reply only |
+| `brief` (default) | a short acknowledgement when the agent starts using tools ("On it.", "Let me check."), then the reply |
+| `conversational` | the acknowledgement, a one-sentence update at a real milestone (it found the cause, finished a big step), at least 20 seconds apart and never the same one twice, then the reply |
+
+The agent writes these lines itself: whisrs adds a request for them to its
+voice instruction, so acknowledgements and updates depend on the model
+following that request. whisrs speaks only what the level allows, whatever the
+model writes, and only a message the agent followed with a tool call, so the
+final reply is never taken for one. They wait under the same rules as a reply
+(not while you dictate or record), are dropped when they waited too long (8
+seconds for an acknowledgement, 12 for an update) or when the reply arrives,
+and are never shown as notifications. `whisrs cancel`, `--stop` and `--reset`
+drop the ones still queued. Like `reply_instruction`, the request is fixed when
+a session starts, so a higher level takes effect at the next fresh session
+(`whisrs agent <name> --new`); a lower one applies at once, since whisrs does
+the filtering. An unknown value gets a warning at startup and means `brief`.
+
+The agent overlay. With an `[[agents]]` entry, whisrs shows a row for each
+agent at work in a screen corner, bottom right by default, apart from the
+dictation overlay. Agent turns no longer show on the dictation overlay or the
+tray: a voice turn's recording and transcription and the agent's speech show
+here instead. A row is a shape (`style = "orb"`, rings and arcs, or `"face"`,
+a small face) beside a card with the agent's name, its state, what it does and
+for how long.
+
+- States: listening (its voice turn records), transcribing, working,
+  speaking (its reply, acknowledgement or notice plays), needs you (it waits
+  for a permission prompt), done and error, each in a color of its own.
+- The activity line names what the agent does: "Running a command", "Reading
+  files", "Editing files", "Searching the code", "Reading a web page",
+  "Searching the web", "Working with a helper", "Planning". Tools from an MCP
+  server (Model Context Protocol, how Claude Code reaches outside tools) go by
+  the server: "Using the browser", "Reading your inbox", "Checking your
+  calendar", "Reading your recordings", else "Using" and the server's name.
+  Anything else reads "Working". While it waits: "Waiting for your approval".
+- The timer counts the turn's time while it works, waits or speaks during the
+  turn; listening and transcribing count from your press. A finished row says
+  "Finished in 1:24" or "Failed after 0:12" instead.
+- Up to four rows, stacked from the corner in config order. With more agents
+  at work, three rows show and a fourth says "+N more".
+- A done or error row stays while its reply waits or plays, then fades out
+  about three seconds after it played.
+- Work a session does on its own shows too: a turn refused with "It's still
+  running a background task." shows that work as working, and a permission
+  prompt it hits as needs you, until its `Stop` hook arrives or `claude
+  agents` (asked every ten seconds while the row shows) lists it as neither.
+- `enabled` follows `[general] overlay` unless you set it. An unknown `style`
+  or `corner` (an edge center is not a corner) gets a warning at startup and
+  the default.
+- It draws on Wayland compositors with layer-shell (the protocol that lets a
+  program place panels and overlays, as on Hyprland and Sway) and on X11. On
+  X11 it scales by `Xft.dpi` (the X resource that sets the font DPI, set with
+  `xrdb`; 96 is 1x, up to 3x). On Wayland it follows the output's whole scale;
+  a fractional scale is not supported yet, so it draws at the next whole one
+  and the compositor scales it down.
+- GNOME on Wayland has no agent overlay yet (GNOME has no layer-shell, and the
+  GNOME extension does not draw it yet). There, and whenever the overlay is
+  not on screen, the "Speak to 'jarvis'..." and "Sending to 'jarvis'..."
+  notifications stand in for it (with `[general] notify` on).
 
 `permissions` maps to Claude Code's permission modes:
 

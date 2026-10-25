@@ -76,6 +76,9 @@ src/
 │   │                       #   SessionRef/TurnUpdate/TurnOutcome, the default voice instruction
 │   ├── spoken.rs           #   <spoken> extraction + sanitize + 400-char cap (pure)
 │   ├── claude.rs           #   Claude Code driver: claude --bg, stop + --bg --resume, hooks via --settings, poll
+│   ├── claude_tail.rs      #   Transcript tail while a turn runs: tool activity + interims (pure parse_line)
+│   ├── progress.rs         #   feedback levels + instruction deltas, activity labels, InterimTracker, ProgressGate
+│   ├── display.rs          #   Agent overlay model: Board (voice > needs-you > working > done/error), rows, timer
 │   └── store.rs            #   $XDG_DATA_HOME/whisrs/agents.json (0600, atomic), written only with agents
 ├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
@@ -138,12 +141,21 @@ src/
 │   └── dbus.rs             # GNOME/KDE window tracking (zbus D-Bus)
 ├── hotkey/                 # Hotkey listener (raw evdev) + spec parsing
 ├── tray/                   # Tray icon (ksni, feature-gated)
-├── overlay/                # Recording overlay (feature-gated)
-│   ├── service.rs          #   Overlay service: picks and drives a backend
-│   ├── render.rs           #   Shared rendering: theme, animation state, frame drawing
-│   ├── wayland.rs          #   Wayland layer-shell backend
-│   ├── x11.rs              #   X11 override-redirect backend
-│   └── gnome.rs            #   GNOME overlay D-Bus broadcaster
+├── overlay/                # Recording pill + agent overlay (feature-gated), each on its own thread
+│   ├── service.rs          #   Overlay service: picks and drives a backend for each
+│   ├── render.rs           #   Pill rendering: theme, animation state, frame drawing
+│   ├── wayland.rs          #   Pill Wayland layer-shell backend
+│   ├── x11.rs              #   Pill X11 override-redirect backend (placement/shape helpers shared)
+│   ├── layer.rs            #   Shared layer-shell bits: create_layer, layer_action, ARGB copy
+│   ├── agent_host.rs       #   Agent overlay hosts' shared part: AgentFrames, ShownFlag, FRAME pacing
+│   ├── agent_wayland.rs    #   Agent overlay Wayland host: poll + wake socket, no commits while hidden
+│   ├── agent_x11.rs        #   Agent overlay X11 host: shaped click-through window, Xft.dpi scale
+│   ├── agent_render.rs     #   Agent overlay drawing (headless): AgentScene (stateful: entrance, crossfade), cards
+│   ├── agent_orb.rs        #   orb style shapes, one per state
+│   ├── agent_face.rs       #   face style shapes, one per state
+│   ├── text.rs             #   fontdue text: glyph cache, coverage blend
+│   ├── font/               #   Inter Regular + SemiBold ASCII subsets, OFL.txt, the pyftsubset command
+│   └── gnome.rs            #   GNOME overlay D-Bus broadcaster (pill state + AgentsChanged JSON)
 └── config/
     ├── types.rs            # Config structs, defaults, validation (config.toml)
     ├── setup.rs            # Interactive onboarding (whisrs setup)
@@ -204,7 +216,8 @@ docs" in an untracked file changes nothing for users and shows up in no PR. Chec
 - `default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]`
 - `local-whisper` — whisper-rs (whisper.cpp) for offline transcription. Requires a C++ toolchain and libclang.
 - `tray` — tray icon via `ksni`
-- `overlay` — recording overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`
+- `overlay`: recording pill and agent overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`,
+  and `fontdue` for the agent overlay's text (Inter subsets bundled in `src/overlay/font/`, OFL)
 - `hooks` — recording-lifecycle hooks + MPRIS media pause via `zbus` (no new system dep; `overlay` already pulls `zbus`)
 - `recording`: the recording feature (`src/recording/` submodules, `src/daemon/recording.rs`, the tray's
   recording items and icons, `whisrs recording`, the editor's Recording questions), with `flacenc`, `realfft` and
@@ -304,8 +317,9 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
 Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude`, `dir`, `permissions` =
-`auto|bypass|ask`, `command`, `args`, `reply_instruction`; `agent::resolve_agents` validates and
-skips bad entries, shared by `Config::validate` and the runtime). With none, nothing runs and no file
+`auto|bypass|ask`, `command`, `args`, `reply_instruction`, `feedback` = `summary|brief|conversational`;
+`agent::resolve_agents` validates and skips bad entries, shared by `Config::validate` and the runtime),
+plus `[agent_overlay]` (`enabled` follows `[general] overlay`, `style` = `orb|face`, `corner`). With none, nothing runs and no file
 is written. A voice turn records like command mode's instruction (`BatchOrigin::Agent`), then the
 turn runs on its own task; replies queue in a FIFO spoken when the state is Idle and no recording
 captures (`may_speak`), errors too (`spoken::spoken_error`). A `ReplyHold` (a command or
@@ -331,6 +345,13 @@ reply and is spoken, unless it repeats a turn that ended on a poll (`TurnOutcome
 permission prompt with no turn running marks needs-you. A session working on its own refuses a turn
 (`TurnOutcome::Busy`, "It's still running a background task."). The child gets the daemon's env minus
 `claude::PARENT_SESSION_VARS` and `WHISRS_*`. Only stored ids are ever passed to `claude`.
+`DaemonContext::state_tx` is a `StateBus` (`context.rs`), sent only by `publish(&ds)`: `raw` (the state
+machine: hooks, the reply queue), `ui` (Idle while the voice is an agent's, `DaemonState::agent_voice`:
+tray, pill, GNOME pill) and `voice` (which agent, for the board). The runtime's board channel
+(`BoardEvent`) and `voice` feed `board_loop`, which owns the `Board` and publishes rows on
+`DaemonContext::agent_board` for the agent overlay; a session working or waiting on its own shows
+there until a `Stop` or `idle_loop`'s listing ends it. `TranscriptTail` (`claude_tail.rs`) sends
+`Activity` and `Interim` updates; `ProgressGate` admits interims per `feedback`.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 

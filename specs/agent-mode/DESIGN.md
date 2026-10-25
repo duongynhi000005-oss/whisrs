@@ -21,6 +21,12 @@ permissions = "auto"             # auto (default) | bypass | ask
 command = "claude"               # optional binary path; default: the harness name on PATH
 args = ["--remote-control", "jarvis"]   # optional, passed on the first turn of a session
 reply_instruction = "..."        # optional, replaces the built-in voice instruction
+feedback = "brief"               # summary | brief (default) | conversational
+
+[agent_overlay]                  # optional; drawn only with an [[agents]] entry
+enabled = true                   # default: follows [general] overlay
+style = "orb"                    # orb (default) | face
+corner = "bottom-right"          # bottom-right (default) | bottom-left | top-right | top-left
 ```
 
 - `permissions` is harness-neutral and mapped per driver. No warning for `bypass`: the user
@@ -38,6 +44,12 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
   its own.
 - `command` exists because a systemd user unit often lacks `~/.local/bin` on PATH. A spawn
   failure names it.
+- `feedback` is fixed at session start like `reply_instruction` (its request is appended
+  to the instruction), so a higher level applies from the next `--new`; a lower one at
+  once, since the daemon's gate enforces the configured level. An unknown value warns
+  and means `brief`; the entry is kept.
+- `[agent_overlay]`: an unknown `style` or `corner` (an edge center too) gets one warning
+  and the default. The keys are known to the unknown-key check.
 
 ## CLI and IPC
 
@@ -70,8 +82,9 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 1. **Toggle while Idle:** if this agent has a turn running, refuse with a short spoken and
    notified "Still working on the last one." (never queued twice while one is queued or
    playing). Otherwise record exactly like command mode's
-   instruction recording (overlay, cues, both streaming and batch paths), with the agent as
-   the sink instead of the LLM rewrite. No selection capture. Nothing to send (audio too
+   instruction recording (cues, both streaming and batch paths), with the agent as the
+   sink instead of the LLM rewrite. It shows on the agent overlay, not the pill or the
+   tray (see "Agent overlay"). No selection capture. Nothing to send (audio too
    short or silent, a prompt echo, an empty transcript) is spoken as "I didn't catch that.",
    and a transcription failure as the error's first sentence; both are notified per
    `[general] notify`, so they are heard with notifications off. Dictation's own wording is
@@ -201,9 +214,13 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
   (`claude stop`, the wait, `claude rm`, which fails while its process runs, warned with its
   id; its id came from our own launch output, so it is ours) on the launch's own task, so a
   `--stop` cannot leave it running, and never reported. The copy is the id the note names,
-  else a printed bg id other than the session's: never the session's own bg id (a note that
-  names it, with that id printed, is taken as continued in place). The original is stopped
-  and waited for again and the resume tried once more. A second copy fails the turn: "Claude Code could not
+  else a printed bg id other than the session's: never the session's own bg id. A note that
+  names the session itself, with that id printed, is unclear (it may have continued in
+  place, or run as a copy): that run is listed until it shows a pid, so its process is
+  remembered (`claude stop` drops the pid from the listing before the process exits), then
+  stopped and waited for, never removed. The original is stopped and waited for again and
+  the resume tried once more. A second copy fails the turn (a second unclear run is stopped
+  first, so a turn reported as not sent is not running): "Claude Code could not
   continue the session, so this turn was not sent. `whisrs agent <name> --new` starts a fresh
   one."
 - **Turn end:** the `Stop` event whose `session_id` matches carries `last_assistant_message`
@@ -217,7 +234,9 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
   may still be running." (never "say it again", which could run the instruction twice), and
   the session is not looked for by name. A `Notification` for a permission prompt marks the agent needs-you and
   speaks a short notice (for example "Waiting for your approval to use Bash"); ignore idle
-  notifications. A voice turn while needs-you is sent normally (stop + resume).
+  notifications. A voice turn while needs-you is sent normally (stop + resume). With no
+  turn running, any `Stop` for the session (with no message too, `IdleEvent::Ended`) ends
+  a needs-you or own-work row (see "Agent overlay").
 - **Fallback poll** while a turn runs, every ten seconds: `claude agents --json --all`, our
   bg id only. The process decides first: an exited entry keeps its last state, so no `pid`
   → the turn ended ("the session ended before replying", or the reply from the transcript
@@ -268,10 +287,137 @@ whisrs never trusts the model to comply (users run different models, some small)
   → "Done."
 - Pure functions in `src/agent/spoken.rs`, unit tested.
 
+## Feedback levels and the transcript tail
+
+What an agent says before its reply is written by the agent itself and filtered by
+whisrs (`src/agent/progress.rs`):
+
+- `summary`: the reply only (the instruction is unchanged).
+- `brief`: the instruction asks for a separate two-to-six-word acknowledgement in its own
+  `<spoken>` tags before the first tool call ("On it.", "Let me check."; skipped when the
+  agent answers without a tool), and no other tags until the final message.
+- `conversational`: the acknowledgement, and at a real milestone one short update (one
+  sentence under twelve words) in a message before the next tool call.
+- `ProgressGate` (one per turn) admits what the configured level allows, whatever the
+  model writes: summary nothing; brief the first line, as the acknowledgement;
+  conversational that, then updates at least `PROGRESS_MIN_GAP` (20 s) after the last
+  admitted one and never one said already (`same_reply`). Acknowledgements depend on the
+  model following the request.
+- Only a message a tool call followed can be an interim, so the final reply never is:
+  `InterimTracker` holds a text block with a complete `<spoken>` pair until a later
+  `tool_use` in the same turn proves it was not the last (text, text, end speaks nothing
+  extra). `spoken::interim_line` takes the pair, sanitizes it and caps it at 120
+  characters; nothing speakable says nothing.
+- Interims queue in the reply FIFO under the same holds, as `Utterance::interim` with an
+  expiry (`ACK_TTL` 8 s, `PROGRESS_TTL` 12 s; an expired one is skipped), are dropped when
+  that agent's reply or error arrives, on `whisrs cancel`, `--stop` and `--reset`, are
+  never requeued after a recording stopped them, and are never notified.
+- Source: `TranscriptTail` (`src/agent/claude_tail.rs`) follows the session's transcript
+  JSONL while a turn runs, from the first statement of `ClaudeDriver::watch` (first turn,
+  resume and rewatch): every 750 ms, the whole file filtered to the turn's start first,
+  then from where it stopped, holding a partial last line; sidechain text and thinking are
+  skipped. Each `tool_use` sends `TurnUpdate::Activity` (the overlay's activity line, from
+  `activity_for_tool`), and a held text block a tool call followed sends
+  `TurnUpdate::Interim`. A rewatch after a restart sends activities only. Not hooks: hooks
+  have no assistant-text event, `PreToolUse` would spawn a process per tool call, and
+  hooks are fixed at session start (a resume passes no flag). Phase 2 harnesses map their
+  event streams onto the same two updates.
+- Activity labels: Bash "Running a command", Read "Reading files", Edit/Write "Editing
+  files", Grep/Glob "Searching the code", WebFetch "Reading a web page", WebSearch
+  "Searching the web", Task/Agent "Working with a helper", TodoWrite "Planning"; MCP tools
+  by server keyword (browser, mail, calendar, whisrs), else "Using <Server Words>";
+  anything else "Working". Case-insensitive, phase 2 tool names included.
+
+## Agent overlay
+
+Agent mode no longer drives the pill or the tray; it has an overlay of its own, a row per
+active agent in a screen corner.
+
+- **StateBus** (`src/daemon/context.rs`): `DaemonContext::state_tx` holds three watch
+  channels, all sent from one `DaemonState` under its lock by `publish(&ds)`, the only way
+  to send. `raw` is the state machine as before (recording-lifecycle hooks, so media pause
+  still fires for an agent's voice turn, and the reply queue). `ui` is the same but Idle
+  while the voice belongs to an agent (`DaemonState::agent_voice`): the tray, the pill and
+  the GNOME pill signal. `voice` names that agent and its state, for the board. The voice
+  is an agent's while its voice turn records (`agent_recording`), is transcribed
+  (`agent_transcribing`, set at the claim and cleared at the transcript or a takeover),
+  and while its utterance is synthesized or played (`tts_agent`, recorded by `speak_text`
+  from `AgentRuntime::playing_agent`, only with `tts_origin == Agent`). A plain toggle
+  that takes over an agent recording shows the pill at Transcribing, as dictation.
+- **Board** (`src/agent/display.rs`, pure): per agent its running turn (activity line),
+  a wait for you, how its last turn ended and whether an utterance of it is queued or
+  playing, plus the one agent the voice belongs to. `compose(now)` gives rows in config
+  order, each in the state that wins: voice, then needs-you, then working, then done or
+  error. A done or error row holds while its agent's utterance is pending, then for
+  `DONE_HOLD` (2.5 s), then fades over `DONE_FADE` (0.6 s). `clear` (`--stop`, `--reset`,
+  the end of a session's own work) keeps the voice, so a reply or recording of that agent
+  still shows until the voice moves on.
+- **Timer:** during a turn the card counts the turn's time while working, needs-you and
+  speaking (an acknowledgement or notice mid-turn); listening and transcribing count from
+  the press, and so does speaking with no turn running. A finished row reads "Finished in
+  m:ss" or "Failed after m:ss" and shows no timer.
+- **Board task:** the runtime sends `BoardEvent`s (turn started, activity, needs-you,
+  working, turn ended, pending agents, clear) on an unbounded channel created only with
+  agents; `board_loop` owns the `Board`, also reads `voice`, and publishes rows on
+  `DaemonContext::agent_board` when they change, waking on its own when a fading row ends.
+- **The session's own work:** a turn refused because the session works on its own
+  (`Busy::Background` at the start, or `TurnOutcome::Busy` from the driver) shows as
+  working, matching `whisrs agent`, not as a failed turn; a permission prompt with no turn
+  running shows needs-you. Either row ends on any `Stop` for the session (with a message:
+  a Done row while the reply plays; without one, `IdleEvent::Ended`: gone), or when a
+  listing shows the session neither working nor waiting: `idle_loop` asks
+  `Driver::session_phase` every 10 s while such a row shows, and `whisrs agent` listings
+  count too. A listing only follows a row, never starts one.
+- **Needs-you notice:** queued under `WAITING_KEY`, one per agent; a newer prompt replaces
+  the queued notice's text, and one already playing plays on with the newer text queued
+  once after it.
+- **Hosts** (`src/overlay/`, each on its own thread and display connection, apart from the
+  pill): Wayland: a layer-shell surface (namespace `whisrs-agents`, `Layer::Overlay`,
+  anchored to the corner's two edges, no input region, no keyboard), a fixed logical
+  300x236 canvas. Its loop sleeps in `poll` on the Wayland fd and a wake socket the board's
+  forwarder writes a byte to per update; while a row shows it draws on frame callbacks at
+  most every 33 ms, and with none it requests no callback and commits nothing, the last
+  transparent buffer staying attached. A surface coming back from hidden with several
+  outputs is recreated on the focused one; a recreated surface starts at scale 1 again.
+  It follows the integer buffer scale; a fractional scale draws at the next whole one,
+  scaled down by the compositor (fractional scaling is deferred). A compositor-closed
+  surface clears `AgentOverlayShown` until a new one is configured. X11: an
+  override-redirect window like the pill's, shaped to what it draws and click-through,
+  unmapped and blocked on its wake channel while idle, scaled by `Xft.dpi / 96` (1 to 3).
+  GNOME on Wayland: no native surface (no layer-shell); `gnome.rs` broadcasts
+  `AgentsChanged` (JSON rows, style, corner) on the existing bus name on every change and
+  each second while a row shows, and the extension does not draw it yet. GNOME on X11 uses
+  the X11 host.
+- **Toasts:** the "Speak to 'X'" and "Sending to 'X'" notifications show (per `[general]
+  notify`) only while the agent overlay is not on screen (`notify_agent_state`), which is
+  the GNOME Wayland fallback.
+- **Rendering** (`agent_render.rs`, headless, unit tested): a 44 px shape (`agent_orb.rs`
+  or `agent_face.rs`, seven states each) on the screen-edge side of a 212x44 card: name
+  and state word, activity and `m:ss`. Rows stack away from the corner's edge. Text is
+  `fontdue` with ASCII subsets of Inter Regular and SemiBold in `src/overlay/font/` (OFL),
+  rasterized at the physical size.
+
+Deviations from the plan, as built:
+
+- `AgentScene` is stateful: it remembers per row when it appeared and when its state or
+  activity changed, so the 180 ms entrance plays once and a change crossfades. An entry's
+  `since` cannot carry that (it restarts with a voice state, and a Done row's is the
+  turn's start).
+- "+N more" is a count, not an agent: with more than four rows, three show and a chip in
+  the fourth slot says how many more.
+- The face's working dots sit in its upper right, inside its box.
+- X11 reshapes grow then shrink: an image only lands inside the bounding shape, and
+  Xwayland composites the whole window, so the shape first grows to the old and the new
+  one, the frame clears what leaves it, and only then does it shrink (no trails).
+- `Driver::forget` (required, no default) was added: the runtime calls it when it forgets
+  a session (`--new`, `--reset`), so a driver drops what it remembers about it (Claude's
+  remembered pids).
+
 ## State and persistence
 
 - `src/daemon/agent.rs` owns an agent runtime in `DaemonContext` behind its own lock, outside
-  `DaemonState`. The state machine only gains the agent recording sink.
+  `DaemonState`. The state machine only gains the agent recording sink; `DaemonState`
+  also says whose voice it is (`agent_transcribing`, `tts_agent`) for the StateBus.
 - `$XDG_DATA_HOME/whisrs/agents.json` (0600): per agent `harness`, `dir`, `session_id`,
   `bg_id`, `transcript_path`, `turn_running`, `turn_started_at`, `updated_at`. Written on
   every change, off the
@@ -285,10 +431,18 @@ whisrs never trusts the model to comply (users run different models, some small)
 
 ```
 src/agent/mod.rs        # driver abstraction, TurnOutcome, permissions mapping, instruction
-src/agent/spoken.rs     # <spoken> extraction + sanitize (pure)
+src/agent/spoken.rs     # <spoken> extraction + sanitize, interim lines (pure)
 src/agent/claude.rs     # Claude Code driver
+src/agent/claude_tail.rs  # transcript tail: activities and interims
+src/agent/progress.rs   # feedback levels, instruction deltas, labels, tracker, gate (pure)
+src/agent/display.rs    # the agent overlay's Board and rows (pure)
 src/agent/store.rs      # agents.json
-src/daemon/agent.rs     # runtime: slots, turns, reply FIFO, IPC handlers, hook events
+src/daemon/agent.rs     # runtime: slots, turns, reply FIFO, IPC handlers, hook events,
+                        #   board_loop, idle_loop
+src/daemon/context.rs   # StateBus (raw, ui, voice)
+src/overlay/layer.rs    # layer-shell bits the pill and the agent overlay share
+src/overlay/agent_host.rs, agent_wayland.rs, agent_x11.rs   # agent overlay hosts
+src/overlay/agent_render.rs, agent_orb.rs, agent_face.rs, text.rs, font/   # its drawing
 ```
 
 The driver abstraction must fit both shapes: Claude's turn ends on an event or a poll;
@@ -305,6 +459,26 @@ from its JSON output (`kill_on_drop`). Adding one must not change the runtime.
 ## Later
 
 - Approving a permission prompt by voice mid-turn, via ACP (Agent Client Protocol).
+
+## Acceptance criteria (phase 1c: overlay and feedback)
+
+1. No `[[agents]]`: no agent overlay thread or surface, no tailer; pill and tray as before.
+2. During an agent's recording, transcription and every utterance of it the pill stays
+   hidden and the tray Idle; media pause and hooks still fire for the agent recording.
+3. Dictation, command mode, `[[llm_commands]]`, read-aloud and `speak --text` drive the
+   pill and tray unchanged; a plain toggle on an agent recording shows the pill at
+   Transcribing.
+4. The overlay defaults to bottom right and works in all four corners; orb and face draw
+   all seven states in the palette; the card shows name, state, activity and timer; rows
+   stack from the corner, hidden when none; done and error fade about 3 s after the reply.
+5. Hidden costs nothing: no frame requests or commits (Wayland), no redraws (X11).
+6. summary speaks only the reply; brief one acknowledgement per turn (only when a tool
+   call followed it); conversational adds updates at least 20 s apart, deduplicated. The
+   reply is spoken exactly once and never dropped.
+7. Unknown `feedback`, `style` or `corner`: one warning and the default; the new keys raise
+   no unknown-key warning; `whisrs config` asks style and corner only with agents.
+8. GNOME Wayland: no native surface attempted, `AgentsChanged` broadcast, agent toasts
+   stay notifications.
 
 ## Acceptance criteria (phase 1)
 

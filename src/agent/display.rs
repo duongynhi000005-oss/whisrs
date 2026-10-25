@@ -94,9 +94,10 @@ pub struct AgentOverlayEntry {
     /// The card's second line: what the turn does ("Running a command"),
     /// "Waiting for your approval", or "Finished in m:ss".
     pub activity: Option<String>,
-    /// What the card's timer counts from: the turn's start while it runs or
-    /// has ended, the voice state's start while listening, transcribing or
-    /// speaking.
+    /// What the card's timer counts from: the turn's start while it runs
+    /// (working, waiting for you, or speaking an acknowledgement) or has
+    /// ended; the voice state's start while listening or transcribing, and
+    /// while speaking with no turn running.
     pub since: Instant,
     /// When a Done or Error row starts fading (it can be later than the
     /// composition's `now`); [`DONE_FADE`] after it, the row is gone. `None`
@@ -229,8 +230,9 @@ impl Board {
     }
 
     /// The agent the voice belongs to now and what it does
-    /// ([`AgentVisual::from_state`]), or `None`. The timer restarts when
-    /// either changes, not for the same state again.
+    /// ([`AgentVisual::from_state`]), or `None`. Its own timer restarts when
+    /// either changes, not for the same state again; speaking during a turn
+    /// shows the turn's.
     pub fn set_voice(&mut self, voice: Option<(&str, AgentVisual)>, now: Instant) {
         self.voice = match voice {
             None => None,
@@ -307,16 +309,15 @@ impl Board {
         }
     }
 
-    /// Forget everything shown for the agent (`--stop`, `--reset`, a wait
-    /// that ended with no turn running): its row goes at once.
+    /// Forget the agent's turn, wait and last end (`--stop`, `--reset`, the
+    /// end of its session's own work or wait): its row goes at once, unless
+    /// the voice is the agent's (a reply playing, a recording), which shows
+    /// until [`Board::set_voice`] says otherwise.
     pub fn clear(&mut self, name: &str) {
         if let Some(slot) = self.slot(name) {
             slot.turn = None;
             slot.needs_you = None;
             slot.ended = None;
-        }
-        if self.voice.as_ref().is_some_and(|v| v.name == name) {
-            self.voice = None;
         }
     }
 
@@ -340,7 +341,13 @@ impl Board {
         };
         if let Some(voice) = self.voice.as_ref().filter(|v| v.name == slot.name) {
             let activity = slot.turn.as_ref().and_then(|t| t.activity.clone());
-            return Some(row(voice.visual, activity, voice.since));
+            // An acknowledgement mid-turn keeps the turn's timer; a press
+            // (listening, transcribing) times itself.
+            let since = match (&slot.turn, voice.visual) {
+                (Some(turn), AgentVisual::Speaking) => turn.since,
+                _ => voice.since,
+            };
+            return Some(row(voice.visual, activity, since));
         }
         if let Some(waiting) = slot.needs_you {
             let since = slot.turn.as_ref().map_or(waiting, |t| t.since);
@@ -453,12 +460,13 @@ mod tests {
         // The timer is the turn's.
         assert_eq!(e.since, t0);
 
-        // Its acknowledgement plays: the voice wins, the activity stays.
+        // Its acknowledgement plays: the voice wins, the activity and the
+        // turn's timer stay.
         board.set_voice(Some(("jarvis", AgentVisual::Speaking)), t0 + secs(7.0));
         let e = one(&board, t0 + secs(7.5));
         assert_eq!(e.visual, AgentVisual::Speaking);
         assert_eq!(e.activity.as_deref(), Some("Running a command"));
-        assert_eq!(e.since, t0 + secs(7.0));
+        assert_eq!(e.since, t0);
 
         board.set_voice(None, t0 + secs(8.0));
         assert_eq!(one(&board, t0 + secs(8.0)).visual, AgentVisual::NeedsYou);
@@ -482,6 +490,69 @@ mod tests {
             visuals(&board, t0 + secs(6.0)),
             [("friday".to_string(), AgentVisual::Speaking)]
         );
+    }
+
+    /// During a turn the timer is the turn's in every state but a press's
+    /// own: listening and transcribing count from when they started. With
+    /// no turn running, speaking times itself too.
+    #[test]
+    fn the_timer_follows_the_turn_through_voice_states() {
+        let t0 = Instant::now();
+        let at = |s: f64| t0 + secs(s);
+        let mut board = Board::new(["jarvis"]);
+        board.set_voice(Some(("jarvis", AgentVisual::Listening)), t0);
+        assert_eq!(one(&board, at(1.0)).since, t0);
+        board.set_voice(Some(("jarvis", AgentVisual::Transcribing)), at(3.0));
+        assert_eq!(one(&board, at(3.5)).since, at(3.0));
+        board.set_voice(None, at(4.0));
+        board.turn_started("jarvis", at(4.0));
+        let timer = |board: &Board, now: f64| {
+            let e = one(board, at(now));
+            (e.visual, clock(at(now).saturating_duration_since(e.since)))
+        };
+        assert_eq!(timer(&board, 20.0), (AgentVisual::Working, "0:16".into()));
+        // The acknowledgement and a needs-you notice play mid-turn: the
+        // clock runs on.
+        board.set_voice(Some(("jarvis", AgentVisual::Speaking)), at(21.0));
+        assert_eq!(timer(&board, 21.0), (AgentVisual::Speaking, "0:17".into()));
+        board.set_voice(None, at(23.0));
+        board.needs_you("jarvis", at(30.0));
+        assert_eq!(timer(&board, 31.0), (AgentVisual::NeedsYou, "0:27".into()));
+        board.set_voice(Some(("jarvis", AgentVisual::Speaking)), at(32.0));
+        assert_eq!(timer(&board, 33.0), (AgentVisual::Speaking, "0:29".into()));
+        board.set_voice(None, at(35.0));
+        // The answer is recorded: its own clock.
+        board.set_voice(Some(("jarvis", AgentVisual::Listening)), at(40.0));
+        assert_eq!(timer(&board, 42.0), (AgentVisual::Listening, "0:02".into()));
+        board.set_voice(None, at(44.0));
+        board.working("jarvis");
+        assert_eq!(timer(&board, 50.0), (AgentVisual::Working, "0:46".into()));
+        // The reply plays after the turn ended: the voice's own clock.
+        board.turn_ended("jarvis", true, at(60.0));
+        board.set_voice(Some(("jarvis", AgentVisual::Speaking)), at(61.0));
+        assert_eq!(timer(&board, 63.0), (AgentVisual::Speaking, "0:02".into()));
+    }
+
+    /// `--stop` or `--reset` while the agent's reply plays (or its voice
+    /// turn records) clears its turn, not its voice: the row shows until the
+    /// voice moves on.
+    #[test]
+    fn a_clear_keeps_the_agents_voice() {
+        let t0 = Instant::now();
+        let mut board = Board::new(["jarvis"]);
+        board.turn_started("jarvis", t0);
+        board.set_voice(Some(("jarvis", AgentVisual::Speaking)), t0);
+        board.clear("jarvis");
+        let e = one(&board, t0 + secs(1.0));
+        assert_eq!(
+            (e.visual, e.activity, e.since),
+            (AgentVisual::Speaking, None, t0)
+        );
+        board.set_voice(None, t0 + secs(2.0));
+        assert!(board.compose(t0 + secs(2.0)).is_empty());
+        board.set_voice(Some(("jarvis", AgentVisual::Listening)), t0 + secs(3.0));
+        board.clear("jarvis");
+        assert_eq!(one(&board, t0 + secs(4.0)).visual, AgentVisual::Listening);
     }
 
     #[test]
@@ -577,7 +648,6 @@ mod tests {
         let e = one(&board, t0 + secs(2.0));
         assert_eq!((e.visual, e.activity), (AgentVisual::Working, None));
         board.activity("jarvis", "Reading files");
-        board.set_voice(Some(("jarvis", AgentVisual::Speaking)), t0);
         board.clear("jarvis");
         assert!(board.compose(t0 + secs(3.0)).is_empty());
         // An activity with no turn running shows nothing.

@@ -13,6 +13,10 @@
 //! - `check-<style>@2x.png`, `entrance-<style>@2x.png`,
 //!   `fade-<style>@2x.png`: a turn finishing (Working to Done, the check
 //!   drawing itself), a row arriving, and a Done row fading out;
+//! - `timer-<style>@2x.png`: one voice turn composed by a [`Board`], as
+//!   the daemon does: listening and transcribing time the press, then the
+//!   turn's timer runs on through working, an acknowledgement spoken
+//!   mid-turn and a wait for approval, to Done;
 //!
 //! plus `scene-more@2x.png` (six agents: three rows and "+3 more", long
 //! text cut to fit) and `scene-light@2x.png` (on a light desktop). Every
@@ -23,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tiny_skia::{Color, IntRect, Pixmap, PixmapPaint, Transform};
-use whisrs::agent::display::{rows, AgentOverlayEntry, AgentVisual, DONE_FADE};
+use whisrs::agent::display::{rows, AgentOverlayEntry, AgentVisual, Board, DONE_FADE};
 use whisrs::overlay::{canvas_size, AgentScene, CANVAS_HEIGHT, CANVAS_WIDTH, ENTRANCE};
 use whisrs::{AgentOverlayCorner, AgentOverlayStyle};
 
@@ -104,6 +108,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             &out,
             &format!("fade-{name}@2x.png"),
         )?;
+        save(
+            &grid(&[timer(style, base)]),
+            &out,
+            &format!("timer-{name}@2x.png"),
+        )?;
     }
 
     let corner = AgentOverlayCorner::BottomRight;
@@ -162,11 +171,12 @@ fn sample(visual: AgentVisual, base: Instant) -> AgentOverlayEntry {
 
 fn four_rows(base: Instant) -> Vec<AgentOverlayEntry> {
     vec![
+        // An acknowledgement mid-turn: the turn's timer.
         entry(
             "jarvis",
             AgentVisual::Speaking,
             Some("Reading your inbox"),
-            ago(base, 3),
+            ago(base, 37),
         ),
         entry(
             "friday",
@@ -315,6 +325,40 @@ fn fade(style: AgentOverlayStyle, base: Instant) -> Vec<Pixmap> {
             row_of(&pm, 2.0)
         })
         .collect()
+}
+
+/// One voice turn through its states, composed by a [`Board`].
+fn timer(style: AgentOverlayStyle, base: Instant) -> Vec<Pixmap> {
+    let at = |s: u64| base + Duration::from_secs(s);
+    let mut scene = AgentScene::new(style, AgentOverlayCorner::BottomRight);
+    let mut pm = canvas(2.0);
+    let mut board = Board::new(["jarvis"]);
+    let mut cells = Vec::new();
+    let mut shot = |board: &Board, now: Instant| {
+        // A moment before too, so a state change has crossfaded.
+        for t in [now - Duration::from_secs(1), now] {
+            scene.draw(&mut pm, rows(&board.compose(t)), t, 0.5, 2.0);
+        }
+        cells.push(row_of(&pm, 2.0));
+    };
+    board.set_voice(Some(("jarvis", AgentVisual::Listening)), at(0));
+    shot(&board, at(4));
+    board.set_voice(Some(("jarvis", AgentVisual::Transcribing)), at(5));
+    shot(&board, at(6));
+    board.set_voice(None, at(7));
+    board.turn_started("jarvis", at(7));
+    board.activity("jarvis", "Running a command");
+    shot(&board, at(49));
+    board.set_voice(Some(("jarvis", AgentVisual::Speaking)), at(50));
+    shot(&board, at(51));
+    board.set_voice(None, at(52));
+    board.needs_you("jarvis", at(60));
+    shot(&board, at(65));
+    board.working("jarvis");
+    board.turn_ended("jarvis", true, at(91));
+    board.set_pending(&["jarvis"], at(91));
+    shot(&board, at(93));
+    cells
 }
 
 fn canvas(scale: f32) -> Pixmap {
