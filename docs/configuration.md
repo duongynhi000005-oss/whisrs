@@ -421,6 +421,8 @@ response_format = "wav"     # audio format requested from the API
 # [[agents]]
 # name = "jarvis"                # required, unique: lowercase letters, digits, - and _
 # hotkey = "Super+Shift+J"       # optional: records a voice turn, same syntax as [hotkeys]
+# new_session_hotkey = "Super+Shift+N"  # optional: records a voice turn that starts a
+#                                #   fresh session (whisrs agent <name> --new)
 # harness = "claude"             # claude (Claude Code) is the one supported today
 # dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist
 # permissions = "auto"           # auto (default) | bypass | ask
@@ -611,6 +613,7 @@ backend = "groq"
 [[agents]]
 name = "jarvis"
 hotkey = "Super+Shift+J"
+new_session_hotkey = "Super+Shift+N"   # optional: a voice turn in a fresh session
 dir = "~/Projects/whisrs"
 ```
 
@@ -618,7 +621,9 @@ dir = "~/Projects/whisrs"
 whisrs agent                       # list the agents: name, harness, idle | working | needs-you, bg id
 whisrs agent jarvis                # record a voice turn (same as the hotkey; press again to stop)
 whisrs agent jarvis --text "..."   # send a typed turn (`--text -` reads stdin)
-whisrs agent jarvis --new          # forget the session; with --text, start a new one with it
+whisrs agent jarvis --new          # record a voice turn that starts a fresh session (same as
+                                   #   new_session_hotkey); with --text, send that text to one
+whisrs agent jarvis --reset        # forget the session and send nothing; the next turn starts a new one
 whisrs agent jarvis --stop         # stop the running turn (or the session's own work) and keep the session
 ```
 
@@ -654,8 +659,19 @@ How a turn goes:
   first). `whisrs cancel` while a reply plays also drops the replies queued
   after it.
 - A press while that agent's turn is still running is refused with a short
-  "Still working on the last one." Other agents can run at the same time; only
-  one recording exists at a time.
+  "Still working on the last one." When something plays at that moment (that
+  notice, or a reply the session produced on its own), the press stops it
+  first and is then refused with a notification only, so a press always
+  silences the agent and never queues another notice. Other agents can run at
+  the same time; only one recording exists at a time.
+- A fresh session: `whisrs agent <name> --new`, or the agent's
+  `new_session_hotkey`, records a voice turn like the normal hotkey, but the
+  transcript starts a new session instead of continuing the old one. Press
+  either key again (or run `--new` again) to stop and send; the press that
+  started the recording decides. The old session is forgotten only once there
+  is something to send, and stays in Claude Code. `--new --text "..."` does
+  the same with typed text, and `--reset` only forgets the session. Both are
+  refused while a turn of that agent runs: stop it first with `--stop`.
 - The session can also work on its own: when a command it started in the
   background finishes, Claude Code goes on without you. Its reply is spoken
   like any other, and while it works `whisrs agent` shows it as working and a
@@ -692,9 +708,23 @@ is left, it says "Done."
 | `ask` | `--permission-mode default`: asks before acting, even when your own default mode is `auto` |
 
 `permissions` and `args` are passed when a session starts. A later turn resumes
-the session with the options it was started with, so a change applies from the
-next new session (`whisrs agent <name> --new`). The same goes for
-`reply_instruction`: the session keeps the instruction it started with.
+the session with the options it was started with (its hooks, `--remote-control`
+and the permission mode included), so a change applies from the next new
+session (`whisrs agent <name> --new`). The same goes for `reply_instruction`:
+the session keeps the instruction it started with.
+
+How a later turn continues the session: whisrs stops the session's process
+(`claude stop`), waits until that process has exited, then resumes the session
+with no other flag. Claude Code needs both: a resume while the old process
+still runs, or one with any flag, starts a copy of the session instead, which
+comes back without the hooks, Remote Control and the permission mode. The wait
+is capped at ten seconds; a process that is still running then fails the turn
+("Claude Code did not stop the session's last run in time, so this turn was
+not sent."), and nothing is sent. whisrs never adopts a copy: if a resume
+starts one anyway, whisrs stops and removes that copy, waits for the original
+again and resumes once more. If that also starts a copy, the turn fails with
+"Claude Code could not continue the session" and `whisrs agent <name> --new`
+starts a fresh one.
 
 Sessions. Each agent's session is a Claude Code background session named
 `whisrs-<name>`: it shows up in `claude agents`, and `claude attach <id>` opens it

@@ -46,6 +46,11 @@ pub struct AgentConfig {
     /// Optional global hotkey, same syntax as `[hotkeys]`: a voice turn.
     #[serde(default)]
     pub hotkey: Option<String>,
+    /// Optional global hotkey for a voice turn that starts a fresh session
+    /// (`whisrs agent <name> --new`). Same syntax and clash checks as
+    /// `hotkey`.
+    #[serde(default)]
+    pub new_session_hotkey: Option<String>,
     /// Which coding agent: `claude` (phase 1).
     #[serde(default = "default_harness")]
     pub harness: String,
@@ -143,6 +148,8 @@ pub struct Agent {
     pub name: String,
     /// The configured hotkey, if any (validity is checked by the listener).
     pub hotkey: Option<String>,
+    /// The hotkey of a fresh-session voice turn, if any.
+    pub new_session_hotkey: Option<String>,
     pub harness: Harness,
     /// `dir` with `~` expanded; an existing directory at load time.
     pub dir: PathBuf,
@@ -249,18 +256,29 @@ fn resolve_agents_with(
             ));
             continue;
         }
-        let hotkey = entry
-            .hotkey
-            .as_deref()
-            .map(str::trim)
-            .filter(|h| !h.is_empty())
-            .map(str::to_string);
-        if let Some(spec) = &hotkey {
-            if let Err(e) = hotkey::parse_hotkey(spec) {
-                warnings.push(format!(
-                    "[[agents]] '{name}' has an invalid hotkey '{spec}': {e}. The agent still \
-                     works through `whisrs agent {name}`"
-                ));
+        let set = |spec: &Option<String>| {
+            spec.as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+        };
+        let hotkey = set(&entry.hotkey);
+        let new_session_hotkey = set(&entry.new_session_hotkey);
+        for (key, spec, cli) in [
+            ("hotkey", &hotkey, format!("whisrs agent {name}")),
+            (
+                "new_session_hotkey",
+                &new_session_hotkey,
+                format!("whisrs agent {name} --new"),
+            ),
+        ] {
+            if let Some(spec) = spec {
+                if let Err(e) = hotkey::parse_hotkey(spec) {
+                    warnings.push(format!(
+                        "[[agents]] '{name}' has an invalid {key} '{spec}': {e}. The agent still \
+                         works through `{cli}`"
+                    ));
+                }
             }
         }
         let command = entry
@@ -280,6 +298,7 @@ fn resolve_agents_with(
         agents.push(Agent {
             name: name.to_string(),
             hotkey,
+            new_session_hotkey,
             harness,
             dir,
             permissions,
@@ -318,11 +337,13 @@ pub enum AgentAction {
     /// `whisrs agent`: every configured agent and its state.
     List,
     /// `whisrs agent <name>`, or its hotkey: record a voice turn (a second
-    /// press stops the recording).
+    /// press stops the recording). With `new` (`whisrs agent <name> --new`,
+    /// or its `new_session_hotkey`) the transcript starts a fresh session.
     Toggle,
-    /// `whisrs agent <name> --text "..."`: a typed turn.
+    /// `whisrs agent <name> --text "..."`: a typed turn; with `new`, in a
+    /// fresh session.
     Send,
-    /// `whisrs agent <name> --new`: forget the session.
+    /// `whisrs agent <name> --reset`: forget the session, start nothing.
     Reset,
     /// `whisrs agent <name> --stop`: stop the running turn, keep the session.
     Stop,
@@ -619,6 +640,7 @@ mod tests {
         AgentConfig {
             name: name.to_string(),
             hotkey: None,
+            new_session_hotkey: None,
             harness: "claude".to_string(),
             dir: "/proj".to_string(),
             permissions: "auto".to_string(),
@@ -645,6 +667,7 @@ mod tests {
             vec![Agent {
                 name: "jarvis".to_string(),
                 hotkey: None,
+                new_session_hotkey: None,
                 harness: Harness::Claude,
                 dir: PathBuf::from("/proj"),
                 permissions: Permissions::Auto,
@@ -662,6 +685,7 @@ mod tests {
 [[agents]]
 name = "jarvis"
 hotkey = "Super+Shift+J"
+new_session_hotkey = "Super+Shift+N"
 harness = "claude"
 dir = "/proj"
 permissions = "ask"
@@ -675,6 +699,7 @@ reply_instruction = "Be terse."
         assert!(warnings.is_empty(), "{warnings:?}");
         let a = &agents[0];
         assert_eq!(a.hotkey.as_deref(), Some("Super+Shift+J"));
+        assert_eq!(a.new_session_hotkey.as_deref(), Some("Super+Shift+N"));
         assert_eq!(a.permissions, Permissions::Ask);
         assert_eq!(a.command, "/opt/claude/bin/claude");
         assert_eq!(a.args, ["--remote-control", "jarvis"]);
@@ -722,20 +747,29 @@ reply_instruction = "Be terse."
     fn an_invalid_hotkey_warns_but_keeps_the_agent() {
         let mut e = entry("jarvis");
         e.hotkey = Some("Super+Nope".into());
+        e.new_session_hotkey = Some("Super+Nada".into());
         let (agents, warnings) = resolve(&[e]);
         assert_eq!(agents.len(), 1);
-        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("invalid hotkey 'Super+Nope'"));
+        assert!(
+            warnings[1].contains("invalid new_session_hotkey 'Super+Nada'")
+                && warnings[1].contains("`whisrs agent jarvis --new`"),
+            "{}",
+            warnings[1]
+        );
     }
 
     #[test]
     fn a_blank_hotkey_or_command_is_unset() {
         let mut e = entry("jarvis");
         e.hotkey = Some("  ".into());
+        e.new_session_hotkey = Some("".into());
         e.command = Some(" ".into());
         let (agents, warnings) = resolve(&[e]);
         assert!(warnings.is_empty());
         assert_eq!(agents[0].hotkey, None);
+        assert_eq!(agents[0].new_session_hotkey, None);
         assert_eq!(agents[0].command, "claude");
     }
 

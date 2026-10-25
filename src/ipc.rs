@@ -66,7 +66,8 @@ pub enum Command {
     },
     /// Agent mode (`[[agents]]`). `name` is required by every action but
     /// `list`; `text` is the typed instruction of `send`; `new` on `send`
-    /// starts a new session first.
+    /// or `toggle` sends the turn to a fresh session (the old one is
+    /// forgotten first); `reset` only forgets the session.
     Agent {
         action: AgentAction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -780,6 +781,27 @@ mod tests {
             parsed,
             Command::Agent { action: AgentAction::Send, name: Some(n), text: Some(t), new: true }
                 if n == "jarvis" && t == "run the tests"
+        ));
+        // A fresh-session voice turn.
+        let fresh = Command::Agent {
+            action: AgentAction::Toggle,
+            name: Some("jarvis".to_string()),
+            text: None,
+            new: true,
+        };
+        let json = serde_json::to_string(&fresh).unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"agent","action":"toggle","name":"jarvis","new":true}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Command>(&json).unwrap(),
+            Command::Agent {
+                action: AgentAction::Toggle,
+                text: None,
+                new: true,
+                ..
+            }
         ));
         for (wire, action) in [
             ("toggle", AgentAction::Toggle),

@@ -118,7 +118,7 @@ instead of the selection
 .RB ( "\-\-text \-"
 reads it from standard input); a read-aloud in progress is stopped first.
 .TP
-\fBagent\fR [\fINAME\fR] [\fB\-\-text\fR \fITEXT\fR] [\fB\-\-new\fR] [\fB\-\-stop\fR]
+\fBagent\fR [\fINAME\fR] [\fB\-\-text\fR \fITEXT\fR] [\fB\-\-new\fR] [\fB\-\-reset\fR] [\fB\-\-stop\fR]
 Talk to a coding agent configured in
 .B [[agents]]
 (Claude Code). Without
@@ -143,9 +143,17 @@ instead of recording
 .RB ( "\-\-text \-"
 reads standard input).
 .B \-\-new
-forgets the session (with
+records a voice instruction that starts a fresh session instead (the same as
+the agent's
+.BR new_session_hotkey ;
+run it again, or press either hotkey, to stop and send); with
 .BR \-\-text ,
-starts a new one with it).
+it sends
+.I TEXT
+to a fresh session.
+.B \-\-reset
+forgets the session and sends nothing; the next turn starts a new one. Both
+are refused while a turn of that agent runs.
 .B \-\-stop
 stops the running turn and keeps the session. With no turn running it stops
 work the session does on its own, such as a background task it started, which

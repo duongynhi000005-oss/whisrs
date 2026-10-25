@@ -336,9 +336,11 @@ impl AgentRuntime {
         self.agents.iter().map(|a| Agent::clone(a)).collect()
     }
 
-    /// Whether any agent has a hotkey.
+    /// Whether any agent has a hotkey (`hotkey` or `new_session_hotkey`).
     pub(crate) fn has_hotkeys(&self) -> bool {
-        self.agents.iter().any(|a| a.hotkey.is_some())
+        self.agents
+            .iter()
+            .any(|a| a.hotkey.is_some() || a.new_session_hotkey.is_some())
     }
 
     fn agent(&self, name: &str) -> Option<Arc<Agent>> {
@@ -593,6 +595,13 @@ impl AgentRuntime {
             .get(name)
             .map(|s| s.phase)
             .unwrap_or(AgentPhase::Idle)
+    }
+
+    /// Whether a whisrs turn of the agent runs, also one that waits for the
+    /// user (needs-you).
+    async fn has_turn(&self, name: &str) -> bool {
+        let inner = self.inner.lock().await;
+        inner.slots.get(name).is_some_and(|s| s.turn.is_some())
     }
 }
 
@@ -912,7 +921,7 @@ pub(crate) async fn handle_agent(
     };
     match action {
         AgentAction::List => unreachable!("answered above"),
-        AgentAction::Toggle => voice_toggle(daemon_state, context, agent).await,
+        AgentAction::Toggle => voice_toggle(daemon_state, context, agent, new).await,
         AgentAction::Send => {
             let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
                 return error("nothing to send: the text is empty");
@@ -1423,6 +1432,15 @@ async fn finish_turn(
     }
 }
 
+/// The error for forgetting the session while a turn runs (`--reset`, or
+/// `--new` while recording or sending).
+fn reset_refusal(agent: &Agent) -> String {
+    format!(
+        "{STILL_WORKING} Stop it first: whisrs agent {} --stop",
+        agent.name
+    )
+}
+
 /// Forget the agent's session. Refused while a turn runs.
 async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     let rt = &context.agents;
@@ -1432,10 +1450,7 @@ async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
         .get(&agent.name)
         .is_some_and(|s| s.turn.is_some())
     {
-        return Err(format!(
-            "{STILL_WORKING} Stop it first: whisrs agent {} --stop",
-            agent.name
-        ));
+        return Err(reset_refusal(agent));
     }
     let record = record_mut(&mut inner, agent);
     if let Some(old) = record.session_id.take() {
@@ -1542,6 +1557,21 @@ fn refuse_busy(
     busy: Busy,
     instruction: Option<&str>,
 ) -> String {
+    let message = notify_busy(context, agent, busy, instruction);
+    context.agents.say_notice(&agent.name, busy.notice());
+    message
+}
+
+/// Log and notify a busy refusal (per `[general] notify`) without speaking
+/// it, and return the error for a CLI request: [`refuse_busy`] minus the
+/// notice, for a press that just stopped the reply or notice playing, so it
+/// does not queue another one in its place.
+fn notify_busy(
+    context: &DaemonContext,
+    agent: &Agent,
+    busy: Busy,
+    instruction: Option<&str>,
+) -> String {
     match busy {
         Busy::Turn => info!("agent '{}': refused, a turn is running", agent.name),
         Busy::Background => info!(
@@ -1556,7 +1586,6 @@ fn refuse_busy(
             REPLY_NOTIFICATION_MS,
         );
     }
-    context.agents.say_notice(&agent.name, busy.notice());
     busy.message(&agent.name)
 }
 
@@ -1564,14 +1593,29 @@ fn refuse_busy(
 // Voice turns: the recording sink
 // ---------------------------------------------------------------------------
 
-/// `whisrs agent <name>` or its hotkey. Idle: record a voice turn. Recording
-/// for this agent: stop and transcribe. Speaking: stop playback and record
-/// (barge-in). Anything else: busy.
+/// `whisrs agent <name>` or its hotkey; with `new_session` (`--new`, or its
+/// `new_session_hotkey`) the transcript starts a fresh session.
+///
+/// - Recording for this agent: stop and transcribe (a press of either kind;
+///   the press that started the recording decides about the session).
+/// - An agent reply or notice playing: stop it first (barge-in), also while
+///   this agent's turn runs, so a press always silences it.
+/// - This agent's turn runs (`--new`: any turn, also one that waits for
+///   you): refuse. With nothing stopped, the notice is spoken and notified;
+///   a press that stopped what played only notifies, so it never queues
+///   another notice in its place.
+/// - Otherwise record a voice turn (a selection read-aloud is stopped for
+///   it). Anything else: busy.
 async fn voice_toggle(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
     agent: Arc<Agent>,
+    new_session: bool,
 ) -> Response {
+    // Held from a barge-in stop until the recording started or the press
+    // was refused, so the reply queue cannot start the next reply between
+    // the stop and the recording.
+    let mut barge_in = None;
     {
         let mut ds = daemon_state.lock().await;
         match ds.state_machine.state() {
@@ -1598,12 +1642,38 @@ async fn voice_toggle(
             State::Transcribing => {
                 return error("busy: still transcribing, try again in a moment");
             }
-            State::Idle | State::Speaking | State::Synthesizing => {}
+            State::Speaking | State::Synthesizing => {
+                let reason = format!("agent '{}'", agent.name);
+                if crate::speak::stop_agent_playback(&mut ds, &context, &reason) {
+                    barge_in = Some(context.agents.hold_replies());
+                }
+            }
+            State::Idle => {}
         }
     }
 
-    if context.agents.phase(&agent.name).await == AgentPhase::Working {
-        return error(&refuse_busy(&context, &agent, Busy::Turn, None));
+    let rt = &context.agents;
+    let busy = if new_session {
+        rt.has_turn(&agent.name).await
+    } else {
+        rt.phase(&agent.name).await == AgentPhase::Working
+    };
+    if busy {
+        let message = if barge_in.is_some() {
+            info!(
+                "agent '{}': the press stopped the playback; no notice is queued for the \
+                 refusal",
+                agent.name
+            );
+            notify_busy(&context, &agent, Busy::Turn, None)
+        } else {
+            refuse_busy(&context, &agent, Busy::Turn, None)
+        };
+        return error(&if new_session {
+            reset_refusal(&agent)
+        } else {
+            message
+        });
     }
 
     #[cfg(feature = "recording")]
@@ -1611,7 +1681,9 @@ async fn voice_toggle(
         return refused;
     }
 
-    start_recording(daemon_state, context, agent).await
+    let response = start_recording(daemon_state, Arc::clone(&context), agent, new_session).await;
+    drop(barge_in);
+    response
 }
 
 /// Start recording a voice turn. Under one lock, so a reply that would start
@@ -1620,6 +1692,7 @@ async fn start_recording(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
     agent: Arc<Agent>,
+    new_session: bool,
 ) -> Response {
     let audio_rx = {
         let mut ds = daemon_state.lock().await;
@@ -1661,16 +1734,18 @@ async fn start_recording(
         ds.recording_started_at = Some(std::time::Instant::now());
         ds.agent_recording = Some(AgentRecordingContext {
             name: agent.name.clone(),
+            new_session,
         });
         let _ = context.state_tx.send(ds.state_machine.state());
         audio_rx
     };
 
-    info!("agent '{}': recording a voice turn", agent.name);
+    let fresh = if new_session { " in a new session" } else { "" };
+    info!("agent '{}': recording a voice turn{fresh}", agent.name);
     if context.notify_state() {
         send_notification(
             "whisrs",
-            &format!("Speak to '{}'... (press again to stop)", agent.name),
+            &format!("Speak to '{}'{fresh}... (press again to stop)", agent.name),
         );
     }
 
@@ -1710,10 +1785,10 @@ async fn voice_turn_background(
         }
         claimed
     };
-    if claimed.is_none() {
+    let Some(claimed) = claimed else {
         info!("{label}: voice turn cancelled, recording discarded");
         return;
-    }
+    };
 
     if context.config.general.audio_feedback {
         feedback::play_stop(context.config.general.audio_feedback_volume);
@@ -1761,6 +1836,14 @@ async fn voice_turn_background(
         );
         return;
     }
+    if claimed.new_session {
+        // A typed turn may have started while this one recorded: the
+        // session is not forgotten under it.
+        if reset(&context, &agent).await.is_err() {
+            refuse_busy(&context, &agent, Busy::Turn, Some(&text));
+            return;
+        }
+    }
     if let Err(busy) = start_turn(&context, &agent, text.clone()).await {
         refuse_busy(&context, &agent, busy, Some(&text));
     }
@@ -1774,6 +1857,7 @@ mod tests {
         Agent {
             name: name.into(),
             hotkey: None,
+            new_session_hotkey: None,
             harness: Harness::Claude,
             dir: PathBuf::from("/proj"),
             permissions: whisrs::agent::Permissions::Auto,
@@ -2018,6 +2102,7 @@ mod tests {
                 g.state_machine.transition(Action::Toggle).unwrap();
                 g.agent_recording = Some(AgentRecordingContext {
                     name: "jarvis".into(),
+                    new_session: false,
                 });
             }
             ds
@@ -2111,7 +2196,6 @@ mod tests {
     }
 
     /// A reply of `jarvis`.
-    #[cfg(feature = "recording")]
     fn utterance(text: &str) -> Utterance {
         Utterance {
             agent: "jarvis".into(),
@@ -2122,7 +2206,6 @@ mod tests {
 
     /// Put `ds` in a read-aloud of `origin` that plays, as `speak_text`
     /// does; returns its stop flag.
-    #[cfg(feature = "recording")]
     async fn start_speaking(
         ds: &Mutex<DaemonState>,
         origin: SpeakOrigin,
@@ -2536,6 +2619,310 @@ mod tests {
             rt.error_line(&agent("jarvis"), message),
             "jarvis: That turn was interrupted, say it again."
         );
+    }
+
+    /// A press while an agent reply or notice plays during this agent's
+    /// running turn stops the playback, and is refused without queuing
+    /// another notice in its place. With nothing playing, the refusal is
+    /// spoken as before.
+    #[tokio::test]
+    async fn a_press_during_a_running_turn_stops_playback_without_a_new_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        let rt = &context.agents;
+        let agent = Arc::clone(&rt.agents[0]);
+        install_turn(&context, "jarvis", 1, "the running one").await;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+
+        // The "Still working" notice of an earlier press plays.
+        let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
+        rt.set_playing(Some(Utterance {
+            agent: "jarvis".into(),
+            text: STILL_WORKING.into(),
+            notice: Some(STILL_WORKING),
+        }));
+        let response = voice_toggle(
+            Arc::clone(&ds),
+            Arc::clone(&context),
+            Arc::clone(&agent),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&response, Response::Error { message } if message == STILL_WORKING),
+            "{response:?}"
+        );
+        assert!(stop.load(Ordering::Acquire), "the notice was not stopped");
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+        // The queue clears `playing` once it sees the playback end.
+        rt.set_playing(None);
+        assert!(queued(rt).is_empty(), "a notice was queued");
+        assert!(
+            !replies_held(&context),
+            "the barge-in hold outlived the press"
+        );
+
+        // A follow-up reply plays: the same.
+        let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
+        rt.set_playing(Some(utterance("A reply it produced on its own.")));
+        voice_toggle(
+            Arc::clone(&ds),
+            Arc::clone(&context),
+            Arc::clone(&agent),
+            false,
+        )
+        .await;
+        assert!(stop.load(Ordering::Acquire));
+        rt.set_playing(None);
+        assert!(queued(rt).is_empty());
+
+        // Nothing plays: the refusal is spoken.
+        voice_toggle(Arc::clone(&ds), Arc::clone(&context), agent, false).await;
+        assert_eq!(queued(rt), [STILL_WORKING]);
+    }
+
+    /// A selection read-aloud is not an agent's playback: a press while the
+    /// turn runs leaves it playing and is refused as before.
+    #[tokio::test]
+    async fn a_press_during_a_running_turn_leaves_a_selection_read_aloud() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        let agent = Arc::clone(&context.agents.agents[0]);
+        install_turn(&context, "jarvis", 1, "the running one").await;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        let stop = start_speaking(&ds, SpeakOrigin::Selection).await;
+        voice_toggle(Arc::clone(&ds), Arc::clone(&context), agent, false).await;
+        assert!(!stop.load(Ordering::Acquire));
+        assert_eq!(ds.lock().await.state_machine.state(), State::Speaking);
+        assert_eq!(queued(&context.agents), [STILL_WORKING]);
+    }
+
+    /// `--new` is refused while any turn of the agent runs, also one that
+    /// waits for you (a plain press would answer that one), and says how to
+    /// go on.
+    #[tokio::test]
+    async fn a_fresh_session_press_is_refused_while_a_turn_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        let agent = Arc::clone(&context.agents.agents[0]);
+        install_turn(&context, "jarvis", 1, "the running one").await;
+        context
+            .agents
+            .inner
+            .lock()
+            .await
+            .slots
+            .get_mut("jarvis")
+            .unwrap()
+            .phase = AgentPhase::NeedsYou;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        let response = voice_toggle(Arc::clone(&ds), Arc::clone(&context), agent, true).await;
+        assert!(
+            matches!(&response, Response::Error { message }
+                if message == "Still working on the last one. Stop it first: whisrs agent jarvis --stop"),
+            "{response:?}"
+        );
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+        assert_eq!(queued(&context.agents), [STILL_WORKING]);
+    }
+
+    /// A transcription backend that always hears the same words.
+    struct FixedBackend;
+
+    #[async_trait::async_trait]
+    impl whisrs::transcription::TranscriptionBackend for FixedBackend {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _config: &whisrs::transcription::TranscriptionConfig,
+        ) -> anyhow::Result<String> {
+            Ok("run the tests".into())
+        }
+
+        fn sends_prompt(&self, _config: &whisrs::transcription::TranscriptionConfig) -> bool {
+            false
+        }
+
+        fn stream_text(&self) -> whisrs::transcription::StreamText {
+            whisrs::transcription::StreamText::Phrases
+        }
+
+        async fn transcribe_segments(
+            &self,
+            _audio: &[u8],
+            _config: &whisrs::transcription::TranscriptionConfig,
+        ) -> anyhow::Result<whisrs::transcription::Transcript> {
+            unreachable!("voice turns do not request segments")
+        }
+
+        fn max_segment_chunk_secs(
+            &self,
+            _config: &whisrs::transcription::TranscriptionConfig,
+        ) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A harness that records the session each turn starts in and replies
+    /// at once.
+    #[derive(Default)]
+    struct SessionLoggingDriver {
+        sessions: std::sync::Mutex<Vec<SessionRef>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Driver for SessionLoggingDriver {
+        async fn run_turn(
+            &self,
+            _agent: &Agent,
+            session: SessionRef,
+            _request: TurnRequest,
+            _io: TurnIo,
+        ) -> TurnOutcome {
+            self.sessions.lock().unwrap().push(session);
+            TurnOutcome::Reply("<spoken>Done.</spoken>".into())
+        }
+
+        async fn rewatch(
+            &self,
+            _agent: &Agent,
+            _session: SessionRef,
+            _request: TurnRequest,
+            _io: TurnIo,
+        ) -> TurnOutcome {
+            unreachable!("no turn is watched again")
+        }
+
+        async fn stop(&self, _agent: &Agent, _session: &SessionRef) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn hook_matches(&self, _payload: &serde_json::Value, _session: &SessionRef) -> bool {
+            false
+        }
+
+        async fn session_phase(
+            &self,
+            _agent: &Agent,
+            _session: &SessionRef,
+        ) -> Result<AgentPhase, String> {
+            Ok(AgentPhase::Idle)
+        }
+
+        async fn session_phases(
+            &self,
+            sessions: &[(Arc<Agent>, SessionRef)],
+        ) -> Vec<Result<AgentPhase, String>> {
+            sessions.iter().map(|_| Ok(AgentPhase::Idle)).collect()
+        }
+
+        async fn idle_event(
+            &self,
+            _payload: &serde_json::Value,
+            _session: &SessionRef,
+        ) -> IdleEvent {
+            IdleEvent::Ignored
+        }
+    }
+
+    /// A voice turn whose press asked for a fresh session forgets the stored
+    /// one when its transcript is ready and starts the turn in a new
+    /// session; a plain one continues the stored session. A turn that
+    /// started while the fresh one recorded keeps the session, and the
+    /// instruction is refused.
+    #[tokio::test]
+    async fn a_fresh_session_voice_turn_starts_a_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(SessionLoggingDriver::default());
+        let mut context = test_context(&["jarvis"], dir.path());
+        {
+            let ctx = Arc::get_mut(&mut context).unwrap();
+            ctx.transcription_backend = Arc::new(FixedBackend);
+            ctx.agents
+                .drivers
+                .insert(Harness::Claude, Arc::clone(&driver) as Arc<dyn Driver>);
+        }
+        let agent = Arc::clone(&context.agents.agents[0]);
+        let stored = SessionRef {
+            session_id: Some("sid-1".into()),
+            bg_id: Some("bg1".into()),
+            transcript_path: None,
+        };
+        let store_session = |context: Arc<DaemonContext>| {
+            let stored = stored.clone();
+            async move {
+                let mut inner = context.agents.inner.lock().await;
+                let mut record = AgentRecord::new("claude", Path::new("/proj"));
+                record.set_session(&stored);
+                inner.store.agents.insert("jarvis".into(), record);
+            }
+        };
+        let voice_turn = |new_session: bool| {
+            let context = Arc::clone(&context);
+            let agent = Arc::clone(&agent);
+            async move {
+                let ds = Arc::new(Mutex::new(DaemonState::new()));
+                {
+                    let mut g = ds.lock().await;
+                    g.state_machine.transition(Action::Toggle).unwrap();
+                    g.agent_recording = Some(AgentRecordingContext {
+                        name: "jarvis".into(),
+                        new_session,
+                    });
+                }
+                let (tx, rx) = mpsc::unbounded_channel();
+                let loud: Vec<i16> = (0..16_000)
+                    .map(|i| if i % 2 == 0 { 8_000 } else { -8_000 })
+                    .collect();
+                tx.send(loud).unwrap();
+                drop(tx);
+                voice_turn_background(Some(rx), ds, context, agent).await;
+            }
+        };
+        let turns = |n: usize| {
+            let driver = Arc::clone(&driver);
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while driver.sessions.lock().unwrap().len() < n {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the turn did not start");
+                driver.sessions.lock().unwrap()[n - 1].clone()
+            }
+        };
+
+        // Wait until the turn ended and its reply was queued.
+        let replied = || async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !context.agents.has_utterances() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the turn did not reply");
+            assert_eq!(queued(&context.agents), ["Done."]);
+            assert!(!context.agents.has_turn("jarvis").await);
+        };
+
+        store_session(Arc::clone(&context)).await;
+        voice_turn(false).await;
+        assert_eq!(turns(1).await, stored, "a plain voice turn continues");
+        replied().await;
+
+        store_session(Arc::clone(&context)).await;
+        voice_turn(true).await;
+        assert_eq!(turns(2).await, SessionRef::default(), "not a fresh session");
+        replied().await;
+
+        // A turn runs by the time the fresh one is transcribed.
+        store_session(Arc::clone(&context)).await;
+        install_turn(&context, "jarvis", 99, "typed meanwhile").await;
+        voice_turn(true).await;
+        assert_eq!(queued(&context.agents), [STILL_WORKING]);
+        let inner = context.agents.inner.lock().await;
+        assert_eq!(inner.store.agents["jarvis"].session(), stored);
     }
 
     #[test]

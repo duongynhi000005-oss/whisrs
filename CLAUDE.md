@@ -35,7 +35,8 @@ whisrs cancel    # cancel and discard audio
 whisrs speak     # read the selected text aloud via TTS (alias: read; press again to stop)
 whisrs speak --text "..."   # speak the given text (--text - reads stdin); its own IPC command (speak-text)
 whisrs agent     # list [[agents]]; `whisrs agent <name>` records a voice turn for that coding agent
-                 # (same as its hotkey), --text "..." sends a typed one, --new forgets the session,
+                 # (same as its hotkey), --text "..." sends a typed one, --new records one (or sends
+                 # --text) in a fresh session (same as new_session_hotkey), --reset forgets the session,
                  # --stop stops the running turn. The reply is spoken via [tts] when the turn ends
 whisrs status    # query daemon state
 whisrs restart   # restart the daemon (wraps systemctl --user when present)
@@ -265,6 +266,8 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
                                      // instead of reading the selection
 {"cmd": "agent", "action": "list|toggle|send|reset|stop", "name": "jarvis", "text": "...", "new": true}
                                      // all but action optional (name required but for list);
+                                     // "new" on toggle (--new) or send starts a fresh session,
+                                     // reset (--reset) only forgets it;
                                      // list/send/reset/stop answer with an Agents response
 {"cmd": "agent-event", "payload": {...}}  // a harness hook's stdin JSON, from `whisrs agent-hook`
 {"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize", "title": "...", "id": "...",
@@ -300,7 +303,7 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
-Agent mode: `[[agents]]` entries (`name`, `hotkey`, `harness` = `claude`, `dir`, `permissions` =
+Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude`, `dir`, `permissions` =
 `auto|bypass|ask`, `command`, `args`, `reply_instruction`; `agent::resolve_agents` validates and
 skips bad entries, shared by `Config::validate` and the runtime). With none, nothing runs and no file
 is written. A voice turn records like command mode's instruction (`BatchOrigin::Agent`), then the
@@ -313,8 +316,12 @@ recording start stops it too and requeues it at the front (`agent::hold_for_reco
 `Notification`) that run `whisrs agent-hook --socket <sock>`; under a systemd service the `--bg`
 launch runs in its own `systemd-run --user --scope` (Claude Code's background service must not
 live in the whisrs unit). The next turn is refused while `claude agents` lists the session
-`working`, else `claude stop` + `claude --bg --resume <id> -- <text>` with no other flag (any flag
-starts a copy); only a `Stop` received after that launch ends it (an earlier one is the old
+`working`, else `claude stop`, a wait until its listed pid has exited (`ClaudeDriver::wait_for_exit`:
+`claude stop` returns, and the listing drops the pid, before Claude Code settles it; capped at 10 s,
+then the turn fails), then `claude --bg --resume <id> -- <text>` with no other flag (any flag, or a
+resume before the settle, starts a copy without the hooks or `--remote-control`). A copy is never
+adopted: stopped + `claude rm`-ed on the launch task, the resume tried once more, a second copy
+fails the turn (`claude::cannot_continue`); only a `Stop` received after that launch ends it (an earlier one is the old
 process's own reply, `TurnUpdate::SessionReply`). A `Stop` with no turn running is the session's own
 reply and is spoken, unless it repeats a turn that ended on a poll (`TurnOutcome::PolledReply`); a
 permission prompt with no turn running marks needs-you. A session working on its own refuses a turn

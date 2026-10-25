@@ -121,7 +121,8 @@ pub async fn start_hotkey_listener(
 
 /// Build the dispatch table: every set `[hotkeys]` field, every
 /// `[[llm_commands]]` entry's `hotkey` and optional `set_hotkey`, and every
-/// usable `[[agents]]` entry's `hotkey` (a voice turn). Invalid specs are
+/// usable `[[agents]]` entry's `hotkey` (a voice turn) and
+/// `new_session_hotkey` (one in a fresh session). Invalid specs are
 /// warned about and skipped, so one bad combo never disables the rest.
 ///
 /// Split out of [`start_hotkey_listener`] — which needs real input devices and
@@ -207,21 +208,26 @@ fn build_actions(
     }
 
     for agent in agents {
-        let Some(spec) = &agent.hotkey else { continue };
-        match parse_hotkey(spec) {
-            Ok(binding) => {
-                info!("hotkey: agent '{}' = {spec}", agent.name);
-                actions.push(HotkeyAction {
-                    binding,
-                    command: Command::Agent {
-                        action: AgentAction::Toggle,
-                        name: Some(agent.name.clone()),
-                        text: None,
-                        new: false,
-                    },
-                });
+        for (key, spec, new) in [
+            ("hotkey", &agent.hotkey, false),
+            ("new_session_hotkey", &agent.new_session_hotkey, true),
+        ] {
+            let Some(spec) = spec else { continue };
+            match parse_hotkey(spec) {
+                Ok(binding) => {
+                    info!("hotkey: agent '{}' {key} = {spec}", agent.name);
+                    actions.push(HotkeyAction {
+                        binding,
+                        command: Command::Agent {
+                            action: AgentAction::Toggle,
+                            name: Some(agent.name.clone()),
+                            text: None,
+                            new,
+                        },
+                    });
+                }
+                Err(e) => warn!("invalid {key} '{spec}' for agent '{}': {e}", agent.name),
             }
-            Err(e) => warn!("invalid hotkey '{spec}' for agent '{}': {e}", agent.name),
         }
     }
 
@@ -694,14 +700,16 @@ mod tests {
         assert!(matches!(actions[0].command, Command::Toggle { .. }));
     }
 
-    /// An agent's hotkey records a voice turn for that agent; one without a
-    /// hotkey binds nothing.
+    /// An agent's hotkey records a voice turn for that agent, and its
+    /// `new_session_hotkey` one in a fresh session; one without a hotkey
+    /// binds nothing.
     #[test]
     fn agent_hotkeys_dispatch_a_voice_turn() {
         use crate::agent::{Harness, Permissions};
         let agent = |name: &str, hotkey: Option<&str>| Agent {
             name: name.to_string(),
             hotkey: hotkey.map(str::to_string),
+            new_session_hotkey: None,
             harness: Harness::Claude,
             dir: PathBuf::from("/proj"),
             permissions: Permissions::Auto,
@@ -709,18 +717,32 @@ mod tests {
             args: Vec::new(),
             instruction: String::new(),
         };
-        let agents = [
-            agent("jarvis", Some("Super+Shift+J")),
-            agent("quiet", None),
-            agent("broken", Some("Super+Nope")),
-        ];
+        let mut jarvis = agent("jarvis", Some("Super+Shift+J"));
+        jarvis.new_session_hotkey = Some("Super+Shift+N".to_string());
+        let mut broken = agent("broken", Some("Super+Nope"));
+        broken.new_session_hotkey = Some("Super+Nada".to_string());
+        let mut only_new = agent("fresh", None);
+        only_new.new_session_hotkey = Some("Super+Shift+F".to_string());
+        let agents = [jarvis, agent("quiet", None), broken, only_new];
         let actions = build_actions(&HotkeyConfig::default(), &[], &agents);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 3);
         assert_eq!(actions[0].binding.trigger, Key::KEY_J);
         assert!(matches!(
             &actions[0].command,
             Command::Agent { action: AgentAction::Toggle, name: Some(n), text: None, new: false }
                 if n == "jarvis"
+        ));
+        assert_eq!(actions[1].binding.trigger, Key::KEY_N);
+        assert!(matches!(
+            &actions[1].command,
+            Command::Agent { action: AgentAction::Toggle, name: Some(n), text: None, new: true }
+                if n == "jarvis"
+        ));
+        assert_eq!(actions[2].binding.trigger, Key::KEY_F);
+        assert!(matches!(
+            &actions[2].command,
+            Command::Agent { action: AgentAction::Toggle, name: Some(n), new: true, .. }
+                if n == "fresh"
         ));
     }
 

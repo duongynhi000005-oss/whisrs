@@ -2213,8 +2213,13 @@ impl Config {
             }
         }
         for agent in &agents {
-            if let Some(hotkey) = &agent.hotkey {
-                binding_sources.push((format!("agents '{}' hotkey", agent.name), hotkey.as_str()));
+            for (key, spec) in [
+                ("hotkey", &agent.hotkey),
+                ("new_session_hotkey", &agent.new_session_hotkey),
+            ] {
+                if let Some(spec) = spec {
+                    binding_sources.push((format!("agents '{}' {key}", agent.name), spec.as_str()));
+                }
             }
         }
         let mut seen_bindings: std::collections::HashMap<(Vec<u16>, u16), (String, String)> =
@@ -5399,6 +5404,7 @@ mod tests {
         crate::agent::AgentConfig {
             name: name.to_string(),
             hotkey: hotkey.map(str::to_string),
+            new_session_hotkey: None,
             harness: "claude".to_string(),
             dir: env!("CARGO_MANIFEST_DIR").to_string(),
             permissions: "auto".to_string(),
@@ -5427,6 +5433,53 @@ mod tests {
             "{}",
             warning.message
         );
+    }
+
+    /// `new_session_hotkey` takes part in the clash check: against another
+    /// binding, and against the agent's own `hotkey`.
+    #[test]
+    fn config_validate_warns_agent_new_session_hotkey_clashes() {
+        let clashes = |config: &Config| -> Vec<String> {
+            config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .map(|w| w.message)
+                .filter(|m| m.contains("duplicate hotkey binding"))
+                .collect()
+        };
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            speak: Some("Super+Shift+N".to_string()),
+            ..Default::default()
+        });
+        let mut jarvis = agent_entry("jarvis", Some("Super+Shift+J"));
+        jarvis.new_session_hotkey = Some("shift+super+n".to_string());
+        config.agents = vec![jarvis.clone()];
+        let found = clashes(&config);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("[hotkeys] speak")
+                && found[0].contains("agents 'jarvis' new_session_hotkey"),
+            "{}",
+            found[0]
+        );
+
+        config.hotkeys = None;
+        jarvis.new_session_hotkey = Some("Super+Shift+J".to_string());
+        config.agents = vec![jarvis.clone()];
+        let found = clashes(&config);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("agents 'jarvis' hotkey")
+                && found[0].contains("agents 'jarvis' new_session_hotkey"),
+            "{}",
+            found[0]
+        );
+
+        jarvis.new_session_hotkey = Some("Super+Shift+N".to_string());
+        config.agents = vec![jarvis];
+        assert!(clashes(&config).is_empty());
     }
 
     #[test]
@@ -5490,6 +5543,7 @@ mod tests {
     fn agent_keys_are_not_unknown() {
         let unknown = unknown_config_keys(
             "[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+Shift+J\"\nharness = \"claude\"\n\
+             new_session_hotkey = \"Super+Shift+N\"\n\
              dir = \"~/Projects/whisrs\"\npermissions = \"ask\"\ncommand = \"claude\"\n\
              args = [\"--remote-control\", \"jarvis\"]\nreply_instruction = \"Be brief.\"\n",
         );

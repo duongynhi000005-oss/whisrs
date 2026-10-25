@@ -9,11 +9,15 @@
 //!   request and reused on every resume, so it is passed once.
 //! - Next turn: refused while `claude agents` shows the session `working` (it
 //!   runs on its own, and stopping it would lose that work). Otherwise
-//!   `claude stop <bg id>` while its process is alive, then `claude --bg
-//!   --resume <session id> -- <text>`, which keeps the session id and the
-//!   saved options (`--settings` included). Any other flag would start a copy.
-//!   A resume that starts a copy anyway prints another bg id; the copy's ids
-//!   replace the old ones.
+//!   `claude stop <bg id>` while its process is alive, a wait until `claude
+//!   agents` lists it with no pid and the process it listed has exited
+//!   (`claude stop` returns, and the listing drops the pid, before Claude
+//!   Code settles the session), then `claude --bg --resume <session id> --
+//!   <text>`, which keeps the session id and the saved options (`--settings`
+//!   and `--remote-control` included). Any other flag, or a resume while the
+//!   old process still runs, starts a copy without them. A copy is never
+//!   adopted: it is stopped and removed, and the resume is tried once more
+//!   after the old process is gone; a second copy fails the turn.
 //! - Turn end: the `Stop` hook (`whisrs agent-hook`, installed through
 //!   `--settings` on whisrs-started sessions only) carries
 //!   `last_assistant_message`. Only a `Stop` received after this turn's launch
@@ -56,8 +60,35 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(90);
 /// `claude agents --json --all` and `claude stop`.
 const QUICK_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// `claude agents --json --all` for `whisrs agent`, which waits on it.
+/// `claude agents --json --all` for `whisrs agent`, which waits on it, and
+/// for each check of a stopped session.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a stopped session is listed until its process is gone.
+const STOP_POLL: Duration = Duration::from_millis(250);
+
+/// How long a stopped session's process may take to exit. `claude stop`
+/// returns, and `claude agents` drops the pid, before the process exits and
+/// Claude Code settles the session (measured on 2.1.301: up to two seconds
+/// after the stop), and a resume that lands first makes it start a copy.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// How often the listed process of a stopped session is checked once the
+/// listing no longer shows it.
+const EXIT_POLL: Duration = Duration::from_millis(50);
+
+/// How long after that process exited a resume waits, for Claude Code to
+/// settle the session (logged within milliseconds of the exit, measured).
+const SETTLE_GRACE: Duration = Duration::from_millis(250);
+
+/// Resumes tried before a turn that only ever starts copies is given up.
+const RESUME_ATTEMPTS: u32 = 2;
+
+/// The error for a turn whose session's last process was still running
+/// [`STOP_WAIT`] after `claude stop`: resuming then would start a copy.
+pub const STOP_TIMEOUT: &str =
+    "Claude Code did not stop the session's last run in time, so this turn was not sent. \
+     Try it again in a moment.";
 
 /// How long a `done` poll waits for the `Stop` hook before reading the
 /// transcript instead. Hook events keep being handled meanwhile.
@@ -92,6 +123,12 @@ pub struct ClaudeDriver {
     hook_command: String,
     poll_interval: Duration,
     done_grace: Duration,
+    /// How often, and how long, a stopped session is waited for, how often
+    /// its process is checked, and the grace after it exited.
+    stop_poll: Duration,
+    stop_wait: Duration,
+    exit_poll: Duration,
+    settle_grace: Duration,
     /// Launch `--bg` in a scope of its own ([`in_service_unit`]).
     use_scope: bool,
 }
@@ -104,6 +141,10 @@ impl ClaudeDriver {
             hook_command: hook_command(whisrs_bin, socket),
             poll_interval: POLL_INTERVAL,
             done_grace: DONE_GRACE,
+            stop_poll: STOP_POLL,
+            stop_wait: STOP_WAIT,
+            exit_poll: EXIT_POLL,
+            settle_grace: SETTLE_GRACE,
             use_scope: in_service_unit(),
         }
     }
@@ -207,6 +248,37 @@ pub fn parse_backgrounded(stdout: &str) -> Option<String> {
     })
 }
 
+/// The bg id of the copy a resume says it started instead of continuing in
+/// place (`note: session 1e897e6d is already running in the background, so
+/// this started a copy as 9e24892c. ...`, measured on 2.1.301).
+pub fn parse_copy_note(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (_, rest) = line.split_once("started a copy as ")?;
+        let id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        (!id.is_empty()).then_some(id)
+    })
+}
+
+/// Whether a resume started a copy instead of continuing in place: it
+/// printed another bg id than the session's, or said it started a copy. A
+/// copy comes back without the session's saved options (the `--settings`
+/// hooks, `--remote-control`, the permission mode), so it is never adopted.
+pub fn resumed_a_copy(expected_bg: Option<&str>, printed_bg: &str, copy_note: bool) -> bool {
+    copy_note || expected_bg.is_some_and(|expected| expected != printed_bg)
+}
+
+/// The error for a turn Claude Code would only run in a copy of the session.
+pub fn cannot_continue(agent: &Agent) -> String {
+    format!(
+        "Agent '{}': Claude Code could not continue the session, so this turn was not sent. \
+         `whisrs agent {} --new` starts a fresh one.",
+        agent.name, agent.name
+    )
+}
+
 /// One background session as `claude agents --json --all` lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedSession {
@@ -216,6 +288,9 @@ pub struct ListedSession {
     pub state: Option<String>,
     /// Its process is running (`pid` present).
     pub alive: bool,
+    /// That process. `claude agents` drops it at a stop before the process
+    /// has exited.
+    pub pid: Option<u32>,
     /// What a waiting session waits for (`permission prompt`, ...).
     pub waiting_for: Option<String>,
     /// `status` is `busy`: the session still runs something, a background
@@ -245,6 +320,10 @@ pub fn find_session(list: &[Value], bg_id: &str) -> Option<ListedSession> {
         session_id: text("sessionId"),
         state: text("state"),
         alive: entry.get("pid").is_some_and(|p| !p.is_null()),
+        pid: entry
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|p| u32::try_from(p).ok()),
         waiting_for: text("waitingFor"),
         busy: entry.get("status").and_then(Value::as_str) == Some("busy"),
     })
@@ -440,6 +519,22 @@ pub fn scope_unavailable(success: bool, stdout: &str, stderr: &str) -> bool {
                     .iter()
                     .any(|w| first.contains(w))
         })
+}
+
+/// The state letter of a `/proc/<pid>/stat` line (`R`, `S`, `Z`, ...): the
+/// field after the command name, which is in parentheses and may contain
+/// spaces and parentheses itself.
+pub fn stat_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
+}
+
+/// Whether process `pid` still runs. A zombie (exited, not reaped yet) does
+/// not.
+fn process_running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat_state(&stat))
+        .is_some_and(|state| !matches!(state, 'Z' | 'X' | 'x'))
 }
 
 /// What a hook payload means to a turn.
@@ -763,8 +858,15 @@ async fn learn_session(agent: &Agent, bg_id: &str) -> Result<ListedSession, Stri
     ))
 }
 
+/// What a `claude --bg` launch printed.
+struct Launch {
+    bg_id: String,
+    /// It said it started a copy ([`parse_copy_note`]).
+    copy_note: bool,
+}
+
 /// Launch `args` and return the bg id it printed.
-async fn launch(agent: &Agent, args: &[String], use_scope: bool) -> Result<String, String> {
+async fn launch(agent: &Agent, args: &[String], use_scope: bool) -> Result<Launch, String> {
     let out = run_launch(agent, args, use_scope).await?;
     for line in out.stderr.lines().filter(|l| !l.trim().is_empty()) {
         info!("agent '{}': claude: {}", agent.name, line.trim());
@@ -772,14 +874,18 @@ async fn launch(agent: &Agent, args: &[String], use_scope: bool) -> Result<Strin
     if !out.success {
         return Err(launch_failure(agent, &out.stdout, &out.stderr));
     }
-    parse_backgrounded(&out.stdout).ok_or_else(|| {
+    let bg_id = parse_backgrounded(&out.stdout).ok_or_else(|| {
         format!(
             "Agent '{}': `{} --bg` printed no session id: {}",
             agent.name,
             agent.command,
             out.stdout.trim()
         )
-    })
+    })?;
+    let copy_note = parse_copy_note(&out.stderr)
+        .or_else(|| parse_copy_note(&out.stdout))
+        .is_some();
+    Ok(Launch { bg_id, copy_note })
 }
 
 /// `claude stop <bg id>`.
@@ -797,22 +903,68 @@ async fn stop_bg(agent: &Agent, bg_id: &str) -> Result<(), String> {
     }
 }
 
+/// Stop and remove a copy a resume started. Its bg id came from our own
+/// launch's output, so it is ours; nothing else is ever removed.
+async fn discard_copy(agent: &Agent, bg_id: &str) {
+    if let Err(e) = stop_bg(agent, bg_id).await {
+        debug!("agent '{}': {e}", agent.name);
+    }
+    let args = ["rm".to_string(), bg_id.to_string()];
+    match run_claude(agent, &args, QUICK_TIMEOUT).await {
+        Ok(out) if out.success => info!("agent '{}': removed the copy {bg_id}", agent.name),
+        Ok(out) => warn!(
+            "agent '{}': `claude rm {bg_id}` failed: {}",
+            agent.name,
+            out.stderr.trim()
+        ),
+        Err(e) => warn!("agent '{}': {e}", agent.name),
+    }
+}
+
+/// How a launch ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Launched {
+    /// The session runs: its bg id, and the ids reported.
+    Running(String, SessionRef),
+    /// A resume started a copy (its bg id), already stopped and removed and
+    /// never reported.
+    Copy(String),
+}
+
 /// A launch that runs on a task of its own, so stopping the turn cannot cut
 /// it off between starting a session and reporting it. The bg id is
 /// reported (`base` with that bg id) as soon as it is printed, before the
 /// session id is looked up, so `--stop` and a restart know it. When the turn
 /// was stopped meanwhile, the launch stops the session it started.
+///
+/// `resume_of` is the session a resume continues: a copy of it
+/// ([`resumed_a_copy`]) is stopped and removed on the same task, so a stop
+/// of the turn cannot leave it running, and is never reported.
 async fn launch_reported(
     agent: &Agent,
     args: Vec<String>,
     base: SessionRef,
     updates: &TurnUpdates,
     use_scope: bool,
-) -> Result<(String, SessionRef), String> {
+    resume_of: Option<&SessionRef>,
+) -> Result<Launched, String> {
     let agent = agent.clone();
     let updates = updates.clone();
+    let resume_of = resume_of.cloned();
     let task = tokio::spawn(async move {
-        let bg_id = launch(&agent, &args, use_scope).await?;
+        let Launch { bg_id, copy_note } = launch(&agent, &args, use_scope).await?;
+        if let Some(original) = &resume_of {
+            if resumed_a_copy(original.bg_id.as_deref(), &bg_id, copy_note) {
+                warn!(
+                    "agent '{}': resuming {} started a copy (bg {bg_id}) instead of continuing \
+                     in place; stopping and removing the copy",
+                    agent.name,
+                    describe(original)
+                );
+                discard_copy(&agent, &bg_id).await;
+                return Ok(Launched::Copy(bg_id));
+            }
+        }
         let mut session = base;
         session.bg_id = Some(bg_id.clone());
         if updates.report_session(session.clone()) {
@@ -825,10 +977,28 @@ async fn launch_reported(
             }
             return Err(format!("Agent '{}': the turn was stopped.", agent.name));
         }
-        Ok((bg_id, session))
+        Ok(Launched::Running(bg_id, session))
     });
     task.await
         .map_err(|e| format!("the launch task failed: {e}"))?
+}
+
+/// A session for the log: its id, else its bg id.
+fn describe(session: &SessionRef) -> String {
+    match (&session.session_id, &session.bg_id) {
+        (Some(id), _) => format!("session {id}"),
+        (None, Some(bg)) => format!("bg {bg}"),
+        (None, None) => "the session".to_string(),
+    }
+}
+
+/// What `claude agents` showed once a stopped session's process was gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stopped {
+    /// Listed with no process: a resume continues it in place.
+    Exited,
+    /// No longer listed (`claude rm`).
+    Gone,
 }
 
 impl ClaudeDriver {
@@ -841,15 +1011,21 @@ impl ClaudeDriver {
     ) -> Result<(SessionRef, Instant), TurnOutcome> {
         let settings = hook_settings(&self.hook_command);
         let launched_at = Instant::now();
-        let (bg_id, mut session) = launch_reported(
+        let launched = launch_reported(
             agent,
             first_turn_args(agent, &settings, text),
             SessionRef::default(),
             updates,
             self.use_scope,
+            None,
         )
         .await
         .map_err(TurnOutcome::Failed)?;
+        let (bg_id, mut session) = match launched {
+            Launched::Running(bg_id, session) => (bg_id, session),
+            // Only a resume is checked for a copy.
+            Launched::Copy(_) => return Err(TurnOutcome::Failed(cannot_continue(agent))),
+        };
         match learn_session(agent, &bg_id).await {
             Ok(listed) => {
                 session.session_id = listed.session_id;
@@ -865,10 +1041,87 @@ impl ClaudeDriver {
         Ok((session, launched_at))
     }
 
+    /// Wait until `claude agents` lists `bg_id` with no pid and every
+    /// process it listed for it (`pids`, and any seen meanwhile) has exited,
+    /// for at most `stop_wait`. `claude stop` returns, and the listing drops
+    /// the pid, before the process exits and Claude Code settles the session
+    /// (measured on 2.1.301: up to two seconds), and a resume that lands
+    /// first makes it start a copy. A failed listing counts as still
+    /// running.
+    async fn wait_for_exit(
+        &self,
+        agent: &Agent,
+        bg_id: &str,
+        mut pids: Vec<u32>,
+    ) -> Result<Stopped, String> {
+        let started = Instant::now();
+        loop {
+            match list_sessions_within(agent, LIST_TIMEOUT).await {
+                Ok(list) => match find_session(&list, bg_id) {
+                    None => return Ok(Stopped::Gone),
+                    Some(listed) if !listed.alive => {
+                        // Unlisted, but maybe still running: check the
+                        // processes themselves, cheaply and often.
+                        while pids.iter().any(|&pid| process_running(pid)) {
+                            if started.elapsed() >= self.stop_wait {
+                                break;
+                            }
+                            tokio::time::sleep(self.exit_poll).await;
+                        }
+                        if !pids.iter().any(|&pid| process_running(pid)) {
+                            debug!(
+                                "agent '{}': bg {bg_id} exited {} ms after the stop",
+                                agent.name,
+                                started.elapsed().as_millis()
+                            );
+                            tokio::time::sleep(self.settle_grace).await;
+                            return Ok(Stopped::Exited);
+                        }
+                    }
+                    Some(listed) => {
+                        if let Some(pid) = listed.pid.filter(|p| !pids.contains(p)) {
+                            pids.push(pid);
+                        }
+                    }
+                },
+                Err(e) => debug!("agent '{}': {e}", agent.name),
+            }
+            if started.elapsed() >= self.stop_wait {
+                warn!(
+                    "agent '{}': bg {bg_id} still runs {} s after `claude stop`; the turn is \
+                     not sent",
+                    agent.name,
+                    self.stop_wait.as_secs()
+                );
+                return Err(format!("Agent '{}': {STOP_TIMEOUT}", agent.name));
+            }
+            tokio::time::sleep(self.stop_poll).await;
+        }
+    }
+
+    /// `claude stop <bg id>`, then [`ClaudeDriver::wait_for_exit`] for it
+    /// and `pid`, the process the listing showed before the stop. Stopping
+    /// a stopped session is harmless.
+    async fn stop_and_wait(
+        &self,
+        agent: &Agent,
+        bg_id: &str,
+        pid: Option<u32>,
+    ) -> Result<Stopped, String> {
+        if let Err(e) = stop_bg(agent, bg_id).await {
+            debug!("agent '{}': {e}", agent.name);
+        }
+        self.wait_for_exit(agent, bg_id, pid.into_iter().collect())
+            .await
+    }
+
     /// A later turn: refused ([`TurnOutcome::Busy`]) while the session works
-    /// on its own; otherwise stop the old process if it is alive, then
-    /// resume. Returns the session and when the resume was spawned: hook
-    /// events received earlier are the old process's.
+    /// on its own; otherwise stop the old process if it is alive and wait
+    /// until it is gone, then resume. A resume that starts a copy anyway is
+    /// never adopted: the copy is stopped and removed, the old process is
+    /// waited for again and the resume is tried once more; a second copy
+    /// fails the turn. Returns the session and when the resume was spawned:
+    /// hook events received earlier are the old process's.
     async fn next_turn(
         &self,
         agent: &Agent,
@@ -877,8 +1130,10 @@ impl ClaudeDriver {
         updates: &TurnUpdates,
     ) -> Result<(SessionRef, Instant), TurnOutcome> {
         let mut session_id = session.session_id.clone();
+        // The process the listing showed for the session before the stop.
+        let mut pid = None;
         if let Some(bg_id) = &session.bg_id {
-            match list_sessions(agent).await {
+            let alive = match list_sessions(agent).await {
                 Ok(list) => match find_session(&list, bg_id) {
                     Some(listed) => {
                         if session_id.is_none() {
@@ -892,11 +1147,8 @@ impl ClaudeDriver {
                             );
                             return Err(TurnOutcome::Busy);
                         }
-                        if listed.alive {
-                            if let Err(e) = stop_bg(agent, bg_id).await {
-                                warn!("agent '{}': {e}", agent.name);
-                            }
-                        }
+                        pid = listed.pid;
+                        listed.alive
                     }
                     None => {
                         // Removed (`claude rm`): a resume would come back
@@ -909,12 +1161,24 @@ impl ClaudeDriver {
                         return self.first_turn(agent, text, updates).await;
                     }
                 },
-                // Cannot tell: stopping a stopped session is harmless.
+                // Cannot tell: stop it and wait, as if it ran.
                 Err(e) => {
                     debug!("agent '{}': {e}", agent.name);
-                    if let Err(e) = stop_bg(agent, bg_id).await {
-                        debug!("agent '{}': {e}", agent.name);
-                    }
+                    true
+                }
+            };
+            if alive {
+                let stopped = self
+                    .stop_and_wait(agent, bg_id, pid)
+                    .await
+                    .map_err(TurnOutcome::Failed)?;
+                if stopped == Stopped::Gone {
+                    info!(
+                        "agent '{}': session {} was removed while it stopped; starting a new one",
+                        agent.name,
+                        session_id.as_deref().unwrap_or(bg_id)
+                    );
+                    return self.first_turn(agent, text, updates).await;
                 }
             }
         }
@@ -925,36 +1189,53 @@ impl ClaudeDriver {
             session_id: Some(session_id.clone()),
             ..session.clone()
         };
-        let launched_at = Instant::now();
-        let (bg_id, resumed) = launch_reported(
-            agent,
-            resume_args(&session_id, text),
-            base,
-            updates,
-            self.use_scope,
-        )
-        .await
-        .map_err(TurnOutcome::Failed)?;
-        if session.bg_id.as_deref() == Some(bg_id.as_str()) {
-            return Ok((resumed, launched_at));
-        }
-        // A copy: Claude Code could not continue in place.
-        let listed = learn_session(agent, &bg_id)
+        let mut attempt = 1;
+        loop {
+            let launched_at = Instant::now();
+            let launched = launch_reported(
+                agent,
+                resume_args(&session_id, text),
+                base.clone(),
+                updates,
+                self.use_scope,
+                Some(&base),
+            )
             .await
             .map_err(TurnOutcome::Failed)?;
-        warn!(
-            "agent '{}': resume started a copy: session {} (bg {bg_id}) replaces {session_id}",
-            agent.name,
-            listed.session_id.as_deref().unwrap_or("?")
-        );
-        Ok((
-            SessionRef {
-                session_id: listed.session_id,
-                bg_id: Some(bg_id),
-                transcript_path: None,
-            },
-            launched_at,
-        ))
+            let copy = match launched {
+                Launched::Running(_, resumed) => return Ok((resumed, launched_at)),
+                Launched::Copy(copy) => copy,
+            };
+            if attempt >= RESUME_ATTEMPTS {
+                warn!(
+                    "agent '{}': resume {attempt} of session {session_id} started a copy too \
+                     (bg {copy}); the turn is not sent",
+                    agent.name
+                );
+                return Err(TurnOutcome::Failed(cannot_continue(agent)));
+            }
+            attempt += 1;
+            // Claude Code still saw the old process running: wait for it
+            // to be gone, then resume once more.
+            if let Some(bg_id) = &session.bg_id {
+                let stopped = self
+                    .stop_and_wait(agent, bg_id, pid)
+                    .await
+                    .map_err(TurnOutcome::Failed)?;
+                if stopped == Stopped::Gone {
+                    info!(
+                        "agent '{}': session {session_id} was removed meanwhile; starting a \
+                         new one",
+                        agent.name
+                    );
+                    return self.first_turn(agent, text, updates).await;
+                }
+            }
+            info!(
+                "agent '{}': resuming session {session_id} once more",
+                agent.name
+            );
+        }
     }
 
     /// Wait for the turn of `session` to end. Hook events received before
@@ -1283,6 +1564,7 @@ mod tests {
         Agent {
             name: "jarvis".into(),
             hotkey: None,
+            new_session_hotkey: None,
             harness: Harness::Claude,
             dir: PathBuf::from("/proj"),
             permissions,
@@ -1434,6 +1716,7 @@ mod tests {
                 session_id: Some("cc7a37cf-9343".into()),
                 state: Some("done".into()),
                 alive: true,
+                pid: Some(1690246),
                 waiting_for: None,
                 busy: false,
             })
@@ -1476,6 +1759,7 @@ mod tests {
             session_id: None,
             state: Some(state.into()),
             alive,
+            pid: alive.then_some(1),
             waiting_for: None,
             busy: false,
         };
@@ -1736,8 +2020,38 @@ not json
     // `watch` against a fake `claude`
     // -----------------------------------------------------------------------
 
-    /// A temp dir with a fake `claude` that answers `agents --json --all`
-    /// with `list.json` and logs every call to `calls.log`.
+    /// The fake `claude`: logs every call to `calls.log`; `agents` prints
+    /// `list.json`, or after a `stop` (when `list-stopped.json` exists)
+    /// `list.json` for as many more calls as `alive-after-stop` says, then
+    /// `list-stopped.json`; the n-th `--bg` prints `bg-<n>.out` (and
+    /// `bg-<n>.err` on stderr) when present, else a launch of `abc12345`.
+    const FAKE_CLAUDE: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+echo "$*" >> "$d/calls.log"
+case "$1" in
+  agents)
+    if [ -f "$d/stopped" ] && [ -f "$d/list-stopped.json" ]; then
+      n=$(cat "$d/stopped")
+      if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$d/stopped"; cat "$d/list.json"
+      else cat "$d/list-stopped.json"; fi
+    else
+      cat "$d/list.json"
+    fi ;;
+  stop)
+    if [ -f "$d/alive-after-stop" ]; then cp "$d/alive-after-stop" "$d/stopped"
+    else echo 0 > "$d/stopped"; fi
+    echo "stopped $2" ;;
+  rm) echo "removed $2" ;;
+  --bg)
+    n=$(cat "$d/bg.count" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$d/bg.count"
+    [ -f "$d/bg-$n.err" ] && cat "$d/bg-$n.err" >&2
+    if [ -f "$d/bg-$n.out" ]; then cat "$d/bg-$n.out"
+    else printf 'backgrounded \302\267 abc12345 \302\267 whisrs-jarvis\n'; fi ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    /// A temp dir with [`FAKE_CLAUDE`] in it.
     struct FakeClaude {
         dir: tempfile::TempDir,
     }
@@ -1746,18 +2060,26 @@ not json
         fn new(list: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script = dir.path().join("claude");
-            std::fs::write(
-                &script,
-                "#!/bin/sh\nd=$(dirname \"$0\")\necho \"$*\" >> \"$d/calls.log\"\ncase \"$1\" in\n  \
-                 agents) cat \"$d/list.json\" ;;\n  stop) echo \"stopped $2\" ;;\n  \
-                 --bg) printf 'backgrounded \\302\\267 abc12345 \\302\\267 whisrs-jarvis\\n' ;;\n  \
-                 *) exit 1 ;;\nesac\n",
-            )
-            .unwrap();
+            // Written by `cp`, not by this process: a test thread that forks
+            // while this process holds the script open for writing would
+            // make running it fail with ETXTBSY ("Text file busy").
+            let source = dir.path().join("claude.src");
+            std::fs::write(&source, FAKE_CLAUDE).unwrap();
+            let copied = std::process::Command::new("cp")
+                .arg(&source)
+                .arg(&script)
+                .status()
+                .unwrap();
+            assert!(copied.success());
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::write(dir.path().join("list.json"), list).unwrap();
             std::fs::write(dir.path().join("transcript.jsonl"), "").unwrap();
             Self { dir }
+        }
+
+        /// Write `name` in the fake's dir.
+        fn file(&self, name: &str, contents: &str) {
+            std::fs::write(self.dir.path().join(name), contents).unwrap();
         }
 
         fn agent(&self) -> Agent {
@@ -1790,9 +2112,17 @@ not json
             hook_command: "true".into(),
             poll_interval: poll,
             done_grace: grace,
+            stop_poll: Duration::from_millis(5),
+            stop_wait: Duration::from_secs(5),
+            exit_poll: Duration::from_millis(5),
+            settle_grace: Duration::from_millis(1),
             use_scope: false,
         }
     }
+
+    /// A pid no process has (above any `pid_max`): a listed session whose
+    /// process exits the moment it is stopped.
+    const GONE_PID: u32 = 999_999_999;
 
     fn entry(pid: Option<u32>, state: &str) -> String {
         let pid = pid.map(|p| format!("\"pid\":{p},")).unwrap_or_default();
@@ -1818,7 +2148,7 @@ not json
     /// such (spoken as a follow-up), not dropped.
     #[tokio::test]
     async fn a_stop_from_before_the_launch_is_not_the_reply() {
-        let fake = FakeClaude::new(&entry(Some(1), "working"));
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "working"));
         let driver = fast_driver(Duration::from_secs(3600), DONE_GRACE);
         let (hooks_tx, mut hooks) = mpsc::unbounded_channel();
         let (updates, mut rx) = TurnUpdates::channel();
@@ -1908,7 +2238,7 @@ not json
     /// turn ends as interrupted.
     #[tokio::test]
     async fn done_without_text_ends_as_interrupted() {
-        let fake = FakeClaude::new(&entry(Some(1), "done"));
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
         let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(5));
         let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
         let (updates, _rx) = TurnUpdates::channel();
@@ -1943,7 +2273,7 @@ not json
     /// came) is the reply.
     #[tokio::test]
     async fn done_reads_the_transcript_when_the_hook_is_missing() {
-        let fake = FakeClaude::new(&entry(Some(1), "done"));
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
         let since = Utc::now() - chrono::Duration::seconds(5);
         let line = format!(
             r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"text","text":"from the transcript"}}]}}}}"#,
@@ -1978,7 +2308,7 @@ not json
     /// still handled (the permission prompt is announced), not swallowed.
     #[tokio::test]
     async fn the_done_grace_keeps_handling_hooks() {
-        let fake = FakeClaude::new(&entry(Some(1), "done"));
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
         let driver = fast_driver(Duration::from_millis(30), Duration::from_secs(3));
         let (hooks_tx, mut hooks) = mpsc::unbounded_channel();
         let (updates, mut rx) = TurnUpdates::channel();
@@ -2059,6 +2389,7 @@ not json
             SessionRef::default(),
             &updates,
             false,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -2066,15 +2397,18 @@ not json
         // Not stopped: the bg id is reported and nothing is stopped.
         let fake = FakeClaude::new("[]");
         let (updates, _rx) = TurnUpdates::channel();
-        let (bg_id, session) = launch_reported(
+        let Launched::Running(bg_id, session) = launch_reported(
             &fake.agent(),
             vec!["--bg".into(), "--".into(), "hi".into()],
             SessionRef::default(),
             &updates,
             false,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap() else {
+            panic!("a first launch is never a copy");
+        };
         assert_eq!(bg_id, "abc12345");
         assert_eq!(updates.stop(), Some(session));
         assert!(!fake.calls().contains("stop"), "{}", fake.calls());
@@ -2084,7 +2418,7 @@ not json
     /// works on its own.
     #[tokio::test]
     async fn a_working_session_is_not_stopped_for_a_new_turn() {
-        let fake = FakeClaude::new(&entry(Some(1), "working"));
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "working"));
         let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
         let (updates, _rx) = TurnUpdates::channel();
         let result = driver
@@ -2094,7 +2428,8 @@ not json
         assert!(!fake.calls().contains("stop"), "{}", fake.calls());
         // Done with a background task still running (`status: busy`): the
         // same refusal, so the task is not killed by the stop.
-        let busy = entry(Some(1), "done").replace(r#""state":"#, r#""status":"busy","state":"#);
+        let busy =
+            entry(Some(GONE_PID), "done").replace(r#""state":"#, r#""status":"busy","state":"#);
         let fake_busy = FakeClaude::new(&busy);
         let result = driver
             .next_turn(&fake_busy.agent(), &fake_busy.session(), "next", &updates)
@@ -2106,7 +2441,8 @@ not json
             Ok(AgentPhase::Working)
         );
         // Done: stopped, then resumed.
-        let fake = FakeClaude::new(&entry(Some(1), "done"));
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
+        fake.file("list-stopped.json", &entry(None, "done"));
         let (updates, _rx) = TurnUpdates::channel();
         let (session, _) = driver
             .next_turn(&fake.agent(), &fake.session(), "next", &updates)
@@ -2123,6 +2459,213 @@ not json
             driver.session_phase(&fake.agent(), &fake.session()).await,
             Ok(AgentPhase::Idle)
         );
+    }
+
+    /// The calls of the fake after the first one that starts with `prefix`.
+    fn calls_after(calls: &str, prefix: &str) -> Vec<String> {
+        calls
+            .lines()
+            .skip_while(|l| !l.starts_with(prefix))
+            .skip(1)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `claude stop` returns before the old process is killed: the resume
+    /// waits until `claude agents` lists the session with no process, so it
+    /// continues in place instead of starting a copy (a copy loses the
+    /// hooks and `--remote-control`).
+    #[tokio::test]
+    async fn a_resume_waits_for_the_stopped_process_to_exit() {
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
+        fake.file("list-stopped.json", &entry(None, "done"));
+        fake.file("alive-after-stop", "3");
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let (updates, _rx) = TurnUpdates::channel();
+        let (session, _) = driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await
+            .unwrap();
+        assert_eq!(session.bg_id.as_deref(), Some("abc12345"));
+        let calls = fake.calls();
+        let after_stop = calls_after(&calls, "stop abc12345");
+        // Three listings still show the process, the fourth shows it gone,
+        // and only then is the session resumed.
+        assert_eq!(
+            after_stop,
+            [
+                "agents --json --all",
+                "agents --json --all",
+                "agents --json --all",
+                "agents --json --all",
+                "--bg --resume abc12345-1111 -- next",
+            ],
+            "{calls}"
+        );
+    }
+
+    /// `claude agents` drops the pid at the stop, before the process has
+    /// exited and Claude Code settled the session (measured): the resume
+    /// waits for the listed process itself.
+    #[tokio::test]
+    async fn a_resume_waits_for_the_listed_process_itself() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.4")
+            .spawn()
+            .unwrap();
+        let fake = FakeClaude::new(&entry(Some(child.id()), "done"));
+        fake.file("list-stopped.json", &entry(None, "done"));
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let (updates, _rx) = TurnUpdates::channel();
+        let started = Instant::now();
+        driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "resumed {} ms in, while the process still ran",
+            started.elapsed().as_millis()
+        );
+        // It exited (a zombie until now: exited counts, reaped or not).
+        assert!(child.try_wait().unwrap().is_some());
+        let calls = fake.calls();
+        assert_eq!(
+            calls_after(&calls, "stop abc12345"),
+            ["agents --json --all", "--bg --resume abc12345-1111 -- next"],
+            "{calls}"
+        );
+    }
+
+    #[test]
+    fn the_process_state_is_read_after_the_command_name() {
+        assert_eq!(stat_state("2971692 (claude) S 2971682 1 1 0"), Some('S'));
+        assert_eq!(stat_state("42 (a (weird) name) Z 1 0"), Some('Z'));
+        assert_eq!(stat_state("garbage"), None);
+        assert!(process_running(std::process::id()));
+        assert!(!process_running(GONE_PID));
+    }
+
+    /// A stopped process that never exits fails the turn after the cap
+    /// instead of resuming into a copy.
+    #[tokio::test]
+    async fn a_stop_that_never_lands_fails_the_turn() {
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
+        let mut driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        driver.stop_wait = Duration::from_millis(100);
+        let (updates, _rx) = TurnUpdates::channel();
+        let result = driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await;
+        assert_eq!(
+            result.unwrap_err(),
+            TurnOutcome::Failed(format!("Agent 'jarvis': {STOP_TIMEOUT}"))
+        );
+        assert!(!fake.calls().contains("--bg"), "{}", fake.calls());
+        assert_eq!(
+            crate::agent::spoken::spoken_error(&format!("Agent 'jarvis': {STOP_TIMEOUT}")),
+            "Claude Code did not stop the session's last run in time, so this turn was not sent."
+        );
+    }
+
+    /// The note Claude Code prints when a resume ran in a copy.
+    const COPY_NOTE: &str = "note: session abc12345 is already running in the background, so \
+         this started a copy as copy0001. `claude attach abc12345` opens the original.\n";
+
+    /// A resume that starts a copy anyway: the copy is stopped and removed
+    /// (never reported, never adopted), the original is waited for again,
+    /// and the second resume continues in place.
+    #[tokio::test]
+    async fn a_copy_is_removed_and_the_resume_tried_once_more() {
+        let fake = FakeClaude::new(&entry(Some(GONE_PID), "done"));
+        fake.file("list-stopped.json", &entry(None, "done"));
+        fake.file(
+            "bg-1.out",
+            "backgrounded \u{b7} copy0001 \u{b7} whisrs-jarvis\n",
+        );
+        fake.file("bg-1.err", COPY_NOTE);
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let (updates, mut rx) = TurnUpdates::channel();
+        let (session, _) = driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await
+            .unwrap();
+        assert_eq!(session, fake.session());
+        let calls = fake.calls();
+        let resumes = calls
+            .lines()
+            .filter(|l| l.starts_with("--bg --resume abc12345-1111"))
+            .count();
+        assert_eq!(resumes, 2, "{calls}");
+        let after_copy = calls_after(&calls, "--bg --resume");
+        assert_eq!(after_copy[0], "stop copy0001", "{calls}");
+        assert_eq!(after_copy[1], "rm copy0001", "{calls}");
+        // The original is stopped (harmless when dead) and waited for again.
+        assert_eq!(after_copy[2], "stop abc12345", "{calls}");
+        assert_eq!(after_copy[3], "agents --json --all", "{calls}");
+        // Only the original's ids were ever reported.
+        while let Ok(update) = rx.try_recv() {
+            if let TurnUpdate::Session(s) = update {
+                assert_eq!(s.bg_id.as_deref(), Some("abc12345"), "{s:?}");
+            }
+        }
+        // A copy is also told by its bg id alone, with no note.
+        let fake = FakeClaude::new(&entry(None, "done"));
+        fake.file(
+            "bg-1.out",
+            "backgrounded \u{b7} copy0001 \u{b7} whisrs-jarvis\n",
+        );
+        let (updates, _rx) = TurnUpdates::channel();
+        driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await
+            .unwrap();
+        assert!(fake.calls().contains("rm copy0001"), "{}", fake.calls());
+    }
+
+    /// A second copy fails the turn and says how to go on; both copies are
+    /// stopped and removed.
+    #[tokio::test]
+    async fn a_second_copy_fails_the_turn() {
+        let fake = FakeClaude::new(&entry(None, "done"));
+        for n in 1..=2 {
+            fake.file(
+                &format!("bg-{n}.out"),
+                &format!("backgrounded \u{b7} copy000{n} \u{b7} whisrs-jarvis\n"),
+            );
+        }
+        let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
+        let (updates, mut rx) = TurnUpdates::channel();
+        let result = driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await;
+        let message = cannot_continue(&fake.agent());
+        assert_eq!(result.unwrap_err(), TurnOutcome::Failed(message.clone()));
+        assert!(message.contains("`whisrs agent jarvis --new`"), "{message}");
+        assert_eq!(
+            crate::agent::spoken::spoken_error(&message),
+            "Claude Code could not continue the session, so this turn was not sent."
+        );
+        let calls = fake.calls();
+        for copy in ["copy0001", "copy0002"] {
+            assert!(calls.contains(&format!("stop {copy}")), "{calls}");
+            assert!(calls.contains(&format!("rm {copy}")), "{calls}");
+        }
+        assert!(rx.try_recv().is_err(), "a copy was reported");
+    }
+
+    #[test]
+    fn a_copy_is_told_by_its_bg_id_or_its_note() {
+        assert_eq!(parse_copy_note(COPY_NOTE).as_deref(), Some("copy0001"));
+        assert_eq!(
+            parse_copy_note("note: woke session 9e24892c with its saved options (--model)."),
+            None
+        );
+        assert!(!resumed_a_copy(Some("abc12345"), "abc12345", false));
+        assert!(resumed_a_copy(Some("abc12345"), "copy0001", false));
+        assert!(resumed_a_copy(Some("abc12345"), "abc12345", true));
+        assert!(resumed_a_copy(None, "abc12345", true));
+        assert!(!resumed_a_copy(None, "abc12345", false));
     }
 
     /// A turn watched again after a restart that landed before its launch

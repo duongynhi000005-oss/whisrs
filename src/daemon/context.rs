@@ -37,6 +37,10 @@ pub(crate) struct LlmCommandContext {
 /// LLM rewrite; there is no selection.
 pub(crate) struct AgentRecordingContext {
     pub(crate) name: String,
+    /// The press that started it asked for a fresh session (`whisrs agent
+    /// <name> --new`, or its `new_session_hotkey`): the session is forgotten
+    /// when the transcript is ready, and the turn starts a new one.
+    pub(crate) new_session: bool,
 }
 
 /// Shared daemon state protected by a mutex.

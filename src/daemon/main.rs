@@ -322,7 +322,8 @@ async fn main() -> Result<()> {
 
     // Start global hotkey listener if configured — the fixed [hotkeys]
     // section, any [[llm_commands]] entry, or any [[agents]] entry with a
-    // hotkey (each carries its own hotkey independent of [hotkeys]).
+    // hotkey or a new_session_hotkey (each carries its own hotkeys
+    // independent of [hotkeys]).
     // Spawned as a background task so retries don't block the IPC server.
     if context.config.hotkeys.is_some()
         || !context.config.llm_commands.is_empty()

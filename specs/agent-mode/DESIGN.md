@@ -14,6 +14,7 @@ One PR covers every harness. Phase 1 is Claude Code and is tested by hand before
 [[agents]]
 name = "jarvis"                  # required, unique, [a-z0-9_-]
 hotkey = "Super+Shift+J"         # optional, same syntax as [hotkeys]
+new_session_hotkey = "Super+Shift+N"   # optional: a voice turn in a fresh session
 harness = "claude"               # claude (phase 1); opencode | codex | copilot (phase 2)
 dir = "~/Projects/whisrs"        # required, ~ expanded, must exist
 permissions = "auto"             # auto (default) | bypass | ask
@@ -32,6 +33,9 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 - Validation warns (and skips the entry) on a missing/duplicate name, unknown harness or
   missing dir; a hotkey clash is reported like the `[[llm_commands]]` clashes. Agents with
   `[tts] enabled = false` get one warning: replies arrive as notifications only.
+- `new_session_hotkey` has the syntax and clash checks of `hotkey` (it is one more binding
+  source, so it also clashes with the agent's own `hotkey`), and starts the hotkey listener on
+  its own.
 - `command` exists because a systemd user unit often lacks `~/.local/bin` on PATH. A spawn
   failure names it.
 
@@ -42,7 +46,9 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 | `whisrs agent` (list: name, harness, idle/working/needs-you, bg id) | `{"cmd":"agent","action":"list"}` → `Response::Agents` |
 | `whisrs agent <name>` (voice turn; same as the hotkey) | `{"cmd":"agent","action":"toggle","name":"…"}` |
 | `whisrs agent <name> --text "…"` (typed turn) | `{"cmd":"agent","action":"send","name":"…","text":"…"}` |
-| `whisrs agent <name> --new [--text "…"]` (forget the session; with text, start a new one) | `"action":"reset"` / `"send"` + `"new":true` |
+| `whisrs agent <name> --new` (voice turn in a fresh session; same as `new_session_hotkey`) | `"action":"toggle"` + `"new":true` |
+| `whisrs agent <name> --new --text "…"` (typed turn in a fresh session) | `"action":"send"` + `"new":true` |
+| `whisrs agent <name> --reset` (forget the session, send nothing) | `"action":"reset"` |
 | `whisrs agent <name> --stop` (stop the running turn, keep the session) | `"action":"stop"` |
 | `whisrs speak --text "…"` / `--text -` (stdin) | `{"cmd":"speak-text","text":"…"}` |
 | `whisrs agent-hook` (hidden; harness hook → daemon) | `{"cmd":"agent-event","payload":{…}}` |
@@ -73,7 +79,17 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
 2. **Toggle while Recording for this agent:** stop and transcribe. Recording for anything
    else: refuse as busy, like command mode.
 3. **Toggle while Speaking:** stop playback and start recording for this agent (barge-in, so
-   answering the agent's question is one press).
+   answering the agent's question is one press). Playback is checked before the busy check: a
+   press while an agent reply or notice plays stops it even while this agent's turn runs, and
+   is then refused with a notification only (no notice is queued in its place), so a press
+   always silences the agent. A selection read-aloud is not stopped for a refused press.
+   - **Fresh session (`--new`, `new_session_hotkey`):** records exactly like a toggle; the
+     recording remembers that its press asked for a fresh session
+     (`AgentRecordingContext::new_session`), and a second press of either kind stops it. When
+     the transcript is ready the session is forgotten (`reset`) and the turn starts a new one;
+     nothing to send forgets nothing. Refused while any whisrs turn of the agent runs (also one
+     that waits for you, which a plain press would answer), at the press and again at the
+     transcript.
 4. **Transcript ready:** start the turn on a spawned task. The state machine returns to Idle
    at once; dictation keeps working while the agent runs.
 5. **Turn ends:** reply text → spoken text (below) → spoken when the daemon is Idle and no
@@ -156,12 +172,26 @@ reply_instruction = "..."        # optional, replaces the built-in voice instruc
   daemon's. Passed with `--settings`, so only whisrs-started sessions have them; the user's
   own settings are untouched.
 - **Next turn:** refused while the session is listed `working` (above). Otherwise, if the bg
-  process is still alive, `claude stop <bg id>`, then `claude --bg --resume <session id> --
+  process is still alive, `claude stop <bg id>`, then wait until the session's row has no
+  `pid` and the process it listed has exited (`/proc/<pid>`, a zombie counts as exited),
+  checked every 250 ms (the process every 50 ms once the row lost its pid), plus 250 ms for
+  Claude Code to settle it, capped at ten seconds; then `claude --bg --resume <session id> --
   "<text>"` with no other flag: it "wakes" the session in place with its saved options
   (`--settings` hooks, `--remote-control`, `--model`...), while any flag passed with
   `--resume` makes Claude Code start a copy, which comes back without the hooks (measured).
-  A resume of a session that is still running (not stopped first) also starts a copy. If the
-  output names another bg id anyway, record the copy's ids and log it.
+  A resume of a session that is still running also starts a copy, and "running" lasts until
+  Claude Code settles the killed process: measured on 2.1.301, `claude stop` returns and the
+  listing drops the `pid` up to two seconds before the process exits and the daemon logs
+  `settled (killed)`; a resume in that window started a copy that kept none of whisrs's
+  flags (no `--remote-control`, no hooks, permission mode `auto`). A cap that is hit fails
+  the turn ("Claude Code did not stop the session's last run in time, so this turn was not
+  sent."). **A copy is never adopted:** a resume that prints another bg id, or says it
+  "started a copy as <id>", has that copy stopped and removed (`claude stop`, `claude rm`; its
+  id came from our own launch output, so it is ours) on the launch's own task, so a `--stop`
+  cannot leave it running, and never reported; the original is stopped and waited for again
+  and the resume tried once more. A second copy fails the turn: "Claude Code could not
+  continue the session, so this turn was not sent. `whisrs agent <name> --new` starts a fresh
+  one."
 - **Turn end:** the `Stop` event whose `session_id` matches carries `last_assistant_message`
   and `transcript_path`. Hook events carry when the daemon received them; for a resumed
   turn only a `Stop` received after the resume launch was spawned counts (the old process is
@@ -273,8 +303,9 @@ from its JSON output (`kill_on_drop`). Adding one must not change the runtime.
 5. A reply that lands while recording is spoken once the daemon is Idle. The agent hotkey
    while Speaking stops playback and starts recording.
 6. A press while that agent's turn runs is refused with a short notice; no second turn.
-7. `--stop`, `--new` and `whisrs agent` work. A turn in flight across a daemon restart is
-   still spoken after it.
+7. `--stop`, `--new`, `--reset`, `new_session_hotkey` and `whisrs agent` work. A turn in
+   flight across a daemon restart is still spoken after it. Resumed turns continue in place
+   (same session id, no copy, ended by the `Stop` hook, `--remote-control` kept).
 8. Missing binary, untrusted dir and a vanished session each give an actionable notification
    and leave the agent usable.
 9. Sessions whisrs did not start are never stopped, resumed or read.

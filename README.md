@@ -238,7 +238,7 @@ whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see conf
 whisrs llm-command-set <name>  # Reprogram a named LLM command from the current selection
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
 whisrs speak --text "Hi"       # Speak the given text (--text - reads stdin)
-whisrs agent jarvis            # Talk to a coding agent (see [[agents]]); --text, --new, --stop; no name lists them
+whisrs agent jarvis            # Talk to a coding agent (see [[agents]]); --text, --new, --reset, --stop; no name lists them
 whisrs recording start -t "Standup"   # Record mic + system audio; stop | toggle | cancel | status
 whisrs recording show last            # Print the latest recording's transcript (list | path | copy | retry)
 whisrs recording summarize last       # Summarize a transcript with the [llm] (or [recording] summary = true for each)
@@ -281,7 +281,7 @@ dir = "~/Projects/whisrs"
 permissions = "auto"   # auto | bypass | ask
 ```
 
-`whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn. Sessions show up in `claude agents` as `whisrs-<name>`, and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
+`whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn, and `whisrs agent jarvis --new` (or an optional `new_session_hotkey`) records one that starts a fresh session. Sessions show up in `claude agents` as `whisrs-<name>`, and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
 
 ---
 

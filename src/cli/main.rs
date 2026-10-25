@@ -111,9 +111,13 @@ enum SubCmd {
         /// stdin)
         #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         text: Option<String>,
-        /// Forget the session; with --text, start a new one with it
+        /// Start a fresh session: record a voice instruction for it (press
+        /// again, or the agent's hotkey, to stop and send), or send --text
         #[arg(long)]
         new: bool,
+        /// Forget the session and send nothing; the next turn starts a new one
+        #[arg(long, conflicts_with_all = ["text", "new", "stop"])]
+        reset: bool,
         /// Stop the running turn (or the session's own work) and keep the session
         #[arg(long, conflicts_with_all = ["text", "new"])]
         stop: bool,
@@ -427,9 +431,10 @@ async fn main() -> anyhow::Result<()> {
             name,
             text,
             new,
+            reset,
             stop,
         } => {
-            let cmd = match agent_command(name, text.map(text_arg), new, stop) {
+            let cmd = match agent_command(name, text.map(text_arg), new, reset, stop) {
                 Ok(cmd) => cmd,
                 Err(message) => exit_with_error(&message),
             };
@@ -584,16 +589,18 @@ fn text_arg(text: String) -> String {
     buf.trim_end().to_string()
 }
 
-/// The IPC command for `whisrs agent [<name>] [--text T] [--new] [--stop]`.
+/// The IPC command for `whisrs agent [<name>] [--text T] [--new] [--reset]
+/// [--stop]`.
 fn agent_command(
     name: Option<String>,
     text: Option<String>,
     new: bool,
+    reset: bool,
     stop: bool,
 ) -> Result<Command, String> {
     use whisrs::agent::AgentAction;
     let Some(name) = name else {
-        if text.is_some() || new || stop {
+        if text.is_some() || new || reset || stop {
             return Err("which agent? Pass its name: whisrs agent <name> ...".to_string());
         }
         return Ok(Command::Agent {
@@ -603,11 +610,11 @@ fn agent_command(
             new: false,
         });
     };
-    let (action, new) = match (&text, new, stop) {
-        (_, _, true) => (AgentAction::Stop, false),
-        (Some(_), new, false) => (AgentAction::Send, new),
-        (None, true, false) => (AgentAction::Reset, false),
-        (None, false, false) => (AgentAction::Toggle, false),
+    let (action, new) = match (&text, stop, reset) {
+        (_, true, _) => (AgentAction::Stop, false),
+        (_, _, true) => (AgentAction::Reset, false),
+        (Some(_), false, false) => (AgentAction::Send, new),
+        (None, false, false) => (AgentAction::Toggle, new),
     };
     Ok(Command::Agent {
         action,
@@ -1862,12 +1869,13 @@ mod tests {
             name,
             text,
             new,
+            reset,
             stop,
         } = cli.command
         else {
             panic!("not the agent subcommand");
         };
-        agent_command(name, text, new, stop)
+        agent_command(name, text, new, reset, stop)
     }
 
     #[test]
@@ -1905,8 +1913,13 @@ mod tests {
                 true
             )
         );
+        // --new alone is a voice turn in a fresh session.
         assert_eq!(
             action(&["jarvis", "--new"]),
+            (AgentAction::Toggle, Some("jarvis".into()), None, true)
+        );
+        assert_eq!(
+            action(&["jarvis", "--reset"]),
             (AgentAction::Reset, Some("jarvis".into()), None, false)
         );
         assert_eq!(
@@ -1919,6 +1932,14 @@ mod tests {
     fn agent_subcommand_rejects_contradictions() {
         assert!(parse_agent(&["jarvis", "--stop", "--new"]).is_err());
         assert!(parse_agent(&["jarvis", "--stop", "--text", "x"]).is_err());
+        for other in [&["--new"][..], &["--stop"], &["--text", "x"]] {
+            let mut args = vec!["jarvis", "--reset"];
+            args.extend_from_slice(other);
+            assert!(parse_agent(&args).is_err(), "{args:?}");
+        }
+        assert!(parse_agent(&["--reset"])
+            .unwrap_err()
+            .contains("which agent"));
         let err = parse_agent(&["--text", "x"]).unwrap_err();
         assert!(err.contains("which agent"), "{err}");
     }
