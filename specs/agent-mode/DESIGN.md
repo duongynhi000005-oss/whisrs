@@ -500,7 +500,7 @@ A harness whose turn is one process implements `TurnHarness`, every method requi
 `label` (for messages), `launch` (agent, session, request → `Launch`: the args after `command`,
 the prompt for stdin or `None` for `/dev/null`, extra env), `strips_env` (its parent-session
 variables), `events` (one stdout line → `StreamEvent`s: `Session(id)`, `Text { message, text }`,
-`Tool(name)`, `Error(message)`) and `stderr_failure` (a failure it recognizes in the last stderr
+`Tool(name)`, `Error(message)`, `RecoverableError(message)`) and `stderr_failure` (a failure it recognizes in the last stderr
 lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is the `Driver`:
 
 - **Spawn:** `command` in `dir`, own process group, `PWD` = dir, the daemon's environment minus
@@ -542,8 +542,8 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
   (`STDERR_LINE_MAX`) keeps its start, each with one warning per turn; neither is ever buffered
   whole. Reading ends when both pipes end and the process exited, or two seconds after the exit
   (a leftover process can hold stdout open).
-- **Outcome:** an `Error` event fails the turn ("Agent 'x': OpenCode failed: ..."); else the
-  reply (a non-zero exit after it is only logged); else "ended the turn without a reply" on exit
+- **Outcome:** an `Error` event fails the turn ("Agent 'x': OpenCode failed: ..."), and so does
+  a `RecoverableError` no `Text` came after; else the reply (a non-zero exit after it is only logged); else "ended the turn without a reply" on exit
   0, or what `stderr_failure` recognizes, or the stderr line that mentions an error (else its
   last), or the exit status.
 - **Stop:** SIGINT, SIGTERM, SIGKILL (`STOP_GRACES` 3 s, 2 s, 2 s), each only while something
@@ -728,13 +728,19 @@ Tested with the npm-packed `@github/copilot-linux-x64` 1.0.103 in offline BYOK m
 wrapper that also isolated `COPILOT_HOME`/`HOME`, emptied every GitHub token and config dir, made the
 keyring unreachable and sent any other request to a refusing local proxy: no account, no GitHub
 request (the proxy logged none), `premiumRequests: 0` on every run. With a GitHub account each turn
-uses the user's Copilot premium requests (AI credits), per Copilot's own billing.
+uses the user's Copilot plan's usage (AI credits, or premium requests on the legacy billing
+platform, as `copilot help billing` puts it), per Copilot's own billing.
 
 - **Every turn:** `copilot --output-format json --session-id=<id> <permissions> [args…]` for a new
   or pending session, `--resume=<id>` in its place once confirmed, the prompt on stdin: prompt mode
   reads stdin when there is no `-p` (verbatim, a leading `--`, `$HOME` and quotes as typed,
   measured), so the user's words are never in argv (`ps`). With `/dev/null` it exits 1 "No prompt
   provided". `--resume` and `--session-id` take `=`, since `--resume [<value>]` has an optional value.
+  A prompt that starts with `/` runs a Copilot command instead (read in the bundle, not run):
+  prompt mode passes it to `autopilotSlashCommandParse` (native) and `commands.invoke` (a slash
+  command or a skill), and `cyo` runs `/compact` on the trimmed prompt, so a leading space or newline
+  would not keep `/compact` from running. Not neutralized: whisrs passes the words as they are, and
+  the docs say so.
 - **Session id:** whisrs mints a version 4 UUID (`copilot::new_session_id`) and reports it at spawn,
   pending (see the base). `--session-id=<id>` starts a session with an id Copilot does not have and
   continues one it has (measured), so a pending session passes it again: a first turn stopped
@@ -769,16 +775,22 @@ uses the user's Copilot premium requests (AI credits), per Copilot's own billing
   rule wins over `--allow-all-tools` (so over the user's own allows too); `auto` =
   `--allow-all-tools` = shell and create run, outside still denied (URLs too); `bypass` = `--yolo` =
   everything. `ask` matches OpenCode's and Codex's: reads, no commands, no changes.
-- **Events:** `assistant.message` (not a sub-agent's: `data.parentToolCallId`) → `Text {
-  data.messageId, data.content }` (an empty one too, so an empty last message is no reply), and,
-  when it has `toolRequests`, `Tool(<first request>)` right after it, so a text written with a tool
-  call is an interim at once; `tool.execution_start` → `Tool(data.toolName)` (MCP:
-  `mcp__<mcpServerName>__<mcpToolName>`), deduplicated by the base; `session.error` →
-  `Error(data.message)` (a `remediation: "sign_in"` error gets "Run `copilot login` in a terminal");
-  `abort` → `Error("it was interrupted before it replied")`, since an interrupted turn prints
-  `result` with `exitCode: 0` and exits 0; `result` → `Session(sessionId)`. Retries
-  (`model.call_failure`, `assistant.turn_retry`, `session.info`) say nothing; `session.error` is the
-  last word of a failed turn (exit 1). Errors measured: HTTP 400 (`"400 <provider message>"`), a
+- **Events:** a sub-agent's event says nothing, whatever its type (`copilot::from_sub_agent`,
+  Copilot's own `nl`/`ms` test: a non-empty top-level `agentId`, else `data.agentId`, else the
+  deprecated `data.parentToolCallId`). `assistant.message` → `Text { data.messageId, data.content }`
+  (an empty one too, so an empty last message is no reply), and, when it has `toolRequests`,
+  `Tool(<first request>)` right after it, so a text written with a tool call is an interim at once;
+  `tool.execution_start` → `Tool(data.toolName)` (MCP: `mcp__<mcpServerName>__<mcpToolName>`),
+  deduplicated by the base; `session.error` as Copilot's own turn outcome counts it (`pyo` and
+  `oQt` in 1.0.103's `cli-main.js`): `errorType` `"hook"` → nothing, `"model_call"` →
+  `RecoverableError(data.message)` (fails the turn only when no main-agent message follows it;
+  Copilot's prompt mode exits 0 after one either way), any other → `Error(data.message)` (a
+  `remediation: "sign_in"` error gets "Run `copilot login` in a terminal"); a `session.warning` of
+  `copilot::FAILING_WARNINGS` (`policy_blocked`, `compaction_static_context_blocked`, which Copilot
+  exits 1 on) → `Error(data.message)`; `abort` → `Error("it was interrupted before it replied")`,
+  since an interrupted turn prints `result` with `exitCode: 0` and exits 0; `result` →
+  `Session(sessionId)`. Retries (`model.call_failure`, `assistant.turn_retry`, `session.info`) say
+  nothing; any other `session.error` is the last word of a failed turn (exit 1). Errors measured: HTTP 400 (`"400 <provider message>"`), a
   BYOK 401 ("Authentication failed with provider at ... Check your COPILOT_PROVIDER_API_KEY ..."),
   a provider that is down ("Could not connect to local model provider at ..."), all kept as
   Copilot's words. Not signed in (stderr "Error: No authentication information found.", exit 1)
@@ -798,7 +810,8 @@ uses the user's Copilot premium requests (AI credits), per Copilot's own billing
   exactly `true` also trusts the folder and runs its hooks) and what a parent Copilot session sets in
   its tool shells: `COPILOT_CLI`, `COPILOT_AGENT_SESSION_ID`, `COPILOT_CLI_BINARY_VERSION`,
   `COPILOT_CLI_RESOLVED_DIST_DIR`, `COPILOT_LOADER_PID` (measured on 1.0.103; an inherited
-  `COPILOT_LOADER_PID` reached the tools unchanged). Its `GIT_*` (`GIT_ASKPASS`, `GIT_EDITOR`,
+  `COPILOT_LOADER_PID` reached the tools unchanged), plus `COPILOT_PROMPT_TURN_DELIMITER`, which
+  splits a prompt into several (`nyo` in the 1.0.103 bundle). Its `GIT_*` (`GIT_ASKPASS`, `GIT_EDITOR`,
   `GIT_TERMINAL_PROMPT`, `GIT_OPTIONAL_LOCKS`, `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`) pass: Copilot
   sets them again for its tools (an inherited `GIT_CONFIG_COUNT` is appended to, measured), and a
   user's own `GIT_CONFIG_*` would go with them. `COPILOT_HOME`, the tokens (`COPILOT_GITHUB_TOKEN` >

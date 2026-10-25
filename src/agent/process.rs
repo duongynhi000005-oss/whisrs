@@ -151,6 +151,10 @@ pub enum StreamEvent {
     Tool(String),
     /// The turn failed: the harness's message.
     Error(String),
+    /// An error the agent may recover from: it fails the turn, with the
+    /// harness's message, unless a text comes after it (Copilot's
+    /// `model_call` error, after which the agent can go on and reply).
+    RecoverableError(String),
 }
 
 /// A harness whose turn is one process. Every method is required: there is
@@ -205,6 +209,9 @@ pub struct StreamState {
     texts: Vec<(String, String)>,
     /// The last error the harness reported.
     error: Option<String>,
+    /// The last recoverable error ([`StreamEvent::RecoverableError`]) while
+    /// no text came after it.
+    recoverable: Option<String>,
     /// A stdout line too long to read ([`STDOUT_LINE_MAX`]) came after the
     /// last text: it may have been the final message, so there is no reply.
     skipped_after_text: bool,
@@ -228,6 +235,7 @@ impl StreamState {
             activity: None,
             texts: Vec::new(),
             error: None,
+            recoverable: None,
             skipped_after_text: false,
         }
     }
@@ -247,6 +255,7 @@ impl StreamState {
                 self.tracker.on_text(&text);
                 self.texts.push((message, text));
                 self.skipped_after_text = false;
+                self.recoverable = None;
             }
             StreamEvent::Tool(name) => {
                 self.confirm(updates);
@@ -260,6 +269,7 @@ impl StreamState {
                 }
             }
             StreamEvent::Error(message) => self.error = Some(message),
+            StreamEvent::RecoverableError(message) => self.recoverable = Some(message),
         }
     }
 
@@ -339,9 +349,10 @@ impl std::fmt::Display for Exit {
 }
 
 /// How the turn ended, from what its output said and how its process
-/// exited. An error the harness reported fails it; otherwise the last
-/// message is the reply (a non-zero exit after one is only logged); a turn
-/// with neither fails with what stderr said, as the harness reads it
+/// exited. An error the harness reported fails it (a recoverable one only
+/// when no text came after it); otherwise the last message is the reply (a
+/// non-zero exit after one is only logged); a turn with neither fails with
+/// what stderr said, as the harness reads it
 /// ([`TurnHarness::stderr_failure`]) or else generically.
 pub fn outcome(
     agent: &Agent,
@@ -351,7 +362,7 @@ pub fn outcome(
     exit: &Exit,
 ) -> TurnOutcome {
     let label = harness.label();
-    if let Some(error) = &state.error {
+    if let Some(error) = state.error.as_ref().or(state.recoverable.as_ref()) {
         return TurnOutcome::Failed(format!(
             "Agent '{}': {label} failed: {}",
             agent.name,
@@ -2007,6 +2018,45 @@ mod tests {
         assert_eq!(
             outcome(&a, &h, &empty, &gone, &status(0)),
             TurnOutcome::Failed("Agent 'coder': Fake ended the turn without a reply.".into())
+        );
+    }
+
+    /// A recoverable error fails the turn only while no text came after
+    /// it; an error the harness reported fails it whatever came after.
+    #[test]
+    fn a_recoverable_error_fails_the_turn_only_without_a_later_text() {
+        let a = agent(Path::new("/proj"));
+        let h = harness();
+        let (updates, _rx) = TurnUpdates::channel();
+        let recoverable = || StreamEvent::RecoverableError("The model call failed".into());
+        // The agent went on and replied: the reply.
+        let mut recovered = StreamState::new(None);
+        recovered.event(recoverable(), &updates);
+        recovered.event(text("m", "Done."), &updates);
+        assert_eq!(
+            outcome(&a, &h, &recovered, &[], &status(0)),
+            TurnOutcome::Reply("Done.".into())
+        );
+        // Nothing after it: it fails the turn, also over a text before it
+        // (an acknowledgement, never the reply).
+        let failed =
+            TurnOutcome::Failed("Agent 'coder': Fake failed: The model call failed.".into());
+        let mut after_ack = StreamState::new(None);
+        after_ack.event(text("m1", "On it."), &updates);
+        after_ack.event(StreamEvent::Tool("bash".into()), &updates);
+        after_ack.event(recoverable(), &updates);
+        assert_eq!(outcome(&a, &h, &after_ack, &[], &status(0)), failed);
+        let mut alone = StreamState::new(None);
+        alone.event(recoverable(), &updates);
+        assert_eq!(outcome(&a, &h, &alone, &[], &status(0)), failed);
+        // A text clears only the recoverable one.
+        let mut both = StreamState::new(None);
+        both.event(StreamEvent::Error("Refused".into()), &updates);
+        both.event(recoverable(), &updates);
+        both.event(text("m", "Done."), &updates);
+        assert_eq!(
+            outcome(&a, &h, &both, &[], &status(1)),
+            TurnOutcome::Failed("Agent 'coder': Fake failed: Refused.".into())
         );
     }
 

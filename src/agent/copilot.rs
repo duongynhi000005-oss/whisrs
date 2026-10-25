@@ -7,7 +7,12 @@
 //!   <permissions> [args…]`, the prompt on stdin, which Copilot's prompt
 //!   mode reads when no `-p` is given (verbatim: a leading `--`, `$HOME` and
 //!   quotes reached the model as typed, measured), so the user's words never
-//!   show in `ps`. **Later turns:** the same with `--resume=<id>`. whisrs
+//!   show in `ps`. A prompt that starts with `/` is a Copilot command, not
+//!   words for the model: prompt mode runs it through
+//!   `autopilotSlashCommandParse` and `commands.invoke` (a slash command or
+//!   a skill), and matches `/compact` after trimming the prompt (`cyo`), so
+//!   no leading space or newline turns it back into words. whisrs passes the
+//!   words as they are. **Later turns:** the same with `--resume=<id>`. whisrs
 //!   mints the id, a UUID ([`new_session_id`]): `--session-id` with an id
 //!   Copilot does not have starts a session with it, and with one it has
 //!   continues it. The id is the agent's as soon as the first turn's process
@@ -49,17 +54,25 @@
 //!   prompt mode never asks anyone: a request it cannot approve is refused
 //!   (`code: "denied"`) and the model goes on without it, so the turn never
 //!   waits for you.
-//! - **Output:** one JSON object per line on stdout, `{type, data, id,
-//!   timestamp, ...}`. `assistant.message` is a message (`data.messageId`,
+//! - **Output:** one JSON object per line on stdout, `{type, data, agentId,
+//!   id, timestamp, ...}`. A sub-agent's event is none of the turn's and is
+//!   skipped, whatever its type ([`from_sub_agent`]: a top-level `agentId`,
+//!   a `data.agentId` or the deprecated `data.parentToolCallId`, Copilot's
+//!   own test). `assistant.message` is a message (`data.messageId`,
 //!   `data.content`), the last one the reply; one with `toolRequests` is
-//!   followed by a tool call at once, so its text is an interim right
-//!   away; a sub-agent's (`data.parentToolCallId`) is skipped.
+//!   followed by a tool call at once, so its text is an interim right away.
 //!   `tool.execution_start` is a tool call (`data.toolName`; an MCP tool as
-//!   `mcp__<server>__<tool>`). `session.error` fails the turn (it is the
-//!   last word of a failed turn, after Copilot's own retries), and so does
-//!   `abort`: an interrupted turn ends with `result` `exitCode: 0` and exits
-//!   0, so it would read as a success. `result` names the session. Nothing
-//!   else matters to whisrs (deltas, model calls, retries, `session.info`).
+//!   `mcp__<server>__<tool>`). A `session.error` fails the turn as
+//!   Copilot's own outcome counts it (`pyo` and `oQt` in 1.0.103's
+//!   `cli-main.js`): one with `errorType` `"hook"` never, one with
+//!   `"model_call"` only when no message follows it (the agent went on and
+//!   replied otherwise; Copilot's prompt mode exits 0 after one either way),
+//!   any other always (the last word of a failed turn, after Copilot's own
+//!   retries, exit 1). So does a `session.warning` Copilot exits 1 on
+//!   ([`FAILING_WARNINGS`]), and an `abort`: an interrupted turn ends with
+//!   `result` `exitCode: 0` and exits 0, so it would read as a success.
+//!   `result` names the session. Nothing else matters to whisrs (deltas,
+//!   model calls, retries, `session.info`).
 //! - **Stop:** SIGINT or SIGTERM interrupts the turn (`abort`, then
 //!   `result`), and the tool shell goes with it; the next turn resumes the
 //!   session. A tool shell runs in a session of its own and outlives a
@@ -89,6 +102,8 @@ pub const PARENT_SESSION_VARS: &[&str] = &[
     "COPILOT_CLI_BINARY_VERSION",
     "COPILOT_CLI_RESOLVED_DIST_DIR",
     "COPILOT_LOADER_PID",
+    // Splits a prompt into several prompts at this text when set.
+    "COPILOT_PROMPT_TURN_DELIMITER",
 ];
 
 /// The variable Copilot reads extra custom instruction directories from (a
@@ -101,6 +116,12 @@ pub const INSTRUCTIONS_ROOT: &str = "copilot";
 
 /// The instruction file, inside an agent's instruction directory.
 pub const INSTRUCTION_FILE: &str = ".github/instructions/whisrs-voice.instructions.md";
+
+/// The `session.warning` types that fail a turn, as Copilot's exit code
+/// counts them (`dyo` in 1.0.103's `cli-main.js`): a prompt a policy
+/// blocked (no `user.message` follows), and a static context (system
+/// prompt, instructions, tool definitions) too large for compaction to help.
+pub const FAILING_WARNINGS: &[&str] = &["compaction_static_context_blocked", "policy_blocked"];
 
 /// What a sign-in error's message may end with: Copilot's hint for its
 /// interactive mode, replaced by the CLI command.
@@ -344,13 +365,17 @@ pub fn is_session_id(id: &str) -> bool {
 }
 
 /// The events of one `copilot --output-format json` line (see the module
-/// doc). Nothing for a line whisrs does not need, a message with no id and
-/// anything that is not JSON.
+/// doc). Nothing for a line whisrs does not need, a sub-agent's event, a
+/// message with no id and anything that is not JSON.
 pub fn parse_line(line: &str) -> Vec<StreamEvent> {
     let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else {
         return Vec::new();
     };
+    if from_sub_agent(&entry) {
+        return Vec::new();
+    }
     let data = entry.get("data");
+    let field = |k: &str| data.and_then(|d| d.get(k)).and_then(Value::as_str);
     match entry.get("type").and_then(Value::as_str) {
         Some("assistant.message") => data.map(message_events).unwrap_or_default(),
         Some("tool.execution_start") => data
@@ -358,7 +383,16 @@ pub fn parse_line(line: &str) -> Vec<StreamEvent> {
             .map(StreamEvent::Tool)
             .into_iter()
             .collect(),
-        Some("session.error") => vec![StreamEvent::Error(failure(data))],
+        Some("session.error") => match field("errorType") {
+            Some("hook") => Vec::new(),
+            Some("model_call") => vec![StreamEvent::RecoverableError(failure(data))],
+            _ => vec![StreamEvent::Error(failure(data))],
+        },
+        Some("session.warning")
+            if field("warningType").is_some_and(|w| FAILING_WARNINGS.contains(&w)) =>
+        {
+            vec![StreamEvent::Error(failure(data))]
+        }
         Some("abort") => vec![StreamEvent::Error(interrupted(
             data.and_then(|d| d.get("reason")).and_then(Value::as_str),
         ))],
@@ -373,18 +407,25 @@ pub fn parse_line(line: &str) -> Vec<StreamEvent> {
     }
 }
 
-/// The events of an `assistant.message`: its text (an empty one too, so an
-/// empty last message is no reply rather than an earlier one), then, when
-/// it asks for tools, its first tool call, which releases the text as an
-/// interim at once. A sub-agent's message is none of the turn's.
+/// Whether `entry` is a sub-agent's event, by Copilot's own test (`nl` and
+/// `ms` in 1.0.103's `cli-main.js`): a non-empty top-level `agentId`, else
+/// `data.agentId`, else the deprecated `data.parentToolCallId`.
+pub fn from_sub_agent(entry: &Value) -> bool {
+    let data = entry.get("data");
+    [
+        entry.get("agentId"),
+        data.and_then(|d| d.get("agentId")),
+        data.and_then(|d| d.get("parentToolCallId")),
+    ]
+    .into_iter()
+    .any(|id| id.and_then(Value::as_str).is_some_and(|id| !id.is_empty()))
+}
+
+/// The events of a main-agent `assistant.message`: its text (an empty one
+/// too, so an empty last message is no reply rather than an earlier one),
+/// then, when it asks for tools, its first tool call, which releases the
+/// text as an interim at once.
 fn message_events(data: &Value) -> Vec<StreamEvent> {
-    if data
-        .get("parentToolCallId")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty())
-    {
-        return Vec::new();
-    }
     let Some(message) = data.get("messageId").and_then(Value::as_str) else {
         return Vec::new();
     };
@@ -421,8 +462,9 @@ fn tool_name(tool: &Value, key: &str) -> Option<String> {
     })
 }
 
-/// What a `session.error` says: its message, and for one Copilot answers
-/// with a sign-in (`remediation: "sign_in"`) the command that signs in.
+/// What a `session.error` (or a failing `session.warning`) says: its
+/// message, and for one Copilot answers with a sign-in (`remediation:
+/// "sign_in"`) the command that signs in.
 pub fn failure(data: Option<&Value>) -> String {
     let field = |k: &str| {
         data.and_then(|d| d.get(k))
@@ -914,18 +956,22 @@ mod tests {
             crate::agent::progress::activity_for_tool("mcp__whisrs__list_recordings"),
             "Reading your recordings"
         );
-        // A sub-agent's message is not the turn's (never its reply); its
-        // tool calls are still activities.
+        // A sub-agent's message is not the turn's (never its reply), nor is
+        // its tool call: 1.0.103 names the sub-agent in a top-level
+        // `agentId`.
+        assert!(parse_line(
+            r#"{"type":"assistant.message","agentId":"explore-1","data":{"messageId":"m9","content":"sub-agent notes","toolRequests":[]},"id":"0b8f3c1e-6d2a-4e57-9a0c-2f4d8e1b7c63","timestamp":"2026-10-25T18:40:02.114Z","parentId":"7e1d4a90-3c5b-4f28-b6e1-9d0a2c4f8b17"}"#
+        )
+        .is_empty());
+        assert!(parse_line(
+            r#"{"type":"tool.execution_start","agentId":"explore-1","data":{"toolCallId":"c2","toolName":"grep","arguments":{"pattern":"TODO"}},"id":"5a2c9e7f-1b4d-4c80-8f3a-6e0d2b9c1a45","timestamp":"2026-10-25T18:40:02.120Z","parentId":"0b8f3c1e-6d2a-4e57-9a0c-2f4d8e1b7c63"}"#
+        )
+        .is_empty());
+        // The deprecated `data.parentToolCallId` still marks one.
         assert!(parse_line(
             r#"{"type":"assistant.message","data":{"messageId":"m9","content":"sub-agent notes","toolRequests":[],"parentToolCallId":"call_task"}}"#
         )
         .is_empty());
-        assert_eq!(
-            parse_line(
-                r#"{"type":"tool.execution_start","data":{"toolCallId":"c2","toolName":"grep","parentToolCallId":"call_task"}}"#
-            ),
-            [StreamEvent::Tool("grep".into())]
-        );
         // A tool request from an MCP server, in a message.
         assert_eq!(
             parse_line(
@@ -1002,6 +1048,145 @@ mod tests {
             spoken::spoken_error(&message),
             "Copilot failed: 400 mock: this request is refused."
         );
+    }
+
+    /// `ACK_THEN_TOOL` with `extra` put in before its line that holds
+    /// `before`.
+    fn ack_then_tool_with(before: &str, extra: &[&str]) -> String {
+        let mut lines: Vec<&str> = ACK_THEN_TOOL.lines().collect();
+        let at = lines.iter().position(|l| l.contains(before)).unwrap();
+        let tail = lines.split_off(at);
+        lines.extend_from_slice(extra);
+        lines.extend(tail);
+        lines.join("\n")
+    }
+
+    /// The fixture's final message, which every turn below replies with
+    /// unless it fails.
+    const FINAL_MESSAGE: &str = "\"content\":\"Finished the tool step.";
+    /// Its `result` line, the turn's last.
+    const RESULT: &str = "\"type\":\"result\"";
+
+    /// A `model_call` error after the shell call (as 1.0.103's schema has
+    /// a `session.error`, the user message's id as its origin).
+    const MODEL_CALL_ERROR: &str = r#"{"type":"session.error","data":{"errorType":"model_call","message":"Model call failed: the stream ended early","originatingMessageId":"ea7374f6-3fdc-4072-8e6c-c5a651dced84"},"id":"5e0c3d1a-7b7e-4f0e-9a51-0c6f1b2a9d10","timestamp":"2026-10-25T18:38:40.650Z","parentId":"1ddbd953-571e-43e2-8c9f-9d5250a0c390"}"#;
+
+    fn turn_outcome(fixture: &str, exit: i32) -> TurnOutcome {
+        let (_, state) = replay(fixture, SessionRef::default());
+        outcome(
+            &agent(Permissions::Auto),
+            &Copilot::new(PathBuf::new()),
+            &state,
+            &[],
+            &status(exit),
+        )
+    }
+
+    fn the_reply() -> TurnOutcome {
+        TurnOutcome::Reply("Finished the tool step. <spoken>The tool step is done.</spoken>".into())
+    }
+
+    /// Copilot's own turn outcome (`oQt` in 1.0.103's `cli-main.js`) lets
+    /// a message of the main agent after a `model_call` error clear it, and
+    /// its prompt mode exits 0 after one (`pyo`): the reply. With no
+    /// message after it, the error fails the turn, never the
+    /// acknowledgement held before the call.
+    #[test]
+    fn a_model_call_error_fails_the_turn_only_without_a_later_message() {
+        assert_eq!(
+            parse_line(MODEL_CALL_ERROR),
+            [StreamEvent::RecoverableError(
+                "Model call failed: the stream ended early".into()
+            )]
+        );
+        assert_eq!(
+            turn_outcome(&ack_then_tool_with(FINAL_MESSAGE, &[MODEL_CALL_ERROR]), 0),
+            the_reply()
+        );
+        let failed = TurnOutcome::Failed(
+            "Agent 'cp': Copilot failed: Model call failed: the stream ended early.".into(),
+        );
+        // In place of the final message, and after it.
+        let no_reply: String = ack_then_tool_with(FINAL_MESSAGE, &[MODEL_CALL_ERROR])
+            .lines()
+            .filter(|l| !l.contains(FINAL_MESSAGE))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(turn_outcome(&no_reply, 0), failed);
+        assert_eq!(
+            turn_outcome(&ack_then_tool_with(RESULT, &[MODEL_CALL_ERROR]), 0),
+            failed
+        );
+    }
+
+    /// What Copilot's outcome ignores (`oQt`, `pyo`): an error of a hook,
+    /// and any error or abort of a sub-agent. The main agent's reply stands.
+    #[test]
+    fn hook_and_sub_agent_errors_never_fail_the_turn() {
+        let hook = r#"{"type":"session.error","data":{"errorType":"hook","message":"Hook preToolUse failed with exit code 1","originatingMessageId":"ea7374f6-3fdc-4072-8e6c-c5a651dced84"},"id":"9c41e2b7-0f3a-4d6e-8b15-7a2d9e0c4f81","timestamp":"2026-10-25T18:38:40.640Z","parentId":"1ddbd953-571e-43e2-8c9f-9d5250a0c390"}"#;
+        assert!(parse_line(hook).is_empty());
+        let sub_agent = [
+            r#"{"type":"assistant.message","agentId":"explore-1","data":{"messageId":"9f3e6a21-4c7d-4b0e-a2f8-5d1c3b7e9a04","content":"I found nothing.","toolRequests":[]},"id":"2d7b0e4c-8a1f-4e93-b6c2-0f5a9d3e7b18","timestamp":"2026-10-25T18:38:40.652Z","parentId":"1ddbd953-571e-43e2-8c9f-9d5250a0c390"}"#,
+            r#"{"type":"session.error","agentId":"explore-1","data":{"errorType":"query","message":"400 the sub-agent's request is refused"},"id":"6b1d8f3a-2e4c-4a07-9d5e-8c0f1a6b3e72","timestamp":"2026-10-25T18:38:40.655Z","parentId":"2d7b0e4c-8a1f-4e93-b6c2-0f5a9d3e7b18"}"#,
+            r#"{"type":"session.error","agentId":"explore-1","data":{"errorType":"model_call","message":"Model call failed"},"id":"0e5c7a92-3d1b-4f68-a4e0-9b2d6c8f1a35","timestamp":"2026-10-25T18:38:40.656Z","parentId":"6b1d8f3a-2e4c-4a07-9d5e-8c0f1a6b3e72"}"#,
+            r#"{"type":"abort","agentId":"explore-1","data":{"reason":"user_initiated"},"id":"4f8a2c6e-9b3d-4e17-8a05-c1d7e3b9f260","timestamp":"2026-10-25T18:38:40.658Z","parentId":"0e5c7a92-3d1b-4f68-a4e0-9b2d6c8f1a35"}"#,
+            // The other ways Copilot's test names a sub-agent.
+            r#"{"type":"session.error","data":{"agentId":"explore-1","errorType":"query","message":"refused"}}"#,
+            r#"{"type":"abort","data":{"reason":"user_initiated","parentToolCallId":"call_task"}}"#,
+        ];
+        for line in sub_agent {
+            assert!(parse_line(line).is_empty(), "{line}");
+        }
+        let mut extra = vec![hook];
+        extra.extend(sub_agent);
+        assert_eq!(
+            turn_outcome(&ack_then_tool_with(FINAL_MESSAGE, &extra), 0),
+            the_reply()
+        );
+        // A sub-agent's message after the reply is not the reply.
+        assert_eq!(
+            turn_outcome(&ack_then_tool_with(RESULT, &sub_agent[..1]), 0),
+            the_reply()
+        );
+        // An empty `agentId` names no sub-agent: the main agent's error.
+        assert_eq!(
+            parse_line(
+                r#"{"type":"session.error","agentId":"","data":{"agentId":"","parentToolCallId":"","errorType":"query","message":"refused"}}"#
+            ),
+            [StreamEvent::Error("refused".into())]
+        );
+        // Any other error of the main agent fails the turn, after a reply too.
+        let query = r#"{"type":"session.error","data":{"errorType":"query","message":"400 refused","originatingMessageId":"ea7374f6-3fdc-4072-8e6c-c5a651dced84"},"id":"3a9e1c5b-7d2f-4b84-9e06-d8c2a4f7b103","timestamp":"2026-10-25T18:38:40.681Z","parentId":"213d7a30-4eef-4d87-869a-8058fb68413d"}"#;
+        assert_eq!(
+            turn_outcome(&ack_then_tool_with(RESULT, &[query]), 1),
+            TurnOutcome::Failed("Agent 'cp': Copilot failed: 400 refused.".into())
+        );
+    }
+
+    /// The warnings Copilot exits 1 on (`dyo`, `pyo`) fail the turn with
+    /// their message; any other warning says nothing.
+    #[test]
+    fn a_policy_block_fails_the_turn() {
+        let blocked = r#"{"type":"session.warning","data":{"warningType":"policy_blocked","message":"This prompt was blocked by your organization's Copilot policy.","originatingMessageId":"ea7374f6-3fdc-4072-8e6c-c5a651dced84"},"id":"8d2f4b6a-1c3e-4a59-b7d0-e9f1a3c5b827","timestamp":"2026-10-25T18:38:40.571Z","parentId":"0db94a7a-18fa-4b51-84b4-6e53074e4417"}"#;
+        assert_eq!(
+            parse_line(blocked),
+            [StreamEvent::Error(
+                "This prompt was blocked by your organization's Copilot policy.".into()
+            )]
+        );
+        let static_context = r#"{"type":"session.warning","data":{"warningType":"compaction_static_context_blocked","message":"Static context is too large."}}"#;
+        assert_eq!(
+            parse_line(static_context),
+            [StreamEvent::Error("Static context is too large.".into())]
+        );
+        assert_eq!(
+            turn_outcome(&ack_then_tool_with(RESULT, &[static_context]), 1),
+            TurnOutcome::Failed("Agent 'cp': Copilot failed: Static context is too large.".into())
+        );
+        assert!(parse_line(
+            r#"{"type":"session.warning","agentId":"explore-1","data":{"warningType":"policy_blocked","message":"blocked"}}"#
+        )
+        .is_empty());
     }
 
     /// A model error leaves a pending first turn pending: the next turn

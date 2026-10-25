@@ -271,7 +271,7 @@ If the LLM call fails, times out, or returns nothing, the raw transcript is type
 
 ### Voice + coding agent
 
-An `[[agents]]` entry gives a coding agent its own hotkey. Press it, say what you want, press again: whisrs sends it to a Claude Code background session (or, with `harness = "opencode"`, an OpenCode session; with `harness = "codex"`, a Codex CLI session; with `harness = "copilot"`, a GitHub Copilot CLI session, where each turn uses your Copilot premium requests; Codex and Copilot were tested against a local mock model only) in the agent's directory and goes back to dictation. When the turn ends, you hear a short spoken reply (through `[tts]`), and the next press continues the same session, so answering the agent's question is one press. Press it while a reply plays to cut in; while that agent is still working, a press only silences its own reply.
+An `[[agents]]` entry gives a coding agent its own hotkey. Press it, say what you want, press again: whisrs sends it to a Claude Code background session (or, with `harness = "opencode"`, an OpenCode session; with `harness = "codex"`, a Codex CLI session; with `harness = "copilot"`, a GitHub Copilot CLI session, where each turn uses your Copilot plan's usage (AI credits, or premium requests on the legacy billing platform); Codex and Copilot were tested against a local mock model only) in the agent's directory and goes back to dictation. When the turn ends, you hear a short spoken reply (through `[tts]`), and the next press continues the same session, so answering the agent's question is one press. Press it while a reply plays to cut in; while that agent is still working, a press only silences its own reply.
 
 ```toml
 [[agents]]

@@ -687,8 +687,9 @@ What you need:
   local mock model, not a real account. See "Codex" below.
 - Or, for `harness = "copilot"`: the GitHub Copilot CLI (`copilot`), signed in
   with `copilot login`, or with a model provider of your own (Copilot's BYOK
-  mode). With a GitHub account, every turn uses your Copilot premium requests,
-  as Copilot bills them. Tested on 1.0.103 against a local mock model only,
+  mode). With a GitHub account, every turn uses your Copilot plan's usage
+  (AI credits, or premium requests on the legacy billing platform), as
+  Copilot bills them. Tested on 1.0.103 against a local mock model only,
   never with a GitHub account. See "GitHub Copilot" below.
 - `[tts] enabled = true` to hear the replies. Without it they arrive as
   notifications only, and `whisrsd` warns at startup.
@@ -1153,6 +1154,11 @@ The words go in on stdin, which Copilot's prompt mode reads when there is no
 binary itself: `gh copilot` runs the same CLI, but cannot take these
 arguments as they are.
 
+A turn that starts with `/` runs a Copilot command: prompt mode reads
+`/name ...` as a slash command or a skill, as if you typed it into Copilot,
+not as words for the agent (a leading space would not stop `/compact`).
+whisrs passes your words as they are.
+
 Sessions. whisrs makes up the session id (a UUID) and starts the session with
 it. `whisrs agent` shows the whole id; `copilot --resume=<id>` opens the
 session in Copilot, which names it after its first words, as it does any
@@ -1182,14 +1188,17 @@ turns it off, with your own instruction files.
 |---|---|
 | `auto` (default) | `--allow-all-tools`: commands and file changes in `dir` run without asking; a file outside `dir` and the temp directory, or a URL, still needs an approval, so it is refused |
 | `bypass` | `--yolo`: every tool, path and URL allowed |
-| `ask` | `--deny-tool=shell --deny-tool=write`: the agent reads and searches files; commands and file changes are refused, also when your Copilot settings or `args` allow them (a deny rule always wins, measured) |
+| `ask` | `--deny-tool=shell --deny-tool=write`: the agent reads and searches files; commands and file changes are refused, also when your Copilot settings or `args` allow them (a deny rule always wins, measured). No rule covers a tool from an MCP server (see below) |
 
 Nobody can answer Copilot's approval requests during a turn: prompt mode
 refuses what needs one, the agent is told so and goes on, and the reply
 usually says what it could not do. So a Copilot agent never shows needs-you,
 and a turn never waits for you. A tool from an MCP server keeps Copilot's own
-rules: one that needs an approval is refused. `COPILOT_ALLOW_ALL` in the
-daemon's environment is not passed on, so `permissions` decides.
+rules: one that needs an approval is refused. With `ask`, that is all that
+stops one: its deny rules do not cover MCP tools, so an approval you saved in
+Copilot itself ("Yes, and don't ask again for tool ... in this repo", or "in
+this directory") may let one run, as it would in Copilot. `COPILOT_ALLOW_ALL` in
+the daemon's environment is not passed on, so `permissions` decides.
 
 Which keys apply when: `permissions` and `args` are passed on every turn,
 since Copilot keeps neither between turns (an `--agent` given only on the
@@ -1200,9 +1209,10 @@ and `--trust-folder` out of `args`: whisrs passes the first ones itself, and
 Copilot refuses `--trust-folder` beside `--session-id` and `--resume`, and
 `--name` beside a session it already has (measured).
 
-Billing. With a GitHub account, every turn uses your Copilot premium requests
-(AI credits on Copilot's newer billing), counted by Copilot's own billing as
-the same prompt typed into Copilot would be. Copilot uses the sign-in it
+Billing. With a GitHub account, every turn uses your Copilot plan's usage (AI
+credits, or premium requests on the legacy billing platform), counted by
+Copilot's own billing as the same prompt typed into Copilot would be
+(`copilot help billing` says where to see it). Copilot uses the sign-in it
 already has: `copilot login`, or a token in `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`
 or `GITHUB_TOKEN`, which whisrs passes on (a `GITHUB_TOKEN` meant for
 something else then wins over your sign-in). With a model provider of your own
@@ -1212,6 +1222,9 @@ signed in, the turn fails with "Copilot is not signed in to GitHub": run
 `copilot login` in a terminal. A provider that refuses its key, or that does
 not answer, fails the turn with Copilot's own message ("Authentication failed
 with provider at ...", "Could not connect to local model provider at ...").
+An error Copilot itself does not count as the turn's failure does not fail it
+here either: a hook's, a helper agent's, or a failed model call after which
+the agent still replies.
 
 What you hear and see works as with Claude Code, with two differences.
 Copilot reports a tool call when it starts, so the overlay's activity line,
@@ -1239,8 +1252,9 @@ turn continues it.
 environment minus what a parent Claude Code session sets (the list above),
 what a parent Copilot session sets for the commands it runs (`COPILOT_CLI`,
 `COPILOT_AGENT_SESSION_ID`, `COPILOT_CLI_BINARY_VERSION`,
-`COPILOT_CLI_RESOLVED_DIST_DIR`, `COPILOT_LOADER_PID`), `COPILOT_ALLOW_ALL`
-and whisrs's own `WHISRS_*` keys. Everything else is passed on, Copilot's own
+`COPILOT_CLI_RESOLVED_DIST_DIR`, `COPILOT_LOADER_PID`), `COPILOT_ALLOW_ALL`,
+`COPILOT_PROMPT_TURN_DELIMITER` (which would split your words into several
+prompts) and whisrs's own `WHISRS_*` keys. Everything else is passed on, Copilot's own
 settings included (`COPILOT_HOME`, the tokens, `COPILOT_OFFLINE`,
 `COPILOT_MODEL`, the `COPILOT_PROVIDER_*` variables). The `GIT_*` variables a
 parent Copilot session sets pass too: Copilot sets them again for its own

@@ -354,7 +354,8 @@ permission prompt with no turn running marks needs-you. A session working on its
 `claude::PARENT_SESSION_VARS` and `WHISRS_*`. Only stored ids are ever passed to `claude`.
 A process-per-turn harness (OpenCode, Codex, Copilot) implements `process::TurnHarness` only (`label`, `launch`
 -> `Launch` {args, stdin, env, session: an id it names up front}, `strips_env`, `events`: one stdout
-line -> `StreamEvent`s Session / Text {message} / Tool / Error, `stderr_failure`: a failure it
+line -> `StreamEvent`s Session / Text {message} / Tool / Error / RecoverableError (fails the turn only
+when no text follows), `stderr_failure`: a failure it
 recognizes in stderr, else `None`); `process::ProcessDriver` does the rest: spawn from a thread that
 waits for the child (own process group, own transient scope `whisrs-agent-<instance>-<name>-<turn>.scope`
 via `systemd-run --user --scope` when it works, else direct; `<instance>` hashes the `agents.json`
@@ -384,7 +385,7 @@ then `--skip-git-repo-check` (it ends a many-valued `-i` of `args`), all before 
 `turn.failed` -> Error (a 401 names `CODEX_API_KEY` when it is set); `RUST_LOG` and
 `codex::PARENT_SESSION_VARS` are stripped.
 Copilot (tested against a mock model only, offline BYOK; with a GitHub account every turn uses the
-user's premium requests): whisrs mints a UUID (`copilot::new_session_id`); a new or pending session
+user's Copilot plan usage: AI credits, or premium requests on the legacy billing platform): whisrs mints a UUID (`copilot::new_session_id`); a new or pending session
 passes `--session-id=<id>` (creates or continues), a confirmed one `--resume=<id>` (fails when Copilot
 lost it, `stderr_failure`); the prompt goes on stdin (no `-p`, nothing in `ps`); every turn passes the
 permission flags (`auto` = `--allow-all-tools`, `bypass` = `--yolo`, `ask` = `--deny-tool=shell
@@ -392,8 +393,11 @@ permission flags (`auto` = `--allow-all-tools`, `bypass` = `--yolo`, `ask` = `--
 (`.github/instructions/whisrs-voice.instructions.md`) whose dir is appended to
 `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` every turn (lands in the system prompt, never in history);
 `assistant.message` -> Text (+ Tool of its first `toolRequests` entry: the interim at once; a sub-agent's
-skipped), `tool.execution_start` -> Tool, `session.error` and `abort` -> Error (an interrupt exits 0),
-`result` -> Session; `copilot::PARENT_SESSION_VARS` (with `COPILOT_ALLOW_ALL`) are stripped.
+skipped), `tool.execution_start` -> Tool, `session.error` -> Error (`hook` errors ignored, `model_call` ones
+RecoverableError), a `policy_blocked`/`compaction_static_context_blocked` warning and `abort` -> Error
+(an interrupt exits 0), every sub-agent event skipped (`agentId`, then `data.agentId`, then the
+deprecated `parentToolCallId`), `result` -> Session; `copilot::PARENT_SESSION_VARS` (with
+`COPILOT_ALLOW_ALL` and `COPILOT_PROMPT_TURN_DELIMITER`) are stripped.
 `DaemonContext::state_tx` is a `StateBus` (`context.rs`), sent only by `publish(&ds)`: `raw` (the state
 machine: hooks, the reply queue), `ui` (Idle while the voice is an agent's, `DaemonState::agent_voice`:
 tray, pill, GNOME pill) and `voice` (which agent, for the board). The runtime's board channel
