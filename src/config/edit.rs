@@ -190,6 +190,7 @@ fn default_config() -> Config {
         overlay: None,
         llm_commands: Vec::new(),
         agents: Vec::new(),
+        agent_overlay: None,
         replacements: Default::default(),
         recording: None,
     }

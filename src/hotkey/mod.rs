@@ -716,6 +716,7 @@ mod tests {
             command: "claude".to_string(),
             args: Vec::new(),
             instruction: String::new(),
+            feedback: crate::agent::progress::Feedback::Brief,
         };
         let mut jarvis = agent("jarvis", Some("Super+Shift+J"));
         jarvis.new_session_hotkey = Some("Super+Shift+N".to_string());

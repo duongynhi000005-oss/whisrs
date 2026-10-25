@@ -60,6 +60,10 @@ pub struct Config {
     /// Overlay appearance config (theme, dimensions, optional custom colors).
     #[serde(default)]
     pub overlay: Option<OverlayConfig>,
+    /// The agent overlay (`[agent_overlay]`): one row per active
+    /// `[[agents]]` entry, apart from the recording pill.
+    #[serde(default)]
+    pub agent_overlay: Option<AgentOverlayConfig>,
     /// Named custom LLM commands, each with its own hotkey (see
     /// [`llm::LlmCommandConfig`]). Empty by default.
     #[serde(default)]
@@ -413,6 +417,130 @@ impl OverlayConfig {
     /// Parsed [`Self::position`]; unknown values fall back to the default.
     pub fn position(&self) -> OverlayPosition {
         OverlayPosition::parse(&self.position).unwrap_or_default()
+    }
+}
+
+/// The agent overlay (`[agent_overlay]`): a row per active agent (its
+/// state, what it does, how long), in a screen corner of its own. Only
+/// drawn when `[[agents]]` has an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOverlayConfig {
+    /// Show it. Unset: follow `[general] overlay`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `"orb"` (default) or `"face"`. Unknown values fall back to `"orb"`;
+    /// [`Config::validate`] warns.
+    #[serde(default = "default_agent_overlay_style")]
+    pub style: String,
+    /// `"bottom-right"` (default), `"bottom-left"`, `"top-right"` or
+    /// `"top-left"`. Unknown values (a `-center` one too) fall back to
+    /// `"bottom-right"`; [`Config::validate`] warns.
+    #[serde(default = "default_agent_overlay_corner")]
+    pub corner: String,
+}
+
+fn default_agent_overlay_style() -> String {
+    AgentOverlayStyle::default().as_str().to_string()
+}
+fn default_agent_overlay_corner() -> String {
+    AgentOverlayCorner::default().as_str().to_string()
+}
+
+impl Default for AgentOverlayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            style: default_agent_overlay_style(),
+            corner: default_agent_overlay_corner(),
+        }
+    }
+}
+
+impl AgentOverlayConfig {
+    /// Whether it is shown, given `[general] overlay`.
+    pub fn enabled(&self, general_overlay: bool) -> bool {
+        self.enabled.unwrap_or(general_overlay)
+    }
+    /// Parsed [`Self::style`]; unknown values fall back to the default.
+    pub fn style(&self) -> AgentOverlayStyle {
+        AgentOverlayStyle::parse(&self.style).unwrap_or_default()
+    }
+    /// Parsed [`Self::corner`]; unknown values fall back to the default.
+    pub fn corner(&self) -> AgentOverlayCorner {
+        AgentOverlayCorner::parse(&self.corner).unwrap_or_default()
+    }
+}
+
+/// How the agent overlay draws an agent. See [`AgentOverlayConfig::style`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentOverlayStyle {
+    /// Rings and arcs in the state's color.
+    #[default]
+    Orb,
+    /// A small face whose eyes and mouth show the state.
+    Face,
+}
+
+impl AgentOverlayStyle {
+    /// Parse a config string (trimmed, case-insensitive). `None` if unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "orb" => Self::Orb,
+            "face" => Self::Face,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Orb => "orb",
+            Self::Face => "face",
+        }
+    }
+}
+
+/// The screen corner of the agent overlay. See
+/// [`AgentOverlayConfig::corner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentOverlayCorner {
+    #[default]
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
+}
+
+impl AgentOverlayCorner {
+    /// Parse a config string (trimmed, case-insensitive). `None` if unknown;
+    /// an edge center is not a corner.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "bottom-right" => Self::BottomRight,
+            "bottom-left" => Self::BottomLeft,
+            "top-right" => Self::TopRight,
+            "top-left" => Self::TopLeft,
+            _ => return None,
+        })
+    }
+
+    /// Canonical config spelling, also sent to the GNOME extension.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BottomRight => "bottom-right",
+            Self::BottomLeft => "bottom-left",
+            Self::TopRight => "top-right",
+            Self::TopLeft => "top-left",
+        }
+    }
+
+    /// Whether it sits at the top edge (rows stack down from it).
+    pub fn is_top(self) -> bool {
+        matches!(self, Self::TopRight | Self::TopLeft)
+    }
+
+    /// Whether it sits at the right edge.
+    pub fn is_right(self) -> bool {
+        matches!(self, Self::BottomRight | Self::TopRight)
     }
 }
 
@@ -1940,6 +2068,29 @@ impl Config {
                          \"bottom-center\". Use one of: bottom-left, bottom-center, \
                          bottom-right, top-left, top-center, top-right.",
                         overlay.position
+                    ),
+                });
+            }
+        }
+
+        if let Some(agent_overlay) = &self.agent_overlay {
+            if AgentOverlayStyle::parse(&agent_overlay.style).is_none() {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[agent_overlay] style = {:?} is not a known style, using \"{}\". Use \
+                         orb or face.",
+                        agent_overlay.style,
+                        AgentOverlayStyle::default().as_str()
+                    ),
+                });
+            }
+            if AgentOverlayCorner::parse(&agent_overlay.corner).is_none() {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[agent_overlay] corner = {:?} is not a screen corner, using \"{}\". \
+                         Use one of: bottom-right, bottom-left, top-right, top-left.",
+                        agent_overlay.corner,
+                        AgentOverlayCorner::default().as_str()
                     ),
                 });
             }
@@ -3950,6 +4101,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4068,6 +4220,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4102,6 +4255,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4139,6 +4293,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4184,6 +4339,7 @@ mod tests {
                 hooks: None,
                 llm_commands: Vec::new(),
                 agents: Vec::new(),
+                agent_overlay: None,
                 replacements: BTreeMap::new(),
                 recording: None,
                 overlay: None,
@@ -4265,6 +4421,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4491,6 +4648,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4756,6 +4914,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4815,6 +4974,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4852,6 +5012,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4890,6 +5051,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4928,6 +5090,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4966,6 +5129,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5001,6 +5165,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5078,6 +5243,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5121,6 +5287,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5166,6 +5333,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5236,6 +5404,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5294,6 +5463,7 @@ mod tests {
             hooks: None,
             llm_commands: Vec::new(),
             agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5411,6 +5581,7 @@ mod tests {
             command: None,
             args: Vec::new(),
             reply_instruction: None,
+            feedback: "brief".to_string(),
         }
     }
 
@@ -5550,6 +5721,108 @@ mod tests {
         assert!(unknown.is_empty(), "{unknown:?}");
         let unknown = unknown_config_keys("[[agents]]\nname = \"jarvis\"\nbogus = 1\n");
         assert_eq!(unknown, vec!["agents[0].bogus".to_string()]);
+    }
+
+    /// `[agent_overlay]` and `[[agents]] feedback` are known keys.
+    #[test]
+    fn agent_overlay_and_feedback_keys_are_not_unknown() {
+        let toml = "[agent_overlay]\nenabled = true\nstyle = \"face\"\ncorner = \"top-left\"\n\
+                    [[agents]]\nname = \"jarvis\"\ndir = \"/proj\"\nfeedback = \"conversational\"\n";
+        assert!(unknown_config_keys(toml).is_empty(), "{toml}");
+        assert!(unknown_config_keys("[agent_overlay]\n").is_empty());
+        let unknown = unknown_config_keys("[agent_overlay]\nstyle = \"orb\"\nbogus = 1\n");
+        assert_eq!(unknown, vec!["agent_overlay.bogus".to_string()]);
+        let config: Config = toml::from_str(toml).unwrap();
+        let overlay = config.agent_overlay.unwrap();
+        assert_eq!(overlay.enabled, Some(true));
+        assert_eq!(overlay.style(), AgentOverlayStyle::Face);
+        assert_eq!(overlay.corner(), AgentOverlayCorner::TopLeft);
+        assert_eq!(config.agents[0].feedback, "conversational");
+    }
+
+    #[test]
+    fn agent_overlay_defaults_follow_the_overlay_switch() {
+        let config: Config = toml::from_str("[agent_overlay]\n").unwrap();
+        let overlay = config.agent_overlay.unwrap();
+        assert_eq!(overlay, AgentOverlayConfig::default());
+        assert_eq!(overlay.style(), AgentOverlayStyle::Orb);
+        assert_eq!(overlay.corner(), AgentOverlayCorner::BottomRight);
+        assert!(!overlay.enabled(false) && overlay.enabled(true));
+        let off = AgentOverlayConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.enabled(true));
+        // Without the section, and for an entry without `feedback`.
+        let config: Config =
+            toml::from_str("[[agents]]\nname = \"jarvis\"\ndir = \"/proj\"\n").unwrap();
+        assert!(config.agent_overlay.is_none());
+        assert_eq!(config.agents[0].feedback, "brief");
+        for corner in ["bottom-right", "bottom-left", "top-right", "top-left"] {
+            assert_eq!(
+                AgentOverlayCorner::parse(corner).map(AgentOverlayCorner::as_str),
+                Some(corner)
+            );
+        }
+        assert_eq!(
+            AgentOverlayCorner::parse(" Top-Right "),
+            Some(AgentOverlayCorner::TopRight)
+        );
+        assert_eq!(
+            AgentOverlayStyle::parse("FACE"),
+            Some(AgentOverlayStyle::Face)
+        );
+    }
+
+    /// An unknown style or corner (a center one too) and an unknown agent
+    /// feedback level each warn once and use the default.
+    #[test]
+    fn config_validate_warns_unknown_agent_overlay_values_and_feedback() {
+        let mut config = validatable_config("groq");
+        let matching = |config: &Config, needle: &str| -> Vec<String> {
+            config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .map(|w| w.message)
+                .filter(|m| m.contains(needle))
+                .collect()
+        };
+        config.agent_overlay = Some(AgentOverlayConfig {
+            enabled: None,
+            style: "blob".to_string(),
+            corner: "bottom-center".to_string(),
+        });
+        let style = matching(&config, "[agent_overlay] style");
+        assert_eq!(style.len(), 1, "{style:?}");
+        assert!(style[0].contains("\"blob\"") && style[0].contains("using \"orb\""));
+        let corner = matching(&config, "[agent_overlay] corner");
+        assert_eq!(corner.len(), 1, "{corner:?}");
+        assert!(
+            corner[0].contains("\"bottom-center\"") && corner[0].contains("using \"bottom-right\""),
+            "{}",
+            corner[0]
+        );
+        let overlay = config.agent_overlay.clone().unwrap();
+        assert_eq!(overlay.style(), AgentOverlayStyle::Orb);
+        assert_eq!(overlay.corner(), AgentOverlayCorner::BottomRight);
+        for (style, corner) in [("orb", "bottom-right"), ("Face", "top-left")] {
+            config.agent_overlay = Some(AgentOverlayConfig {
+                enabled: Some(true),
+                style: style.to_string(),
+                corner: corner.to_string(),
+            });
+            assert!(matching(&config, "[agent_overlay]").is_empty());
+        }
+
+        let mut jarvis = agent_entry("jarvis", None);
+        jarvis.feedback = "chatty".to_string();
+        config.agents = vec![jarvis];
+        let feedback = matching(&config, "unknown feedback value");
+        assert_eq!(feedback.len(), 1, "{feedback:?}");
+        assert!(feedback[0].contains("'chatty'") && feedback[0].contains("uses brief"));
+        // The entry is kept: no "skipped" warning.
+        assert!(matching(&config, "is skipped").is_empty());
     }
 
     /// The recording checks, in a build with the feature.

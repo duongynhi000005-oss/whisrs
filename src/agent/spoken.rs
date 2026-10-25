@@ -15,7 +15,9 @@
 //! 4. Nothing speakable after all that (no letter or digit left):
 //!    [`EMPTY_REPLY`].
 //!
-//! [`spoken_error`] does the same for a failed turn's error message.
+//! [`spoken_error`] does the same for a failed turn's error message, and
+//! [`interim_line`] for an acknowledgement or progress update the agent
+//! wrote before a tool call.
 //!
 //! Pure functions, no I/O.
 
@@ -31,6 +33,10 @@ pub const EMPTY_REPLY: &str = "Done.";
 
 /// What is spoken for an error with nothing speakable in it.
 pub const ERROR_FALLBACK: &str = "The agent turn failed.";
+
+/// The longest interim line (an acknowledgement or a progress update)
+/// spoken, in characters.
+pub const MAX_INTERIM_CHARS: usize = 120;
 
 /// Sentences kept from a reply without a `<spoken>` block.
 const FALLBACK_SENTENCES: usize = 2;
@@ -56,6 +62,25 @@ pub fn spoken_reply(reply: &str) -> String {
 /// punctuation a dropped URL or path left behind.
 fn speakable(text: &str) -> bool {
     text.chars().any(char::is_alphanumeric)
+}
+
+/// The spoken form of an interim message: the text of an assistant message
+/// a tool call followed, so known not to be the final reply. Only a complete
+/// `<spoken>...</spoken>` pair counts (an interim has no fallback: text
+/// without one is the agent's own notes), sanitized like a reply and capped
+/// at [`MAX_INTERIM_CHARS`] on a sentence or word boundary. `None` when
+/// nothing speakable is left.
+pub fn interim_line(raw: &str) -> Option<String> {
+    let block = last_complete_spoken_block(raw)?;
+    let line = cap_on_sentence(&sanitize(block), MAX_INTERIM_CHARS);
+    speakable(&line).then_some(line)
+}
+
+/// Two raw messages that are the same: equal up to whitespace (the
+/// transcript's text of a turn that ended on a poll can differ from the
+/// Stop hook's in whitespace). Also how interim lines are deduplicated.
+pub fn same_reply(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
 }
 
 /// The short line spoken for a failed turn: the first sentence of the error
@@ -89,6 +114,25 @@ const CLOSE_TAG: &str = "</spoken>";
 /// truncated reply) yields everything after its first opening tag. `None`
 /// without either.
 pub fn last_spoken_block(reply: &str) -> Option<&str> {
+    let (last_pair, after_last_close) = scan_spoken_pairs(reply);
+    if last_pair.is_some() {
+        return last_pair;
+    }
+    let lower = reply[after_last_close..].to_ascii_lowercase();
+    let open = lower.find(OPEN_TAG)?;
+    Some(&reply[after_last_close + open + OPEN_TAG.len()..])
+}
+
+/// The content of the last complete `<spoken>...</spoken>` pair, paired as
+/// in [`last_spoken_block`]. `None` without one: a truncated block does not
+/// count.
+pub fn last_complete_spoken_block(text: &str) -> Option<&str> {
+    scan_spoken_pairs(text).0
+}
+
+/// The last complete pair's content, and where the text after the last
+/// closing tag starts (0 without one).
+fn scan_spoken_pairs(reply: &str) -> (Option<&str>, usize) {
     // ASCII lowercasing keeps every byte offset valid in `reply`.
     let lower = reply.to_ascii_lowercase();
     let mut last_pair = None;
@@ -102,11 +146,7 @@ pub fn last_spoken_block(reply: &str) -> Option<&str> {
         }
         from = close + CLOSE_TAG.len();
     }
-    if last_pair.is_some() {
-        return last_pair;
-    }
-    let open = lower[from..].find(OPEN_TAG)?;
-    Some(&reply[from + open + OPEN_TAG.len()..])
+    (last_pair, from)
 }
 
 /// `reply` without any `<spoken>` or `</spoken>` tag.
@@ -682,5 +722,64 @@ mod tests {
         assert_eq!(spoken_error("no prefix here. Second."), "No prefix here.");
         assert_eq!(spoken_error("Agent 'jarvis': /a/b/c"), ERROR_FALLBACK);
         assert_eq!(spoken_error(""), ERROR_FALLBACK);
+    }
+
+    #[test]
+    fn an_interim_needs_a_complete_pair() {
+        assert_eq!(
+            interim_line("<spoken>On it.</spoken>\n\nLet me look at the config.").as_deref(),
+            Some("On it.")
+        );
+        // The last complete pair, as for a reply.
+        assert_eq!(
+            interim_line("<spoken>On it.</spoken> then <SPOKEN>Found the cause.</Spoken>")
+                .as_deref(),
+            Some("Found the cause.")
+        );
+        // No pair, or only a truncated one: the agent's own notes.
+        assert_eq!(interim_line("Let me check the logs."), None);
+        assert_eq!(interim_line("notes <spoken>On it"), None);
+        assert_eq!(last_complete_spoken_block("notes <spoken>On it"), None);
+        assert_eq!(
+            last_complete_spoken_block("<spoken>a</spoken> <spoken>cut"),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn an_interim_is_sanitized_and_nothing_speakable_is_none() {
+        assert_eq!(
+            interim_line("<spoken>**Checking** `src/main.rs` now.</spoken>").as_deref(),
+            Some("Checking now.")
+        );
+        assert_eq!(interim_line("<spoken></spoken>"), None);
+        assert_eq!(interim_line("<spoken>https://x.io /a/b!</spoken>"), None);
+        assert_eq!(interim_line("<spoken>```\ncode\n```</spoken>"), None);
+    }
+
+    #[test]
+    fn an_interim_is_capped_on_a_sentence_or_a_word() {
+        let first = "I found the cause in the cache layer.";
+        let second = "The key ignored the locale, so every language shared one entry and \
+                      the wrong strings came back.";
+        let line = interim_line(&format!("<spoken>{first} {second}</spoken>")).unwrap();
+        assert_eq!(line, first);
+        let long = "word ".repeat(60);
+        let line = interim_line(&format!("<spoken>{long}</spoken>")).unwrap();
+        assert!(line.chars().count() <= MAX_INTERIM_CHARS, "{line}");
+        assert!(line.ends_with("word."), "{line}");
+    }
+
+    #[test]
+    fn replies_are_compared_up_to_whitespace() {
+        assert!(same_reply(
+            "Done.\n\n<spoken>All set.</spoken>",
+            " Done. <spoken>All set.</spoken>\n"
+        ));
+        assert!(!same_reply("<spoken>Done.</spoken>", "Done."));
+        assert!(!same_reply(
+            "Fixed the test. <spoken>Done.</spoken>",
+            "Ran it. <spoken>Done.</spoken>"
+        ));
     }
 }

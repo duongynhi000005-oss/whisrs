@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use whisrs::agent::claude::ClaudeDriver;
+use whisrs::agent::spoken::same_reply;
 use whisrs::agent::store::{self, AgentRecord, AgentStore};
 use whisrs::agent::{
     resolve_agents, spoken, Agent, AgentAction, AgentInfo, AgentPhase, Driver, Harness, HookEvent,
@@ -137,13 +138,6 @@ fn busy_notification(agent: &str, busy: Busy, instruction: Option<&str>) -> Stri
         ));
     }
     body
-}
-
-/// Two raw replies that are the same message: equal up to whitespace (the
-/// transcript's text of a turn that ended on a poll can differ from the
-/// Stop hook's in whitespace).
-fn same_reply(a: &str, b: &str) -> bool {
-    a.split_whitespace().eq(b.split_whitespace())
 }
 
 /// One running turn.
@@ -1452,6 +1446,9 @@ async fn apply_update(context: &DaemonContext, agent: &Agent, generation: u64, u
             drop(inner);
             own_reply(context, agent, raw).await;
         }
+        // Not wired yet: the daemon lane feeds these to the agent overlay
+        // and the interim queue.
+        TurnUpdate::Activity(_) | TurnUpdate::Interim(_) => {}
     }
 }
 
@@ -2001,6 +1998,7 @@ mod tests {
             command: "claude".into(),
             args: Vec::new(),
             instruction: String::new(),
+            feedback: whisrs::agent::progress::Feedback::Brief,
         }
     }
 
@@ -2731,19 +2729,6 @@ mod tests {
         assert!(Busy::Background
             .message("jarvis")
             .contains("whisrs agent jarvis --stop"));
-    }
-
-    #[test]
-    fn replies_are_compared_up_to_whitespace() {
-        assert!(same_reply(
-            "Done.\n\n<spoken>All set.</spoken>",
-            " Done. <spoken>All set.</spoken>\n"
-        ));
-        assert!(!same_reply("<spoken>Done.</spoken>", "Done."));
-        assert!(!same_reply(
-            "Fixed the test. <spoken>Done.</spoken>",
-            "Ran it. <spoken>Done.</spoken>"
-        ));
     }
 
     #[test]

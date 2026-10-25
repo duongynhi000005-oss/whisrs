@@ -50,6 +50,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::claude_tail::{TailMode, TranscriptTail};
 use super::{
     Agent, AgentPhase, Driver, HookEvent, IdleEvent, Permissions, SessionRef, TurnIo, TurnOutcome,
     TurnRequest, TurnUpdate, TurnUpdates,
@@ -714,8 +715,12 @@ fn claude_config_dir() -> Option<PathBuf> {
 
 /// Find a session's transcript by its id: `<config>/projects/*/<id>.jsonl`.
 /// Only our own session's file is ever opened. Blocking.
-fn find_transcript(session_id: &str) -> Option<PathBuf> {
-    let projects = claude_config_dir()?.join("projects");
+pub(super) fn find_transcript(session_id: &str) -> Option<PathBuf> {
+    find_transcript_in(&claude_config_dir()?.join("projects"), session_id)
+}
+
+/// [`find_transcript`] under a given `projects` dir.
+pub(super) fn find_transcript_in(projects: &Path, session_id: &str) -> Option<PathBuf> {
     let file = format!("{session_id}.jsonl");
     std::fs::read_dir(projects)
         .ok()?
@@ -1421,7 +1426,10 @@ impl ClaudeDriver {
     }
 
     /// Wait for the turn of `session` to end. Hook events received before
-    /// `accept_after` belong to an earlier process and are ignored.
+    /// `accept_after` belong to an earlier process and are ignored. The
+    /// transcript is followed meanwhile for activities and interims
+    /// ([`TranscriptTail`]): interims only for a turn this daemon launched
+    /// (`accept_after` set), not one watched again after a restart.
     async fn watch(
         &self,
         agent: &Agent,
@@ -1431,6 +1439,11 @@ impl ClaudeDriver {
         hooks: &mut mpsc::UnboundedReceiver<HookEvent>,
         updates: &TurnUpdates,
     ) -> TurnOutcome {
+        let mode = match accept_after {
+            Some(_) => TailMode::Live,
+            None => TailMode::Rewatch,
+        };
+        let _tail = TranscriptTail::spawn(session.clone(), since, updates.clone(), mode);
         let Some(bg_id) = session.bg_id.clone() else {
             // Only a turn watched again after a restart lacks a bg id: the
             // restart landed before its launch printed one.
@@ -1768,6 +1781,7 @@ mod tests {
             command: "claude".into(),
             args: vec!["--model".into(), "haiku".into()],
             instruction: DEFAULT_REPLY_INSTRUCTION.into(),
+            feedback: crate::agent::progress::Feedback::Brief,
         }
     }
 

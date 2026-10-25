@@ -4,8 +4,10 @@
 //!
 //! This module holds what both binaries share: the `[[agents]]` config and
 //! its validation, the IPC types, the driver abstraction every harness
-//! implements and the default spoken-reply instruction. The runtime that
-//! owns the sessions lives in the daemon (`src/daemon/agent.rs`).
+//! implements and the default spoken-reply instruction, plus the pure parts
+//! of what an agent says and shows while it works ([`progress`],
+//! [`display`]). The runtime that owns the sessions lives in the daemon
+//! (`src/daemon/agent.rs`).
 //!
 //! Two driver shapes fit [`Driver`]: Claude Code's turn is launched as a
 //! background session and ends on a hook event or a poll
@@ -15,6 +17,9 @@
 //! the child exits. The runtime only ever calls the [`Driver`] methods.
 
 pub mod claude;
+pub mod claude_tail;
+pub mod display;
+pub mod progress;
 pub mod spoken;
 pub mod store;
 
@@ -27,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::hotkey;
+use progress::Feedback;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -69,6 +75,12 @@ pub struct AgentConfig {
     /// Replaces the built-in voice instruction ([`DEFAULT_REPLY_INSTRUCTION`]).
     #[serde(default)]
     pub reply_instruction: Option<String>,
+    /// How much the agent says while it works: `summary` (only the reply),
+    /// `brief` (default: an acknowledgement, then the reply) or
+    /// `conversational` (also updates at real milestones). See
+    /// [`progress::Feedback`].
+    #[serde(default = "default_feedback")]
+    pub feedback: String,
 }
 
 fn default_harness() -> String {
@@ -77,6 +89,10 @@ fn default_harness() -> String {
 
 fn default_permissions() -> String {
     "auto".to_string()
+}
+
+fn default_feedback() -> String {
+    Feedback::default().as_str().to_string()
 }
 
 /// The coding agent an entry drives.
@@ -157,8 +173,11 @@ pub struct Agent {
     /// The binary to run: `command`, or the harness default.
     pub command: String,
     pub args: Vec<String>,
-    /// The voice instruction: `reply_instruction`, or the default.
+    /// The voice instruction: `reply_instruction`, or the default, then the
+    /// request for interims of `feedback` ([`progress::feedback_delta`]).
     pub instruction: String,
+    /// How much the agent says while it works.
+    pub feedback: Feedback,
 }
 
 /// Whether `name` is a valid agent name: non-empty, `[a-z0-9_-]`.
@@ -190,7 +209,8 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 ///
 /// Skipped: a missing, invalid or duplicate name, an unknown harness or
 /// permissions value, and a missing or nonexistent dir. An invalid hotkey is
-/// warned about but keeps the entry (the CLI still reaches it).
+/// warned about but keeps the entry (the CLI still reaches it), and so does
+/// an unknown feedback level, which is `brief` then.
 pub fn resolve_agents(entries: &[AgentConfig]) -> (Vec<Agent>, Vec<String>) {
     resolve_agents_with(entries, |p| p.is_dir())
 }
@@ -288,13 +308,26 @@ fn resolve_agents_with(
             .filter(|c| !c.is_empty())
             .map(|c| expand_tilde(c).to_string_lossy().into_owned())
             .unwrap_or_else(|| harness.default_command().to_string());
-        let instruction = entry
-            .reply_instruction
-            .as_deref()
-            .map(str::trim)
-            .filter(|i| !i.is_empty())
-            .unwrap_or(DEFAULT_REPLY_INSTRUCTION)
-            .to_string();
+        let feedback = Feedback::parse(&entry.feedback).unwrap_or_else(|| {
+            let known: Vec<&str> = Feedback::ALL.iter().map(|f| f.as_str()).collect();
+            warnings.push(format!(
+                "[[agents]] '{name}' has an unknown feedback value '{}', so it uses {} (use {})",
+                entry.feedback,
+                Feedback::default(),
+                known.join(", ")
+            ));
+            Feedback::default()
+        });
+        let instruction = format!(
+            "{}{}",
+            entry
+                .reply_instruction
+                .as_deref()
+                .map(str::trim)
+                .filter(|i| !i.is_empty())
+                .unwrap_or(DEFAULT_REPLY_INSTRUCTION),
+            progress::feedback_delta(feedback)
+        );
         agents.push(Agent {
             name: name.to_string(),
             hotkey,
@@ -305,6 +338,7 @@ fn resolve_agents_with(
             command,
             args: entry.args.clone(),
             instruction,
+            feedback,
         });
     }
     (agents, warnings)
@@ -313,6 +347,8 @@ fn resolve_agents_with(
 /// The built-in voice instruction: Claude's appended system prompt, or the
 /// prefix of the first message on a harness without one. It asks for a
 /// `<spoken>` reply, but whisrs never relies on it ([`spoken::spoken_reply`]).
+/// The agent's feedback level appends its request for interims
+/// ([`progress::feedback_delta`]).
 pub const DEFAULT_REPLY_INSTRUCTION: &str = "You are being driven by voice through whisrs. The \
 user spoke this request, and speech recognition can mishear words, so read it charitably; if a \
 misheard word could make you do something destructive or irreversible, ask first. Work as you \
@@ -441,6 +477,13 @@ pub enum TurnUpdate {
     /// background command): not this turn's reply, but spoken as one the
     /// session produced on its own. The text is the raw final message.
     SessionReply(String),
+    /// What the turn does now, as a short label for the overlay ("Running
+    /// a command", [`progress::activity_for_tool`]).
+    Activity(String),
+    /// The raw text of an assistant message a tool call followed, so known
+    /// not to be the turn's final message: maybe an acknowledgement or a
+    /// progress update ([`spoken::interim_line`], [`progress::ProgressGate`]).
+    Interim(String),
 }
 
 /// How a turn ended.
@@ -560,6 +603,11 @@ impl TurnUpdates {
         shared.stopped = true;
         shared.latest.clone()
     }
+
+    /// The newest ids the turn reported, if any.
+    pub fn latest(&self) -> Option<SessionRef> {
+        self.shared().latest.clone()
+    }
 }
 
 /// The channels between a running turn and the runtime.
@@ -647,6 +695,7 @@ mod tests {
             command: None,
             args: Vec::new(),
             reply_instruction: None,
+            feedback: "brief".to_string(),
         }
     }
 
@@ -673,7 +722,11 @@ mod tests {
                 permissions: Permissions::Auto,
                 command: "claude".to_string(),
                 args: Vec::new(),
-                instruction: DEFAULT_REPLY_INSTRUCTION.to_string(),
+                instruction: format!(
+                    "{DEFAULT_REPLY_INSTRUCTION}{}",
+                    progress::feedback_delta(Feedback::Brief)
+                ),
+                feedback: Feedback::Brief,
             }]
         );
     }
@@ -692,6 +745,7 @@ permissions = "ask"
 command = "/opt/claude/bin/claude"
 args = ["--remote-control", "jarvis"]
 reply_instruction = "Be terse."
+feedback = "Conversational"
 "#,
         )
         .unwrap();
@@ -703,7 +757,44 @@ reply_instruction = "Be terse."
         assert_eq!(a.permissions, Permissions::Ask);
         assert_eq!(a.command, "/opt/claude/bin/claude");
         assert_eq!(a.args, ["--remote-control", "jarvis"]);
-        assert_eq!(a.instruction, "Be terse.");
+        assert_eq!(a.feedback, Feedback::Conversational);
+        assert_eq!(
+            a.instruction,
+            format!(
+                "Be terse.{}",
+                progress::feedback_delta(Feedback::Conversational)
+            )
+        );
+    }
+
+    /// `summary` adds nothing to the instruction; an unknown level warns and
+    /// is `brief`, and the agent is kept.
+    #[test]
+    fn feedback_shapes_the_instruction_and_unknown_is_brief() {
+        let mut e = entry("jarvis");
+        e.feedback = " SUMMARY ".into();
+        e.reply_instruction = Some(" Be terse. ".into());
+        let (agents, warnings) = resolve(&[e]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(agents[0].feedback, Feedback::Summary);
+        assert_eq!(agents[0].instruction, "Be terse.");
+
+        let mut e = entry("jarvis");
+        e.feedback = "chatty".into();
+        let (agents, warnings) = resolve(&[e]);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].feedback, Feedback::Brief);
+        assert!(agents[0]
+            .instruction
+            .ends_with(progress::feedback_delta(Feedback::Brief)));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("unknown feedback value 'chatty'")
+                && warnings[0].contains("uses brief")
+                && warnings[0].contains("summary, brief, conversational"),
+            "{}",
+            warnings[0]
+        );
     }
 
     #[test]
@@ -848,8 +939,11 @@ reply_instruction = "Be terse."
         assert!(updates.report_session(session.clone()));
         // Plain sends keep the newest ids too.
         let (updates, _rx) = TurnUpdates::channel();
+        assert_eq!(updates.latest(), None);
         updates.send(TurnUpdate::Session(session.clone()));
         updates.send(TurnUpdate::Working);
+        updates.send(TurnUpdate::Activity("Running a command".into()));
+        assert_eq!(updates.latest(), Some(session.clone()));
         assert_eq!(updates.stop(), Some(session));
     }
 
