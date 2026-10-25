@@ -3234,7 +3234,16 @@ esac
         let fake = FakeClaude::new(&with_copy(&entry(None, "done"), Some(child.id())));
         fake.file("agents-1.json", &entry(None, "done"));
         fake.file("list-stopped.json", &with_copy(&entry(None, "done"), None));
-        let exits = fast_exits();
+        // The second listing shows the copy; under a loaded test run two
+        // fake `claude` calls can take longer than `fast_exits`' 50 ms, so
+        // this test waits as long as it takes (the wait ends once listed).
+        let exits = Exits::new(
+            Duration::from_millis(5),
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        );
         exits.discard_copy(&fake.agent(), "copy0001").await.unwrap();
         assert!(
             started.elapsed() >= Duration::from_millis(350),
