@@ -626,9 +626,10 @@ fn agent_command(
 
 /// `whisrs agent` rows: name, harness, state, and the session's background
 /// id (what `claude attach`, `claude logs` and `claude stop` take). With no
-/// bg id (an OpenCode session, or an older daemon's row) the session id is
-/// shown: all of it for OpenCode (what `opencode --session` takes), its
-/// first eight characters from an older daemon.
+/// bg id (an OpenCode or Codex session, or an older daemon's row) the
+/// session id is shown: all of it for OpenCode and Codex (what `opencode
+/// --session` and `codex resume` take), its first eight characters from an
+/// older daemon.
 fn print_agents(agents: &[whisrs::agent::AgentInfo], use_color: bool) {
     use whisrs::agent::AgentPhase;
     if agents.is_empty() {

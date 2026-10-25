@@ -118,6 +118,12 @@ impl TurnHarness for OpenCode {
     fn events(&self, line: &str) -> Vec<StreamEvent> {
         parse_line(line)
     }
+
+    /// Nothing to recognize: OpenCode reports its failures as `error`
+    /// lines, and `--session` creates a session it does not find.
+    fn stderr_failure(&self, _agent: &Agent, _stderr: &[String]) -> Option<String> {
+        None
+    }
 }
 
 /// The title of an agent's sessions in OpenCode.
@@ -571,7 +577,7 @@ mod tests {
         let a = agent(Permissions::Auto);
         let ok = Exit::Status(std::os::unix::process::ExitStatusExt::from_raw(0));
         assert_eq!(
-            outcome(&a, "OpenCode", &state, &[], &ok),
+            outcome(&a, &OpenCode, &state, &[], &ok),
             TurnOutcome::Reply(reply)
         );
     }
@@ -593,7 +599,7 @@ mod tests {
         let (sent, state) = replay(MODEL_UNAVAILABLE, None);
         // The session was created before the model failed: kept.
         assert_eq!(sent, [session("ses_whisrsfixturenoroute")]);
-        let TurnOutcome::Failed(message) = outcome(&a, "OpenCode", &state, &[], &failed) else {
+        let TurnOutcome::Failed(message) = outcome(&a, &OpenCode, &state, &[], &failed) else {
             panic!("an error line fails the turn");
         };
         assert_eq!(
@@ -607,7 +613,7 @@ mod tests {
         // An error before any session names none: nothing to continue.
         let (sent, state) = replay(BAD_SESSION_ID, None);
         assert!(sent.is_empty(), "{sent:?}");
-        let TurnOutcome::Failed(message) = outcome(&a, "OpenCode", &state, &[], &failed) else {
+        let TurnOutcome::Failed(message) = outcome(&a, &OpenCode, &state, &[], &failed) else {
             panic!("an error line fails the turn");
         };
         assert!(

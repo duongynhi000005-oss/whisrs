@@ -424,13 +424,15 @@ response_format = "wav"     # audio format requested from the API
 # hotkey = "Super+Shift+J"       # optional: records a voice turn, same syntax as [hotkeys]
 # new_session_hotkey = "Super+Shift+N"  # optional: records a voice turn that starts a
 #                                #   fresh session (whisrs agent <name> --new)
-# harness = "claude"             # claude (Claude Code, default) | opencode (OpenCode 2)
+# harness = "claude"             # claude (Claude Code, default) | opencode (OpenCode 2) |
+#                                #   codex (Codex CLI)
 # dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist
 # permissions = "auto"           # auto (default) | bypass | ask
-# command = "claude"             # optional: the binary (default: claude or opencode on
-#                                #   PATH). Set its full path when the daemon's PATH lacks
+# command = "claude"             # optional: the binary (default: claude, opencode or codex
+#                                #   on PATH). Set its full path when the daemon's PATH lacks
 #                                #   it (a systemd user service often has no ~/.local/bin)
 # args = ["--model", "sonnet"]   # optional: extra arguments for the first turn of a session
+#                                #   (Codex: for every turn)
 # reply_instruction = "..."      # optional: replaces the built-in voice instruction
 #                                #   (args and reply_instruction apply, after the restart,
 #                                #   from the next new session: whisrs agent <name> --new;
@@ -614,7 +616,7 @@ everything whisrs types, pastes or copies, wherever it is going.
 
 Agent mode lets you talk to a coding agent. Press an agent's hotkey (or run
 `whisrs agent <name>`), say what you want, and press again. whisrs sends the
-words to a Claude Code or OpenCode session working in that agent's `dir`, and
+words to a Claude Code, OpenCode or Codex session working in that agent's `dir`, and
 when the turn ends it speaks a short reply. The next press continues the same
 session, so you can answer the question the agent asked or make the decision
 it needs.
@@ -635,13 +637,20 @@ name = "coder"
 harness = "opencode"
 hotkey = "Super+Shift+K"
 dir = "~/Projects/site"
+
+[[agents]]
+name = "cx"
+harness = "codex"
+hotkey = "Super+Shift+C"
+dir = "~/Projects/api"
 ```
 
 ```
 whisrs agent                       # list the agents: name, harness, idle | working | needs-you, and
                                    #   the id of each session: Claude Code's background id (what
                                    #   claude attach <id> takes), OpenCode's session id (what
-                                   #   opencode --session <id> takes)
+                                   #   opencode --session <id> takes), Codex's thread id (what
+                                   #   codex resume <id> takes)
 whisrs agent jarvis                # record a voice turn (same as the hotkey; press again to stop)
 whisrs agent jarvis --text "..."   # send a typed turn (`--text -` reads stdin)
 whisrs agent jarvis --new          # record a voice turn that starts a fresh session (same as
@@ -662,6 +671,9 @@ What you need:
   `opencode run` (a provider you set up with `opencode auth`; the free
   OpenCode Zen models refused `opencode run` when tested). See "OpenCode"
   below.
+- Or, for `harness = "codex"`: the Codex CLI (`codex`), signed in with
+  `codex login` (a ChatGPT plan or an API key). Tested on 0.164.0 against a
+  local mock model, not a real account. See "Codex" below.
 - `[tts] enabled = true` to hear the replies. Without it they arrive as
   notifications only, and `whisrsd` warns at startup.
 - `whisrs restart` after adding or changing an `[[agents]]` entry: the daemon
@@ -702,7 +714,7 @@ How a turn goes:
   transcript starts a new session instead of continuing the old one. Press
   either key again (or run `--new` again) to stop and send; the press that
   started the recording decides. The old session is forgotten only once there
-  is something to send, and stays in Claude Code or OpenCode. `--new --text "..."` does
+  is something to send, and stays in Claude Code, OpenCode or Codex. `--new --text "..."` does
   the same with typed text, and `--reset` only forgets the session. Both are
   refused while a turn of that agent runs: stop it first with `--stop`. While
   that turn waits for you, the refusal says what it waits for ("Waiting for
@@ -807,8 +819,8 @@ for how long.
   not on screen, the "Speak to 'jarvis'..." and "Sending to 'jarvis'..."
   notifications stand in for it (with `[general] notify` on).
 
-With Claude Code, `permissions` maps to its permission modes (OpenCode's
-mapping is under "OpenCode" below):
+With Claude Code, `permissions` maps to its permission modes (OpenCode's and
+Codex's mappings are under "OpenCode" and "Codex" below):
 
 | `permissions` | Claude Code |
 |---|---|
@@ -963,6 +975,109 @@ Code session sets (the list above), what a parent OpenCode session sets
 keys. Everything else is passed on, OpenCode's own settings included
 (`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, the XDG
 directories).
+
+### Codex
+
+With `harness = "codex"`, each turn is one `codex exec` process, which ends
+with the turn. This was tested on Codex CLI 0.164.0 against a local mock
+model, not a real account. The first turn starts a session, every later one
+resumes it:
+
+```
+codex exec --json --skip-git-repo-check <permissions> -c analytics.enabled=false -c developer_instructions=<instruction> [<args>] -
+codex exec --json --skip-git-repo-check <permissions> -c analytics.enabled=false -c developer_instructions=<instruction> [<args>] resume <id> -
+```
+
+The words go in on stdin. `--skip-git-repo-check` lets `dir` be any folder,
+not only a git repository. `analytics.enabled=false` turns Codex's usage
+metrics off for these runs: with them on, `codex exec` sends them after the
+turn and exits only once they are sent, which held every reply back by 4 to
+10 seconds when tested. To keep them, put `"-c", "analytics.enabled=true"` in
+`args`: it comes later, so it wins.
+
+Sessions. Codex makes up the session id (a thread id, a UUID), and whisrs
+reads it from the first line Codex prints. `whisrs agent` shows the whole id;
+`codex resume <id>` opens the session in Codex. whisrs resumes a session only
+by that id, never by a name. A turn that failed after Codex started the
+session (the model refused the request, say) keeps it, and the next turn
+continues it. If Codex no longer has the session (you deleted or archived
+it), the turn fails with "Codex no longer has this agent's session" and
+`whisrs agent <name> --new` starts a new one.
+
+The voice instruction (the built-in one or your `reply_instruction`, with the
+request of your `feedback` level) goes in as Codex's developer instructions,
+on every turn. The model gets it as a developer message, so it never shows as
+your words. Passing it again on a later turn does not repeat it, and it
+survives a compaction of a long session, which drops an instruction that was
+given only on the first turn (both measured). A changed instruction applies
+from the next new session, as with the other harnesses.
+
+`permissions` for Codex:
+
+| `permissions` | Codex |
+|---|---|
+| `auto` (default) | `--approve-for-me`: the workspace-write sandbox, so the agent changes files in `dir` (network off); a command that needs more goes to Codex's automatic reviewer, which approves or refuses it (one more model call) |
+| `bypass` | `--dangerously-bypass-approvals-and-sandbox`: no sandbox and no approvals |
+| `ask` | `--sandbox read-only`: the agent reads files and runs commands that only read; anything that would change something is refused, so it tells you what it would do instead |
+
+Nobody can answer Codex's approval requests during a turn: `codex exec`
+refuses what it may not do, the agent is told so and goes on, and the reply
+usually says what it could not do. So a Codex agent never shows needs-you, and
+a turn never waits for you. Leave sandbox and approval flags out of `args`:
+`--approve-for-me` and `--sandbox` together make Codex refuse to start.
+
+When `dir` is a git repository, a turn with `auto` or `bypass` makes Codex
+record the repository as trusted in its own `config.toml`
+(`[projects."<dir>"] trust_level = "trusted"`), as running Codex there in a
+writable mode yourself does, and Codex then also loads that project's own
+`.codex/` settings. `ask` records nothing (both measured).
+
+Which keys apply when: `permissions` and `args` are passed on every turn,
+since `codex exec resume` keeps neither from the first turn (a `-m` model
+given only on the first turn was gone on the next, measured). So after
+`whisrs restart` a change to either applies from the next turn.
+`reply_instruction` and `feedback` are fixed when a session starts, as with
+Claude Code. `command` is the `codex` binary.
+
+Billing. `codex exec` uses the sign-in Codex already has: your ChatGPT plan,
+or an API key at API prices. A `CODEX_API_KEY` in the daemon's environment
+takes precedence over a ChatGPT sign-in, and whisrs passes it on. With
+`auto`, each review by the automatic reviewer is one more model call. When
+Codex is not signed in, the turn fails after about 40 seconds of retries with
+"it is not signed in, or its sign-in expired": run `codex login` in a
+terminal.
+
+What you hear and see works as with Claude Code, with two differences. Codex
+reports a tool call when it starts, so the overlay's activity line, and the
+acknowledgement the agent wrote before its first tool call, come as soon as
+the call begins (a command the read-only sandbox blocked showed no activity
+when tested: Codex printed no line for it). And between turns no Codex process
+runs: a session never works on its own, and a new turn is never refused for
+that.
+
+`--stop` interrupts the turn: whisrs sends `codex exec` SIGINT, then SIGTERM
+and SIGKILL if it is still running a few seconds later, and returns once it
+is gone. Codex ends the command it runs with it, sandboxed or not. The session
+keeps what it did; the next turn continues it. Stopping a command that runs in
+the workspace-write sandbox (`auto`) can leave empty `.git`, `.codex`,
+`.agents` and `.aws` directories in `dir` where it had none: the sandbox's
+mount points, which Codex does not remove when it is interrupted (measured).
+Delete them if they are in the way.
+
+A daemon restart during a turn ends that turn, as with OpenCode, and the
+restarted daemon says "whisrs restarted during that turn, which stopped it
+before Codex replied." The session keeps what it did so far, and the next turn
+continues it.
+
+`codex` runs in the agent's `dir`, with `PWD` set to it, and the daemon's
+environment minus what a parent Claude Code session sets (the list above),
+what a parent Codex session sets for the commands it runs (`CODEX_THREAD_ID`,
+`CODEX_SESSION_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_CI`, `CODEX_SANDBOX`,
+`CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_VERSION`,
+`CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS`), `RUST_LOG` (whisrsd's log level,
+which Codex would take as its own and print its logs at) and whisrs's own
+`WHISRS_*` keys. Everything else is passed on, Codex's own settings included
+(`CODEX_HOME`, `CODEX_API_KEY`).
 
 ## Choosing the microphone
 

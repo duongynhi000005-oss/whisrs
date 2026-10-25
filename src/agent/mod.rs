@@ -12,14 +12,15 @@
 //! Two driver shapes fit [`Driver`]: Claude Code's turn is launched as a
 //! background session and ends on a hook event or a poll
 //! ([`claude::ClaudeDriver`]); a process-per-turn driver
-//! ([`process::ProcessDriver`], OpenCode's [`opencode::OpenCode`]) spawns
-//! one child per turn, reads the session id and the final message from its
-//! JSON output, returns when the child exits, and stops the child when the
-//! turn is stopped or dropped. The runtime only ever calls the [`Driver`]
-//! methods.
+//! ([`process::ProcessDriver`], OpenCode's [`opencode::OpenCode`] and
+//! Codex's [`codex::Codex`]) spawns one child per turn, reads the session id
+//! and the final message from its JSON output, returns when the child exits,
+//! and stops the child when the turn is stopped or dropped. The runtime only
+//! ever calls the [`Driver`] methods.
 
 pub mod claude;
 pub mod claude_tail;
+pub mod codex;
 pub mod display;
 pub mod opencode;
 pub mod process;
@@ -61,7 +62,7 @@ pub struct AgentConfig {
     /// `hotkey`.
     #[serde(default)]
     pub new_session_hotkey: Option<String>,
-    /// Which coding agent: `claude` (default) or `opencode`.
+    /// Which coding agent: `claude` (default), `opencode` or `codex`.
     #[serde(default = "default_harness")]
     pub harness: String,
     /// The directory the agent works in. `~` is expanded; it must exist.
@@ -73,7 +74,8 @@ pub struct AgentConfig {
     /// The harness binary. Default: the harness name on `PATH`.
     #[serde(default)]
     pub command: Option<String>,
-    /// Extra arguments, passed on the first turn of a session.
+    /// Extra arguments, passed on the first turn of a session (Codex: on
+    /// every turn, since `codex exec resume` keeps none of them).
     #[serde(default)]
     pub args: Vec<String>,
     /// Replaces the built-in voice instruction ([`DEFAULT_REPLY_INSTRUCTION`]).
@@ -107,16 +109,19 @@ pub enum Harness {
     Claude,
     /// OpenCode 2 (`opencode run`, a process per turn).
     OpenCode,
+    /// Codex CLI (`codex exec`, a process per turn).
+    Codex,
 }
 
 impl Harness {
     /// Every harness this build drives, for messages.
-    pub const ALL: &'static [Harness] = &[Harness::Claude, Harness::OpenCode];
+    pub const ALL: &'static [Harness] = &[Harness::Claude, Harness::OpenCode, Harness::Codex];
 
     pub fn parse(s: &str) -> Option<Harness> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(Harness::Claude),
             "opencode" => Some(Harness::OpenCode),
+            "codex" => Some(Harness::Codex),
             _ => None,
         }
     }
@@ -125,6 +130,7 @@ impl Harness {
         match self {
             Harness::Claude => "claude",
             Harness::OpenCode => "opencode",
+            Harness::Codex => "codex",
         }
     }
 
@@ -133,6 +139,7 @@ impl Harness {
         match self {
             Harness::Claude => "claude",
             Harness::OpenCode => "opencode",
+            Harness::Codex => "codex",
         }
     }
 
@@ -141,6 +148,7 @@ impl Harness {
         match self {
             Harness::Claude => "Claude Code",
             Harness::OpenCode => "OpenCode",
+            Harness::Codex => "Codex",
         }
     }
 }
@@ -432,7 +440,7 @@ pub struct AgentInfo {
     pub phase: AgentPhase,
     /// The session id, once there is one: its first eight characters
     /// beside a bg id (Claude), else all of it, as the harness takes it
-    /// (`opencode --session <id>`).
+    /// (`opencode --session <id>`, `codex resume <id>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// The id of the background process running the session (Claude: the
@@ -461,7 +469,8 @@ pub const BACKGROUND_TASK: &str = "It's still running a background task.";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRef {
     /// The harness's session id (Claude: the conversation UUID; OpenCode:
-    /// `ses_...`, minted by whisrs).
+    /// `ses_...`, minted by whisrs; Codex: the thread UUID its first line
+    /// names).
     #[serde(default)]
     pub session_id: Option<String>,
     /// The id of the background process running it (Claude: the short id
@@ -862,7 +871,7 @@ feedback = "Conversational"
         assert!(warnings[4].contains("/nope does not exist"));
         assert!(
             warnings[5].contains("unknown harness 'aider'")
-                && warnings[5].contains("drives: claude, opencode"),
+                && warnings[5].contains("drives: claude, opencode, codex"),
             "{}",
             warnings[5]
         );
@@ -912,6 +921,20 @@ feedback = "Conversational"
     }
 
     #[test]
+    fn a_codex_entry_runs_codex_by_default() {
+        let mut e = entry("cx");
+        e.harness = "Codex".into();
+        e.permissions = "ask".into();
+        let (agents, warnings) = resolve(&[e]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(agents[0].harness, Harness::Codex);
+        assert_eq!(agents[0].command, "codex");
+        assert_eq!(agents[0].permissions, Permissions::Ask);
+        assert_eq!(Harness::Codex.to_string(), "codex");
+        assert_eq!(Harness::Codex.label(), "Codex");
+    }
+
+    #[test]
     fn tilde_expands_to_home() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_tilde("~"), home);
@@ -937,6 +960,7 @@ feedback = "Conversational"
     fn harness_and_permissions_parse_case_insensitively() {
         assert_eq!(Harness::parse(" Claude "), Some(Harness::Claude));
         assert_eq!(Harness::parse("OpenCode"), Some(Harness::OpenCode));
+        assert_eq!(Harness::parse(" CODEX"), Some(Harness::Codex));
         assert_eq!(Harness::parse("aider"), None);
         for harness in Harness::ALL {
             assert_eq!(Harness::parse(harness.as_str()), Some(*harness));

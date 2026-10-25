@@ -1,7 +1,8 @@
 //! The process-per-turn driver: each turn is one harness process that prints
-//! JSON lines and exits (OpenCode's `opencode run`). A harness module says
-//! how a turn starts and what a line of its output means ([`TurnHarness`]);
-//! [`ProcessDriver`] does the rest, the same for every such harness:
+//! JSON lines and exits (OpenCode's `opencode run`, Codex's `codex exec`). A
+//! harness module says how a turn starts and what a line of its output means
+//! ([`TurnHarness`]); [`ProcessDriver`] does the rest, the same for every such
+//! harness:
 //!
 //! - **Spawn:** the agent's `command` with the harness's arguments, in the
 //!   agent's dir, with the daemon's environment minus what a parent session
@@ -21,7 +22,8 @@
 //!   id it names is reported when it is new ([`TurnUpdate::Session`]), a tool
 //!   call is an activity ([`activity_for_tool`]) and releases the assistant
 //!   text before it as an interim ([`InterimTracker`]), and the text of the
-//!   last message is the reply. Stderr is kept for the error.
+//!   last message is the reply. Stderr is kept for the error, which the
+//!   harness may recognize ([`TurnHarness::stderr_failure`]).
 //! - **Stop:** SIGINT to the group, then SIGTERM, then SIGKILL, each sent
 //!   only while something of the group is left, after the previous one's
 //!   grace ([`STOP_GRACES`]). A turn dropped while its process runs (its task
@@ -131,6 +133,12 @@ pub trait TurnHarness: Send + Sync + 'static {
     /// The events of one stdout line, in order. None for a line that says
     /// nothing about the turn, or is not the harness's JSON.
     fn events(&self, line: &str) -> Vec<StreamEvent>;
+
+    /// The failure of a turn that printed no error event and no reply and
+    /// exited unsuccessfully, from its last stderr lines, when the harness
+    /// recognizes them (a session it no longer has); `None` leaves it to
+    /// the line that mentions an error ([`stderr_detail`]).
+    fn stderr_failure(&self, agent: &Agent, stderr: &[String]) -> Option<String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,14 +250,16 @@ impl std::fmt::Display for Exit {
 /// How the turn ended, from what its output said and how its process
 /// exited. An error the harness reported fails it; otherwise the last
 /// message is the reply (a non-zero exit after one is only logged); a turn
-/// with neither fails with what stderr said.
+/// with neither fails with what stderr said, as the harness reads it
+/// ([`TurnHarness::stderr_failure`]) or else generically.
 pub fn outcome(
     agent: &Agent,
-    label: &str,
+    harness: &dyn TurnHarness,
     state: &StreamState,
     stderr: &[String],
     exit: &Exit,
 ) -> TurnOutcome {
+    let label = harness.label();
     if let Some(error) = &state.error {
         return TurnOutcome::Failed(format!(
             "Agent '{}': {label} failed: {}",
@@ -271,6 +281,9 @@ pub fn outcome(
             "Agent '{}': {label} ended the turn without a reply.",
             agent.name
         ));
+    }
+    if let Some(message) = harness.stderr_failure(agent, stderr) {
+        return TurnOutcome::Failed(message);
     }
     let detail = stderr_detail(stderr)
         .map(|line| sentence(&line))
@@ -295,7 +308,7 @@ pub fn stderr_detail(lines: &[String]) -> Option<String> {
 
 /// `text` on one line, capped at [`ERROR_MAX`] characters, ending in
 /// punctuation.
-fn sentence(text: &str) -> String {
+pub fn sentence(text: &str) -> String {
     let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() > ERROR_MAX {
         line = line.chars().take(ERROR_MAX).collect::<String>() + "...";
@@ -880,7 +893,7 @@ impl<H: TurnHarness> Driver for ProcessDriver<H> {
             read.exit,
             read.state.texts.len()
         );
-        outcome(agent, label, &read.state, &read.stderr, &read.exit)
+        outcome(agent, &self.harness, &read.state, &read.stderr, &read.exit)
     }
 
     /// The turn's process ended with the old daemon: it never replied.
@@ -946,7 +959,7 @@ mod tests {
     /// A harness run by `sh -c <script>`, with a line protocol of its own:
     /// `S <id>` a session, `T <message> <text>` a text, `U <tool>` a tool
     /// call, `E <message>` an error; any other line is a text of message
-    /// `raw`.
+    /// `raw`. A stderr line `gone` is a session it no longer has.
     struct Fake {
         script: String,
     }
@@ -992,6 +1005,19 @@ mod tests {
                     text: line.to_string(),
                 },
             }]
+        }
+
+        fn stderr_failure(&self, agent: &Agent, stderr: &[String]) -> Option<String> {
+            stderr
+                .iter()
+                .any(|l| l == "gone")
+                .then(|| format!("Agent '{}': its session is gone.", agent.name))
+        }
+    }
+
+    fn harness() -> Fake {
+        Fake {
+            script: String::new(),
         }
     }
 
@@ -1118,16 +1144,17 @@ mod tests {
     #[test]
     fn the_outcome_prefers_an_error_then_the_reply_then_stderr() {
         let a = agent(Path::new("/proj"));
+        let h = harness();
         let (updates, _rx) = TurnUpdates::channel();
         let mut replied = StreamState::new(None);
         replied.event(text("m", "Done. <spoken>Done.</spoken>"), &updates);
         assert_eq!(
-            outcome(&a, "Fake", &replied, &[], &status(0)),
+            outcome(&a, &h, &replied, &[], &status(0)),
             TurnOutcome::Reply("Done. <spoken>Done.</spoken>".into())
         );
         // A reply, then a non-zero exit: still the reply.
         assert_eq!(
-            outcome(&a, "Fake", &replied, &[], &status(1)),
+            outcome(&a, &h, &replied, &[], &status(1)),
             TurnOutcome::Reply("Done. <spoken>Done.</spoken>".into())
         );
         // An error the harness reported wins, on one line.
@@ -1138,14 +1165,14 @@ mod tests {
             &updates,
         );
         assert_eq!(
-            outcome(&a, "Fake", &failed, &[], &status(1)),
+            outcome(&a, &h, &failed, &[], &status(1)),
             TurnOutcome::Failed(
                 "Agent 'coder': Fake failed: Could not connect. Check the port.".into()
             )
         );
         let empty = StreamState::new(None);
         assert_eq!(
-            outcome(&a, "Fake", &empty, &[], &status(0)),
+            outcome(&a, &h, &empty, &[], &status(0)),
             TurnOutcome::Failed("Agent 'coder': Fake ended the turn without a reply.".into())
         );
         let stderr = vec![
@@ -1154,16 +1181,31 @@ mod tests {
             "see --help".into(),
         ];
         assert_eq!(
-            outcome(&a, "Fake", &empty, &stderr, &status(2)),
+            outcome(&a, &h, &empty, &stderr, &status(2)),
             TurnOutcome::Failed(
                 "Agent 'coder': Fake failed: error: unknown option --standalone.".into()
             )
         );
         assert_eq!(
-            outcome(&a, "Fake", &empty, &[], &status(3)),
+            outcome(&a, &h, &empty, &[], &status(3)),
             TurnOutcome::Failed(
                 "Agent 'coder': Fake failed: it exited with exit status: 3.".into()
             )
+        );
+        // What the harness recognizes in stderr comes before the generic line,
+        // but never before an error event or a reply.
+        let gone = vec!["error: thread not found".into(), "gone".into()];
+        assert_eq!(
+            outcome(&a, &h, &empty, &gone, &status(1)),
+            TurnOutcome::Failed("Agent 'coder': its session is gone.".into())
+        );
+        assert_eq!(
+            outcome(&a, &h, &replied, &gone, &status(1)),
+            TurnOutcome::Reply("Done. <spoken>Done.</spoken>".into())
+        );
+        assert_eq!(
+            outcome(&a, &h, &empty, &gone, &status(0)),
+            TurnOutcome::Failed("Agent 'coder': Fake ended the turn without a reply.".into())
         );
     }
 
@@ -1185,9 +1227,7 @@ mod tests {
 
     #[test]
     fn every_driver_strips_a_parent_sessions_variables_and_whisrs_keys() {
-        let driver = ProcessDriver::new(Fake {
-            script: String::new(),
-        });
+        let driver = ProcessDriver::new(harness());
         for name in [
             "CLAUDECODE",
             "CLAUDE_CODE_SESSION_ID",

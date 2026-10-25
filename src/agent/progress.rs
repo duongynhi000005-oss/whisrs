@@ -145,7 +145,7 @@ pub fn activity_for_tool(name: &str) -> String {
         "grep" | "glob" => "Searching the code",
         "webfetch" => "Reading a web page",
         "websearch" | "web_search" => "Searching the web",
-        "task" | "agent" => "Working with a helper",
+        "task" | "agent" | "collab_tool_call" => "Working with a helper",
         "todowrite" | "todo_list" => "Planning",
         _ => WORKING,
     };
@@ -381,6 +381,7 @@ mod tests {
             ("file_change", "Editing files"),
             ("web_search", "Searching the web"),
             ("todo_list", "Planning"),
+            ("collab_tool_call", "Working with a helper"),
             ("webfetch", "Reading a web page"),
             ("todowrite", "Planning"),
         ] {

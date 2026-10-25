@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a17400-3f5e-7711-acfd-6693d0d64e53"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `mock-1` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"error","message":"{\"error\": {\"message\": \"mock: this request is refused\", \"type\": \"invalid_request_error\", \"code\": \"mock_refused\"}}"}
+{"type":"turn.failed","error":{"message":"{\"error\": {\"message\": \"mock: this request is refused\", \"type\": \"invalid_request_error\", \"code\": \"mock_refused\"}}"}}

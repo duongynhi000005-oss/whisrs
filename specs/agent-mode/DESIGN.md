@@ -35,12 +35,16 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
   none: without it a session starts in the user's `permissions.defaultMode`, which may be
   `auto`, and `ask` would not ask. OpenCode: `auto` → no flag, `bypass` → `--auto`, `ask` →
   shell and edit ask rules appended to `OPENCODE_CONFIG_CONTENT` (see "OpenCode driver").
+  Codex: `auto` → `--approve-for-me`, `bypass` → `--dangerously-bypass-approvals-and-sandbox`,
+  `ask` → `--sandbox read-only` (see "Codex driver").
 - `[[agents]]` (and `[agent_overlay]`) is read once, when the daemon starts
   (`AgentRuntime::new`): any change needs `whisrs restart` first.
 - `permissions`, `args` and `reply_instruction` are fixed when a session starts (a resume
   passes no flag, see below), so after the restart a change applies from the next `--new`.
   OpenCode passes `permissions` on every turn (`run` keeps none), so a change applies from the
   next turn after the restart; `args` and the instruction are fixed at session start there too.
+  Codex passes `permissions` and `args` on every turn (`exec resume` keeps neither, measured);
+  the instruction is fixed at session start there too.
 - Validation warns (and skips the entry, `resolve_agents`) on a missing, invalid (not
   `[a-z0-9_-]`) or duplicate name, an unknown harness or `permissions` value, and a missing
   or nonexistent dir; a hotkey clash is reported like the `[[llm_commands]]` clashes. Agents
@@ -441,8 +445,8 @@ Deviations from the plan, as built:
   a reply that lands after a daemon restart is still spoken. A changed `harness` or `dir`
   starts a fresh session.
 - Daemon shutdown leaves agent sessions running; they belong to the harness. A
-  process-per-turn turn (OpenCode) ends with the daemon (see "OpenCode driver"); its session
-  stays, and the next turn continues it.
+  process-per-turn turn (OpenCode, Codex) ends with the daemon (see "OpenCode driver"); its
+  session stays, and the next turn continues it.
 
 ## Layout
 
@@ -453,6 +457,7 @@ src/agent/claude.rs     # Claude Code driver
 src/agent/claude_tail.rs  # transcript tail: activities and interims
 src/agent/process.rs    # process-per-turn base: ProcessDriver<H: TurnHarness>, StreamState, stop
 src/agent/opencode.rs   # OpenCode driver (a TurnHarness)
+src/agent/codex.rs      # Codex driver (a TurnHarness)
 src/agent/progress.rs   # feedback levels, instruction deltas, labels, tracker, gate (pure)
 src/agent/display.rs    # the agent overlay's Board and rows (pure)
 src/agent/store.rs      # agents.json
@@ -471,7 +476,7 @@ from its JSON output (`kill_on_drop`). Adding one must not change the runtime.
 ## Phase 2 drivers (same PR, after the phase 1 test)
 
 - OpenCode: built, see "OpenCode driver".
-- Codex: `codex exec --json`, `codex exec resume <id>`, on the same base (a `TurnHarness`).
+- Codex: built, see "Codex driver".
 - GitHub Copilot CLI: `copilot -p ... --output-format json`, on the same base.
 - Each follows its own documentation; contracts are collected before phase 2 starts.
 
@@ -480,8 +485,9 @@ from its JSON output (`kill_on_drop`). Adding one must not change the runtime.
 A harness whose turn is one process implements `TurnHarness`, every method required:
 `label` (for messages), `launch` (agent, session, request → `Launch`: the args after `command`,
 the prompt for stdin or `None` for `/dev/null`, extra env), `strips_env` (its parent-session
-variables) and `events` (one stdout line → `StreamEvent`s: `Session(id)`, `Text { message, text }`,
-`Tool(name)`, `Error(message)`). `ProcessDriver<H>` is the `Driver`:
+variables), `events` (one stdout line → `StreamEvent`s: `Session(id)`, `Text { message, text }`,
+`Tool(name)`, `Error(message)`) and `stderr_failure` (a failure it recognizes in the last stderr
+lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is the `Driver`:
 
 - **Spawn:** `command` in `dir`, own process group, `PWD` = dir, the daemon's environment minus
   `claude::strips_env` (Claude's parent-session list and `WHISRS_*`) and the harness's own list,
@@ -497,7 +503,8 @@ variables) and `events` (one stdout line → `StreamEvent`s: `Session(id)`, `Tex
   the exit (a leftover process can hold stdout open).
 - **Outcome:** an `Error` event fails the turn ("Agent 'x': OpenCode failed: ..."); else the
   reply (a non-zero exit after it is only logged); else "ended the turn without a reply" on exit
-  0, or the stderr line that mentions an error (else its last), or the exit status.
+  0, or what `stderr_failure` recognizes, or the stderr line that mentions an error (else its
+  last), or the exit status.
 - **Stop:** SIGINT, SIGTERM, SIGKILL to the group (`STOP_GRACES` 3 s, 2 s, 2 s), each only while
   something of the group is left (the exit seen and `kill(-pgid, 0)` = ESRCH); never `kill(0)`
   or `kill(-1)`. Run once per process (`OnceCell`), so `Driver::stop` after the abort and the
@@ -556,6 +563,71 @@ variables) and `events` (one stdout line → `StreamEvent`s: `Session(id)`, `Tex
 - **List:** `whisrs agent` shows the whole session id when there is no bg id (what
   `opencode --session` takes); Claude's rows keep the short id beside the bg id.
 - OpenCode 1 (no `--standalone`, `--session` only continues) is not driven.
+
+### Codex driver (verified on 0.164.0 against a local mock model)
+
+Tested with the npm-packed `codex` 0.164.0, an isolated `CODEX_HOME` whose `model_providers.mock`
+points at a scripted Responses API server; no account and no real model.
+
+- **Every turn:** `codex exec --json --skip-git-repo-check <permissions> -c
+  analytics.enabled=false -c developer_instructions=<TOML string> [args…] -`, the prompt on
+  stdin; a later turn adds `resume <thread id>` before the `-`. Every option goes before
+  `resume` (`--sandbox` and `--approve-for-me` are a usage error after it). The skip lets `dir`
+  be any folder (without it Codex exits 1 outside a git repo).
+- **Session id:** Codex mints it; the first line is `thread.started{thread_id}` (a UUIDv7), and a
+  resumed turn repeats the same id. Only a UUID is taken (`codex::is_thread_id`) and resumed: a
+  stored id that is not one fails the turn, since Codex would look it up as a thread name (and
+  start a new thread when none matches). A turn that failed after `thread.started` (a provider
+  400) keeps a resumable thread (measured). A thread Codex no longer has fails the resume on
+  stderr (`no rollout found for thread id`, exit 1), which `stderr_failure` turns into "Codex no
+  longer has this agent's session ... `--new` starts a new one".
+- **On every turn:** `args` (a `-m` model of turn 1 was gone on turn 2, measured) and the
+  permission flags (a resumed turn applies the flags it is given, measured from read-only to
+  bypass, to auto, back to read-only).
+- **Analytics:** with analytics on (Codex's default), `codex exec` uploads metrics after
+  `turn.completed` and exits only after the upload, 4 to 10 s later (measured, every run), and the
+  reply waits for the exit. `-c analytics.enabled=false` makes it exit about 25 ms after the turn.
+  A later `-c analytics.enabled=true` in `args` wins (measured).
+- **Instruction:** `-c developer_instructions=<instruction as a TOML basic string>` (`-c` parses
+  its value as TOML; an instruction that parsed as another value would not be a string). It
+  arrives as a `developer` message, never in the user's turn. Measured: once per request on
+  every turn when passed every turn; a changed value on a resumed turn is not added (the stored
+  one stays); with it passed on the first turn only, a compaction drops it from every later
+  request, and passed on every turn it survives the compaction. So it is passed on every turn.
+- **Permissions:** `codex exec` forces approval policy `never` and refuses every approval request
+  (commands, patches, `request_user_input`), so a turn never waits. `auto` = `--approve-for-me`
+  (workspace-write sandbox, network off; an escalation goes to the automatic reviewer, an extra
+  model call), `bypass` = `--dangerously-bypass-approvals-and-sandbox`, `ask` = `--sandbox
+  read-only` (reads and read-only commands run; writes are refused), explicit so a user's
+  `sandbox_mode` cannot loosen it. `ask` matches OpenCode's: nothing changes without the user.
+  In a git repo, every writable mode (`auto`, `bypass`, plain workspace-write) makes Codex write
+  `[projects."<dir>"] trust_level = "trusted"` into `$CODEX_HOME/config.toml` (measured; read-only
+  writes nothing): Codex's own behavior, documented for users.
+- **Events:** `item.completed` of an `agent_message` → `Text { item.id, text }` (one message per
+  item; the last is the reply, as Codex's own final message); `item.started` of
+  `command_execution`, `file_change`, `web_search`, `todo_list`, `collab_tool_call` → `Tool(type)`,
+  and of `mcp_tool_call` → `Tool("mcp__<server>__<tool>")`, so the activity and the interim come
+  when a call starts (file changes and web searches also start, measured); `turn.failed` →
+  `Error(error.message)`, a provider's JSON body reduced to its `error.message` and a
+  `401 Unauthorized` turned into "it is not signed in, or its sign-in expired ... `codex login`".
+  Nothing from top-level `error` lines and `error` items (retries and warnings; a fatal one
+  comes back in `turn.failed`), from `item.completed` of tools (an unfinished one is completed
+  after the final message at `turn.completed`, and would release the reply as an interim), nor
+  from `item.updated`, `reasoning`, `turn.started`, `turn.completed`. The turn ends at the exit.
+- **Stop:** SIGINT interrupts the turn; Codex exits (about 70 ms through whisrs) and ends the
+  command it runs, sandboxed (`bwrap --die-with-parent`, its own session) or not; SIGKILL of the
+  group also took the command along (measured). The next turn resumes the thread with the stopped
+  turn in it (measured). Interrupting a command in the workspace-write sandbox leaves bwrap's
+  empty mount points (`.git`, `.codex`, `.agents`, `.aws`) in a dir that lacked them (measured;
+  a command that runs to its end leaves none). Codex's behavior; documented, not cleaned up.
+- **Restart:** as OpenCode's: `PR_SET_PDEATHSIG` interrupts the turn when whisrsd exits, the
+  rewatch fails it with `cut_off` (measured), and the next turn resumes the thread.
+- **Environment:** besides the base's stripping, what a parent Codex session sets in its tool
+  shells (`CODEX_THREAD_ID`, `CODEX_SESSION_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_CI`, `CODEX_SANDBOX`,
+  `CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_VERSION`, `CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS`)
+  and `RUST_LOG` (Codex reads it and logs to stderr at whisrsd's level, measured). `CODEX_HOME`
+  and `CODEX_API_KEY` pass; the latter beats a ChatGPT sign-in, which the docs say.
+- **List:** the whole thread id, what `codex resume <id>` takes.
 
 ## Later
 

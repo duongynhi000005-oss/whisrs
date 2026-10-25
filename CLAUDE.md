@@ -80,6 +80,7 @@ src/
 │   ├── process.rs          #   Process-per-turn base: ProcessDriver<H: TurnHarness> (spawn in own pgid + PDEATHSIG,
 │   │                       #   JSON lines -> StreamEvent -> TurnUpdates, SIGINT/TERM/KILL stop, outcome)
 │   ├── opencode.rs         #   OpenCode driver (TurnHarness): opencode run --standalone --format json --session <id>
+│   ├── codex.rs            #   Codex driver (TurnHarness): codex exec --json [... resume <thread id>] -
 │   ├── progress.rs         #   feedback levels + instruction deltas, activity labels, InterimTracker, ProgressGate
 │   ├── display.rs          #   Agent overlay model: Board (voice > needs-you > working > done/error), rows, timer
 │   └── store.rs            #   $XDG_DATA_HOME/whisrs/agents.json (0600, atomic), written only with agents
@@ -319,7 +320,7 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
-Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude|opencode`, `dir`, `permissions` =
+Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude|opencode|codex`, `dir`, `permissions` =
 `auto|bypass|ask`, `command`, `args`, `reply_instruction`, `feedback` = `summary|brief|conversational`;
 `agent::resolve_agents` validates and skips bad entries, shared by `Config::validate` and the runtime),
 plus `[agent_overlay]` (`enabled` follows `[general] overlay`, `style` = `orb|face`, `corner`). With none, nothing runs and no file
@@ -348,9 +349,10 @@ reply and is spoken, unless it repeats a turn that ended on a poll (`TurnOutcome
 permission prompt with no turn running marks needs-you. A session working on its own refuses a turn
 (`TurnOutcome::Busy`, "It's still running a background task."). The child gets the daemon's env minus
 `claude::PARENT_SESSION_VARS` and `WHISRS_*`. Only stored ids are ever passed to `claude`.
-A process-per-turn harness (OpenCode) implements `process::TurnHarness` only (`label`, `launch`
+A process-per-turn harness (OpenCode, Codex) implements `process::TurnHarness` only (`label`, `launch`
 -> `Launch` {args, stdin, env}, `strips_env`, `events`: one stdout line -> `StreamEvent`s Session /
-Text {message} / Tool / Error); `process::ProcessDriver` does the rest: spawn from a thread that
+Text {message} / Tool / Error, `stderr_failure`: a failure it recognizes in stderr, else `None`);
+`process::ProcessDriver` does the rest: spawn from a thread that
 waits for the child (own process group, `PWD` = dir, stdin the prompt then closed, `PR_SET_PDEATHSIG`
 = SIGINT so a turn dies with the daemon, as the cgroup kill does under systemd), `StreamState`
 (a new session id reported once, `InterimTracker` on Text/Tool, the reply = the last message's text
@@ -360,6 +362,13 @@ SIGKILL to the group, `STOP_GRACES`; a dropped turn is stopped too, `Registered`
 OpenCode: whisrs mints the `ses_` id (`opencode::new_session_id`), the first turn passes
 `--title whisrs-<name>` + `args` and prefixes the voice instruction to the prompt, `bypass` =
 `--auto`, `ask` = shell/edit ask rules appended to `OPENCODE_CONFIG_CONTENT` (`opencode::ask_config`).
+Codex (tested against a mock model only): the id is the `thread.started` UUID (only a UUID is ever
+resumed, `codex::is_thread_id`); every turn passes the permission flags (`auto` = `--approve-for-me`,
+`bypass` = `--dangerously-bypass-approvals-and-sandbox`, `ask` = `--sandbox read-only`),
+`-c analytics.enabled=false` (else the exit, and the reply, waits seconds for a metrics upload),
+`-c developer_instructions=<TOML string>` (survives compaction only when passed every turn) and `args`,
+all before `resume <id>`; `item.started` of a tool -> Tool, `item.completed` agent_message -> Text,
+`turn.failed` -> Error; `RUST_LOG` and `codex::PARENT_SESSION_VARS` are stripped.
 `DaemonContext::state_tx` is a `StateBus` (`context.rs`), sent only by `publish(&ds)`: `raw` (the state
 machine: hooks, the reply queue), `ui` (Idle while the voice is an agent's, `DaemonState::agent_voice`:
 tray, pill, GNOME pill) and `voice` (which agent, for the board). The runtime's board channel

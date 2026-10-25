@@ -43,6 +43,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use whisrs::agent::claude::ClaudeDriver;
+use whisrs::agent::codex::Codex;
 use whisrs::agent::display::{AgentVisual, Board};
 use whisrs::agent::opencode::OpenCode;
 use whisrs::agent::process::ProcessDriver;
@@ -436,6 +437,7 @@ impl AgentRuntime {
             Arc::new(ClaudeDriver::new(&whisrs, socket)),
         );
         drivers.insert(Harness::OpenCode, Arc::new(ProcessDriver::new(OpenCode)));
+        drivers.insert(Harness::Codex, Arc::new(ProcessDriver::new(Codex)));
         let (board_tx, board_rx) = mpsc::unbounded_channel();
         Self {
             agents: agents.into_iter().map(Arc::new).collect(),
@@ -843,7 +845,8 @@ impl AgentRuntime {
             .unwrap_or(AgentPhase::Idle);
         let record = inner.store.agents.get(&agent.name);
         // Short beside a bg id (what Claude Code's commands take); whole
-        // otherwise, as the harness takes it (`opencode --session <id>`).
+        // otherwise, as the harness takes it (`opencode --session <id>`,
+        // `codex resume <id>`).
         let session = record.and_then(|r| {
             let id = r.session_id.as_deref()?;
             Some(match r.bg_id {

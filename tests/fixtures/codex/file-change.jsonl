@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"01a17400-3ff4-7b23-8b75-a698c77af36a"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `mock-1` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"<spoken>Writing it.</spoken>"}}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"/tmp/claude-1000/cxfx/hello.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/tmp/claude-1000/cxfx/hello.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Tool output was: 'Wall time: 0.0000 seconds\\nOutput:\\nExit code: 0\\nWall time: 0 seconds\\nOutput:\\nSuccess. Updated the following files:\\nA hello.txt\\n'. <spoken>The command ran.</spoken>"}}
+{"type":"turn.completed","usage":{"input_tokens":20,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}
