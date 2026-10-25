@@ -309,10 +309,10 @@ Adding a command means a new `Command` variant plus a daemon handler. Never put 
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
 list/show/path` read the recordings folder directly, which keeps transcript bodies off IPC
 (as does the speaker list `whisrs recording name` prints after the daemon renamed one).
-`whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
-only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 `whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
 starts it with `store::configured_recordings_dir()`.
+`whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
+only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 
 ## Configuration
 
@@ -325,8 +325,9 @@ TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drive
 Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude|opencode|codex|copilot`, `dir`, `permissions` =
 `auto|bypass|ask`, `command`, `args`, `reply_instruction`, `feedback` = `summary|brief|conversational`;
 `agent::resolve_agents` validates and skips bad entries, shared by `Config::validate` and the runtime),
-plus `[agent_overlay]` (`enabled` follows `[general] overlay`, `style` = `orb|face`, `corner`). With none, nothing runs and no file
-is written. A voice turn records like command mode's instruction (`BatchOrigin::Agent`), then the
+plus `[agent_overlay]` (`enabled` follows `[general] overlay`, `style` = `orb|face`, `corner`). With none, nothing runs
+except one `systemctl --user list-units` at startup (the scope sweep), and no file is written.
+A voice turn records like command mode's instruction (`BatchOrigin::Agent`), then the
 turn runs on its own task; replies queue in a FIFO spoken when the state is Idle and no recording
 captures (`may_speak`), errors too (`spoken::spoken_error`). A `ReplyHold` (a command or
 `[[llm_commands]]` press until it records, a recording start) also holds them, checked under the

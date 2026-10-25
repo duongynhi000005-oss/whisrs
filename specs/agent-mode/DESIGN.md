@@ -62,8 +62,9 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
 - `command` exists because a systemd user unit often lacks `~/.local/bin` on PATH. A spawn
   failure names it.
 - `feedback` needs the restart like every key. Its request is appended to the instruction,
-  so it is fixed at session start like `reply_instruction`: a higher level applies from
-  the next `--new` after the restart. A lower one applies from the restart, since the
+  so it applies when the instruction does: a higher level applies from the next `--new`
+  after the restart (Copilot: from the next turn, since it gets the instruction on every
+  turn). A lower one applies from the restart, since the
   daemon's gate (`ProgressGate`, built per turn from the configured level) filters what is
   spoken. An unknown value warns and means `brief`; the entry is kept.
 - `[agent_overlay]`: an unknown `style` or `corner` (an edge center too) gets one warning
@@ -280,8 +281,8 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
 
 ## Spoken reply
 
-Default instruction (appended system prompt on Claude, prefixed to the first message on a
-harness without one):
+Default instruction (Claude: an appended system prompt; OpenCode: prefixed to the first
+message; Codex: `developer_instructions`; Copilot: a custom instructions file):
 
 > You are being driven by voice through whisrs. The user spoke this request, and speech
 > recognition can mishear words, so read it charitably; if a misheard word could make you do
@@ -848,7 +849,8 @@ platform, as `copilot help billing` puts it), per Copilot's own billing.
 
 ## Acceptance criteria (phase 1)
 
-1. No `[[agents]]`: no behavior change, no processes spawned, no files written.
+1. No `[[agents]]`: no behavior change, nothing runs except one `systemctl --user list-units`
+   at startup (the scope sweep), no files written.
 2. `whisrs speak --text` and `--text -` speak the given text; an older daemon errors.
 3. `whisrs agent jarvis --text …` runs a real `claude --bg` turn in `dir` and speaks the
    sanitized `<spoken>` part. A second turn continues the same session (it remembers turn 1).

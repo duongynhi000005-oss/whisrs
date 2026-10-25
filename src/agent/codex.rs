@@ -33,7 +33,8 @@
 //!   turn it is not repeated (one copy per request, measured), and a
 //!   compaction, which drops it from a session that got it once, keeps it
 //!   (measured). A changed instruction does not replace the stored one: it
-//!   applies from the next `--new`, as on the other harnesses. It replaces
+//!   applies from the next `--new`, as with Claude and OpenCode (Copilot
+//!   takes it on every turn). It replaces
 //!   any `developer_instructions` of the user's Codex config or profile.
 //! - **Permissions** ([`permission_args`]): `auto` is `--approve-for-me`
 //!   (the workspace-write sandbox, writes in the dir; a command that needs

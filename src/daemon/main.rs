@@ -3,7 +3,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tracing::{error, info};
@@ -40,8 +39,8 @@ use crate::speak::{handle_speak, handle_speak_text};
 #[cfg(feature = "hooks")]
 use crate::startup::check_session_bus;
 use crate::startup::{
-    check_audio_devices, check_uinput_access, cleanup_stale_socket, import_compositor_env,
-    load_config, validate_config,
+    bind_socket, check_audio_devices, check_uinput_access, cleanup_stale_socket,
+    import_compositor_env, load_config, validate_config,
 };
 
 /// The daemon takes no options of its own, but declaring the interface means
@@ -301,7 +300,7 @@ async fn main() -> Result<()> {
 
     cleanup_stale_socket(&sock_path).await?;
 
-    let listener = UnixListener::bind(&sock_path).context("failed to bind Unix socket")?;
+    let listener = bind_socket(&sock_path)?;
     info!("listening on {}", sock_path.display());
 
     // Only now, with the socket ours: a second whisrsd that exits at the

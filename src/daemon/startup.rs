@@ -24,6 +24,23 @@ pub(crate) async fn cleanup_stale_socket(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Bind the IPC socket, readable and writable by its owner only.
+///
+/// Anyone who can connect can drive the daemon, and with `[[agents]]` that
+/// runs a coding agent as the user, so the mode is set before the first
+/// accept. `$XDG_RUNTIME_DIR` is 0700 already; the `/tmp` fallback is not.
+/// Every client (the CLI, `whisrs agent-hook`) runs as the same user.
+pub(crate) fn bind_socket(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = tokio::net::UnixListener::bind(path).context("failed to bind Unix socket")?;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(path);
+        return Err(e).with_context(|| format!("failed to restrict {}", path.display()));
+    }
+    Ok(listener)
+}
+
 /// Load configuration from config.toml, falling back to defaults.
 /// Returns (Config, Option<warning_message>) — the warning is set when config
 /// parsing fails and defaults are used, so the caller can notify the user.
@@ -564,5 +581,21 @@ mod tests {
             "the warning must count the file-sourced terms: {}",
             warning.message
         );
+    }
+
+    /// The socket is 0600 from the first accept, and still takes connections.
+    #[tokio::test]
+    async fn bind_socket_is_owner_only_and_accepts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("whisrs.sock");
+        let listener = bind_socket(&path).expect("bind");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        let (client, accepted) =
+            tokio::join!(tokio::net::UnixStream::connect(&path), listener.accept());
+        client.expect("connect");
+        accepted.expect("accept");
     }
 }

@@ -79,7 +79,7 @@ pub struct AgentConfig {
     pub command: Option<String>,
     /// Extra arguments, passed on the first turn of a session (Codex and
     /// Copilot: on every turn, since a resumed turn keeps none of them).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Replaces the built-in voice instruction ([`DEFAULT_REPLY_INSTRUCTION`]).
     #[serde(default)]
@@ -402,8 +402,9 @@ fn resolve_agents_with(
     (agents, warnings)
 }
 
-/// The built-in voice instruction: Claude's appended system prompt, or the
-/// prefix of the first message on a harness without one. It asks for a
+/// The built-in voice instruction: Claude's appended system prompt,
+/// OpenCode's first-message prefix, Codex's `developer_instructions` and
+/// Copilot's custom instructions file. It asks for a
 /// `<spoken>` reply, but whisrs never relies on it ([`spoken::spoken_reply`]).
 /// The agent's feedback level appends its request for interims
 /// ([`progress::feedback_delta`]).

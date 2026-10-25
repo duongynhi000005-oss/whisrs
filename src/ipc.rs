@@ -124,7 +124,8 @@ pub enum Response {
     Recording {
         recording: RecordingStatus,
     },
-    /// Agent rows after an `agent` command (`list`, `send`).
+    /// Agent rows after an `agent` command: every agent for `list`, the one
+    /// agent for `send`, `reset` and `stop`.
     Agents {
         agents: Vec<AgentInfo>,
     },

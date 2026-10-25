@@ -428,7 +428,11 @@ response_format = "wav"     # audio format requested from the API
 #                                #   codex (Codex CLI) | copilot (GitHub Copilot CLI)
 # dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist (a
 #                                #   relative path is taken from whisrsd's working directory)
-# permissions = "auto"           # auto (default) | bypass | ask
+# permissions = "auto"           # auto (default) | bypass | ask. What auto allows:
+#                                #   claude: Claude Code's auto mode (a classifier reviews each action)
+#                                #   opencode: OpenCode's own rules (most tools allowed by default)
+#                                #   codex: --approve-for-me (auto-approved inside the workspace-write sandbox)
+#                                #   copilot: --allow-all-tools (every tool without asking, in dir)
 # command = "claude"             # optional: the binary (default: claude, opencode, codex or
 #                                #   copilot on PATH). Set its full path when the daemon's PATH lacks
 #                                #   it (a systemd user service often has no ~/.local/bin)
@@ -854,6 +858,12 @@ first, like any `[[agents]]` change, and then applies from the next new
 session (`whisrs agent <name> --new`). The same goes for `reply_instruction`:
 the session keeps the instruction it started with.
 
+`claude --bg` takes the prompt only as an argument, so with Claude Code your
+words (and on a session's first turn the voice instruction) are on the command
+line of the `claude --bg` that whisrs runs, which other processes can read
+(`ps` shows it) until it returns, once the session has started. OpenCode,
+Codex and Copilot get your words on stdin.
+
 One option you may want in `args` is `--remote-control` (for example
 `args = ["--remote-control", "jarvis"]`; the name after it is optional).
 Remote Control is a Claude Code option that lets you follow and answer the
@@ -989,8 +999,11 @@ that call ends. And between turns no OpenCode process runs: a session never
 works on its own, and a new turn is never refused for that.
 
 Each turn runs in a systemd scope of its own (`systemd-run --user --scope`, a
-unit named `whisrs-agent-<id>-<name>-<turn>.scope`), so a stop reaches every
-process the turn started, also one that put itself in a session of its own.
+unit named `whisrs-agent-<instance>-<name>-<turn>.scope`; `<instance>` is
+eight hex digits hashed from the path of whisrs's `agents.json`, so a second
+daemon with a data directory of its own leaves these scopes alone). Through
+the scope, a stop reaches every process the turn started, also one that put
+itself in a session of its own.
 `--stop` interrupts the turn: whisrs sends SIGINT, then SIGTERM and SIGKILL to
 whatever of the turn is still running a few seconds later (`opencode run`, its
 process group, every process of its tree and the scope), and returns once all
@@ -1059,8 +1072,11 @@ request of your `feedback` level) goes in as Codex's developer instructions,
 on every turn. The model gets it as a developer message, so it never shows as
 your words. Passing it again on a later turn does not repeat it, and it
 survives a compaction of a long session, which drops an instruction that was
-given only on the first turn (both measured). A changed instruction applies
-from the next new session, as with the other harnesses. It replaces any
+given only on the first turn (both measured). A session keeps the
+instruction it started with (a changed one passed on a later turn is not
+added, measured), so after `whisrs restart` a changed instruction applies from
+the next new session (`whisrs agent <name> --new`), as with Claude Code and
+OpenCode. It replaces any
 `developer_instructions` you set in Codex's own `config.toml` or a profile:
 put text of your own in `reply_instruction`.
 

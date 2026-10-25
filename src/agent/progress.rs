@@ -111,9 +111,10 @@ const CONVERSATIONAL_DELTA: &str = concat!(
 /// What is appended to the voice instruction (the default or the agent's
 /// `reply_instruction`) for a level. Empty for [`Feedback::Summary`]. It
 /// starts with a space, so it reads on from the instruction's last
-/// sentence. Like the instruction it is fixed when a session starts, so a
-/// change applies from the next `--new`; a lower level applies at once,
-/// since [`ProgressGate`] enforces the configured one.
+/// sentence. It applies when the instruction does: from the next `--new`
+/// (Copilot: from the next turn, it gets the instruction on every turn); a
+/// lower level applies at once, since [`ProgressGate`] enforces the
+/// configured one.
 pub fn feedback_delta(feedback: Feedback) -> &'static str {
     match feedback {
         Feedback::Summary => "",

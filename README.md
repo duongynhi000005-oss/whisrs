@@ -15,7 +15,7 @@
 
 **Voice for the Linux desktop, written in Rust: dictation, read-aloud, and voice-driven LLM commands.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor, or talk to a coding agent: Claude Code, OpenCode or Codex works on it and answers out loud. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record your mic and the system audio too: both become one timestamped Markdown transcript, kept in its own folder.
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor, or talk to a coding agent: Claude Code, OpenCode, Codex or GitHub Copilot works on it and answers out loud. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record your mic and the system audio too: both become one timestamped Markdown transcript, kept in its own folder.
 
 ![whisrs demo: dictation, read aloud, and command mode](assets/demo.gif)
 

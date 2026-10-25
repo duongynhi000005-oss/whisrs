@@ -69,9 +69,11 @@ pub struct Config {
     #[serde(default)]
     pub llm_commands: Vec<llm::LlmCommandConfig>,
     /// Coding agents driven by voice (see [`crate::agent::AgentConfig`]).
-    /// Empty by default: with none, agent mode spawns nothing and writes
-    /// nothing.
-    #[serde(default)]
+    /// Empty by default: with none, agent mode writes nothing and runs
+    /// only one `systemctl --user list-units` at startup (the scope sweep).
+    /// Left out of the file when empty: an `agents = []` there would make a
+    /// pasted `[[agents]]` block invalid TOML.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<crate::agent::AgentConfig>,
     /// Word/phrase replacements applied to every dictation before it is
     /// typed, and to every line of a recording's transcript:
@@ -5721,6 +5723,49 @@ mod tests {
         assert!(unknown.is_empty(), "{unknown:?}");
         let unknown = unknown_config_keys("[[agents]]\nname = \"jarvis\"\nbogus = 1\n");
         assert_eq!(unknown, vec!["agents[0].bogus".to_string()]);
+    }
+
+    /// Every config write (`whisrs setup`, a `whisrs config` save, the
+    /// daemon's `[[llm_commands]]` hotkey write) serializes the struct. An
+    /// empty `agents` written as `agents = []` made the `[[agents]]` block
+    /// pasted from the docs afterwards invalid TOML (a static array cannot be
+    /// extended by an array of tables), so the daemon fell back to the
+    /// defaults and lost every key and hotkey. Same for `[agent_overlay]`.
+    #[test]
+    fn agent_sections_can_be_appended_to_a_written_config() {
+        const AGENT: &str = "\n[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+Shift+J\"\n\
+                             dir = \"~/Projects/whisrs\"\n";
+        const OVERLAY: &str = "\n[agent_overlay]\nstyle = \"face\"\n";
+        let written = toml::to_string_pretty(&validatable_config("groq")).unwrap();
+        let pasted = format!("{written}{AGENT}{OVERLAY}");
+        let config: Config = toml::from_str(&pasted).unwrap_or_else(|e| panic!("{e}\n{pasted}"));
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(
+            config.agent_overlay.unwrap().style(),
+            AgentOverlayStyle::Face
+        );
+
+        // An entry's unset keys (`args` included) are left out as well.
+        let jarvis = agent_entry("jarvis", Some("Super+Shift+J"));
+        let entry = toml::to_string(&jarvis).unwrap();
+        for unset in ["args", "command", "reply_instruction", "new_session_hotkey"] {
+            assert!(!entry.contains(unset), "{unset}: {entry}");
+        }
+        let overlay = toml::to_string(&AgentOverlayConfig::default()).unwrap();
+        assert!(!overlay.contains("enabled"), "{overlay}");
+
+        // A config with an agent reads back the same, and a second pasted
+        // entry extends it.
+        let mut config = validatable_config("groq");
+        config.agents = vec![jarvis];
+        config.agent_overlay = Some(AgentOverlayConfig::default());
+        let written = toml::to_string_pretty(&config).unwrap();
+        let reread: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reread.agents, config.agents);
+        assert_eq!(reread.agent_overlay, config.agent_overlay);
+        let pasted = format!("{written}\n[[agents]]\nname = \"friday\"\ndir = \"/proj\"\n");
+        let reread: Config = toml::from_str(&pasted).unwrap_or_else(|e| panic!("{e}\n{pasted}"));
+        assert_eq!(reread.agents.len(), 2);
     }
 
     /// `[agent_overlay]` and `[[agents]] feedback` are known keys.

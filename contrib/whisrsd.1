@@ -94,6 +94,7 @@ is not set, falls back to:
 .IR /tmp/whisrs\-<uid>.sock
 .RE
 .PP
+The socket is readable and writable by its owner only (mode 0600).
 The protocol uses length-prefixed JSON messages (4-byte big-endian length
 header followed by a JSON body).
 .PP
