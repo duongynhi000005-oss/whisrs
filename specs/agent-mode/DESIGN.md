@@ -33,11 +33,14 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
   chose it. Claude: `auto` → `--permission-mode auto`, `bypass` → `--permission-mode
   bypassPermissions`, `ask` → `--permission-mode default`. `ask` passes the flag rather than
   none: without it a session starts in the user's `permissions.defaultMode`, which may be
-  `auto`, and `ask` would not ask.
+  `auto`, and `ask` would not ask. OpenCode: `auto` → no flag, `bypass` → `--auto`, `ask` →
+  shell and edit ask rules appended to `OPENCODE_CONFIG_CONTENT` (see "OpenCode driver").
 - `[[agents]]` (and `[agent_overlay]`) is read once, when the daemon starts
   (`AgentRuntime::new`): any change needs `whisrs restart` first.
 - `permissions`, `args` and `reply_instruction` are fixed when a session starts (a resume
   passes no flag, see below), so after the restart a change applies from the next `--new`.
+  OpenCode passes `permissions` on every turn (`run` keeps none), so a change applies from the
+  next turn after the restart; `args` and the instruction are fixed at session start there too.
 - Validation warns (and skips the entry, `resolve_agents`) on a missing, invalid (not
   `[a-z0-9_-]`) or duplicate name, an unknown harness or `permissions` value, and a missing
   or nonexistent dir; a hotkey clash is reported like the `[[llm_commands]]` clashes. Agents
@@ -437,7 +440,9 @@ Deviations from the plan, as built:
   every transcript read. At startup an agent with `turn_running` is watched again (poll), so
   a reply that lands after a daemon restart is still spoken. A changed `harness` or `dir`
   starts a fresh session.
-- Daemon shutdown leaves agent sessions running; they belong to the harness.
+- Daemon shutdown leaves agent sessions running; they belong to the harness. A
+  process-per-turn turn (OpenCode) ends with the daemon (see "OpenCode driver"); its session
+  stays, and the next turn continues it.
 
 ## Layout
 
@@ -446,6 +451,8 @@ src/agent/mod.rs        # driver abstraction, TurnOutcome, permissions mapping, 
 src/agent/spoken.rs     # <spoken> extraction + sanitize, interim lines (pure)
 src/agent/claude.rs     # Claude Code driver
 src/agent/claude_tail.rs  # transcript tail: activities and interims
+src/agent/process.rs    # process-per-turn base: ProcessDriver<H: TurnHarness>, StreamState, stop
+src/agent/opencode.rs   # OpenCode driver (a TurnHarness)
 src/agent/progress.rs   # feedback levels, instruction deltas, labels, tracker, gate (pure)
 src/agent/display.rs    # the agent overlay's Board and rows (pure)
 src/agent/store.rs      # agents.json
@@ -463,10 +470,92 @@ from its JSON output (`kill_on_drop`). Adding one must not change the runtime.
 
 ## Phase 2 drivers (same PR, after the phase 1 test)
 
-- OpenCode: `opencode run --format json [--session <id>]`, or `opencode serve` (HTTP + SSE).
-- Codex: `codex exec --json`, `codex exec resume <id>`.
-- GitHub Copilot CLI: from its docs.
+- OpenCode: built, see "OpenCode driver".
+- Codex: `codex exec --json`, `codex exec resume <id>`, on the same base (a `TurnHarness`).
+- GitHub Copilot CLI: `copilot -p ... --output-format json`, on the same base.
 - Each follows its own documentation; contracts are collected before phase 2 starts.
+
+### The process-per-turn base (`src/agent/process.rs`)
+
+A harness whose turn is one process implements `TurnHarness`, every method required:
+`label` (for messages), `launch` (agent, session, request → `Launch`: the args after `command`,
+the prompt for stdin or `None` for `/dev/null`, extra env), `strips_env` (its parent-session
+variables) and `events` (one stdout line → `StreamEvent`s: `Session(id)`, `Text { message, text }`,
+`Tool(name)`, `Error(message)`). `ProcessDriver<H>` is the `Driver`:
+
+- **Spawn:** `command` in `dir`, own process group, `PWD` = dir, the daemon's environment minus
+  `claude::strips_env` (Claude's parent-session list and `WHISRS_*`) and the harness's own list,
+  then `Launch::env`. Spawned from a thread that registers the child for `--stop` before the turn
+  hears of it, writes the prompt, closes stdin and waits for the child, with
+  `PR_SET_PDEATHSIG` = SIGINT (checked against `getppid` after the prctl): the thread lives as
+  long as the child, so the child is interrupted only when the daemon exits or dies.
+- **Output:** stdout lines go through `events` into `StreamState`: a session id other than the
+  agent's is reported (`TurnUpdate::Session`), so a first turn's id is stored once the harness
+  names it; `Tool` sends `Activity` (deduplicated) and releases the text before it through
+  `InterimTracker`; the reply is the text parts of the last message, joined. Stderr keeps its
+  last 40 lines. Reading ends when both pipes end and the process exited, or two seconds after
+  the exit (a leftover process can hold stdout open).
+- **Outcome:** an `Error` event fails the turn ("Agent 'x': OpenCode failed: ..."); else the
+  reply (a non-zero exit after it is only logged); else "ended the turn without a reply" on exit
+  0, or the stderr line that mentions an error (else its last), or the exit status.
+- **Stop:** SIGINT, SIGTERM, SIGKILL to the group (`STOP_GRACES` 3 s, 2 s, 2 s), each only while
+  something of the group is left (the exit seen and `kill(-pgid, 0)` = ESRCH); never `kill(0)`
+  or `kill(-1)`. Run once per process (`OnceCell`), so `Driver::stop` after the abort and the
+  stop a dropped turn starts (`Registered`'s drop) are the same stop, and both wait for it. The
+  next turn of the agent waits for a previous process still stopping: never two on a session.
+- **Rewatch:** the turn ended with the old daemon, so it fails at once with `cut_off`: "whisrs
+  restarted during that turn, which stopped it before OpenCode replied. The session keeps what
+  it did so far." It never stays working.
+- Between turns nothing runs: `session_phase(s)` is Idle, no hooks (`hook_matches` false,
+  `idle_event` ignored), `forget` has nothing to drop. No needs-you: none of the three harnesses
+  waits on an approval headless.
+
+### OpenCode driver (verified on 2.0.29)
+
+- **Every turn:** `opencode run --standalone --format json --session <id> [--title
+  whisrs-<agent> args…] [--auto]`, the prompt on stdin (argv words with spaces reach the model
+  quoted). `--standalone` gives the run a private server (`opencode serve --stdio`, in a session
+  of its own, ended by its stdin lease when the run exits): the shared background service would
+  outlive the turn, ignore the run's environment and keep a turn going when `run` is killed.
+- **Session id:** whisrs mints it in OpenCode's layout (`ses_` + twelve hex digits of the
+  inverted `ms * 4096 + counter`, so newer sorts first, + fourteen base62 characters,
+  `opencode::new_session_id`); `--session` creates a session it does not find, so the same
+  command continues it later. It is reported once a line names it (every line carries
+  `sessionID`; a failure before the session resolved names `""`), so a turn that never reached
+  OpenCode leaves nothing to continue. `--title` and `args` go on the first turn only (the title
+  also saves the title-generation model call, measured); a `-m` model or `--agent` stays the
+  session's (measured).
+- **Instruction:** prefixed to the first prompt, then a blank line. `run` has no system prompt
+  option; `agents.<name>.system` replaces OpenCode's base prompt and the session then cannot
+  resume without that agent; config `instructions` did not reach the model; `AGENTS.md` would
+  mean writing into the user's project. In the history it holds for every turn (measured); the
+  tradeoff: it shows in the session's first message, and a compaction can summarize it.
+- **Permissions:** headless OpenCode answers every ask with a rejection plus feedback to the
+  model, which goes on (no hang, exit 0). `auto` passes nothing (OpenCode's defaults allow most
+  tools); `bypass` passes `--auto` (asks approved, deny rules hold); `ask` appends
+  `[{shell, *, ask}, {edit, *, ask}]` (edit, write and patch all assert `edit`) to
+  `OPENCODE_CONFIG_CONTENT`, after the daemon's own content (merged; rules are last-match-wins,
+  and the env layer comes after the config files, measured). Content that is not a JSON object
+  fails the turn rather than running without the rules.
+- **Events:** `text` → `Text { part.messageID, part.text }` (printed when the part ends; a fast
+  turn's texts come after the turn, from the run's reconcile, in order); `tool_use` →
+  `Tool(part.tool)`, printed when the call ends (completed or rejected), so the activity and the
+  acknowledgement before it come then; `error` → `Error(error.message)`; `step_start`,
+  `step_finish` and `reasoning` only name the session. The turn ends at the process's exit.
+- **Stop:** SIGINT to the run interrupts the session and exits 130 (0.2 s, measured); the
+  server and the tool's shell (its own session) go with it, and the next turn continues the
+  session with the stopped call in its history (measured, also after SIGTERM to every process
+  at once, as a cgroup kill does).
+- **Restart:** under systemd the run dies with the unit's cgroup; otherwise `PR_SET_PDEATHSIG`
+  interrupts it when whisrsd exits or is killed (measured both ways). The restarted daemon's
+  rewatch ends the turn with `cut_off`.
+- **Environment:** besides the base's stripping, `OPENCODE`, `OPENCODE_SESSION_ID`,
+  `OPENCODE_TERMINAL`, `AGENT` (set in OpenCode's tool shells), `OPENCODE_PASSWORD`,
+  `OPENCODE_SERVER_PASSWORD`. `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG*` and the XDG
+  directories pass.
+- **List:** `whisrs agent` shows the whole session id when there is no bg id (what
+  `opencode --session` takes); Claude's rows keep the short id beside the bg id.
+- OpenCode 1 (no `--standalone`, `--session` only continues) is not driven.
 
 ## Later
 

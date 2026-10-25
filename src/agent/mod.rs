@@ -11,14 +11,18 @@
 //!
 //! Two driver shapes fit [`Driver`]: Claude Code's turn is launched as a
 //! background session and ends on a hook event or a poll
-//! ([`claude::ClaudeDriver`]); a process-per-turn driver (phase 2: OpenCode,
-//! Codex, Copilot) spawns one child per turn with `kill_on_drop`, reads the
-//! session id and the final message from its JSON output, and returns when
-//! the child exits. The runtime only ever calls the [`Driver`] methods.
+//! ([`claude::ClaudeDriver`]); a process-per-turn driver
+//! ([`process::ProcessDriver`], OpenCode's [`opencode::OpenCode`]) spawns
+//! one child per turn, reads the session id and the final message from its
+//! JSON output, returns when the child exits, and stops the child when the
+//! turn is stopped or dropped. The runtime only ever calls the [`Driver`]
+//! methods.
 
 pub mod claude;
 pub mod claude_tail;
 pub mod display;
+pub mod opencode;
+pub mod process;
 pub mod progress;
 pub mod spoken;
 pub mod store;
@@ -57,7 +61,7 @@ pub struct AgentConfig {
     /// `hotkey`.
     #[serde(default)]
     pub new_session_hotkey: Option<String>,
-    /// Which coding agent: `claude` (phase 1).
+    /// Which coding agent: `claude` (default) or `opencode`.
     #[serde(default = "default_harness")]
     pub harness: String,
     /// The directory the agent works in. `~` is expanded; it must exist.
@@ -101,15 +105,18 @@ fn default_feedback() -> String {
 pub enum Harness {
     /// Claude Code (`claude --bg`).
     Claude,
+    /// OpenCode 2 (`opencode run`, a process per turn).
+    OpenCode,
 }
 
 impl Harness {
     /// Every harness this build drives, for messages.
-    pub const ALL: &'static [Harness] = &[Harness::Claude];
+    pub const ALL: &'static [Harness] = &[Harness::Claude, Harness::OpenCode];
 
     pub fn parse(s: &str) -> Option<Harness> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(Harness::Claude),
+            "opencode" => Some(Harness::OpenCode),
             _ => None,
         }
     }
@@ -117,6 +124,7 @@ impl Harness {
     pub fn as_str(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
+            Harness::OpenCode => "opencode",
         }
     }
 
@@ -124,6 +132,15 @@ impl Harness {
     pub fn default_command(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
+            Harness::OpenCode => "opencode",
+        }
+    }
+
+    /// The harness's name in messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Harness::Claude => "Claude Code",
+            Harness::OpenCode => "OpenCode",
         }
     }
 }
@@ -413,7 +430,9 @@ pub struct AgentInfo {
     pub name: String,
     pub harness: String,
     pub phase: AgentPhase,
-    /// The first eight characters of the session id, once there is one.
+    /// The session id, once there is one: its first eight characters
+    /// beside a bg id (Claude), else all of it, as the harness takes it
+    /// (`opencode --session <id>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     /// The id of the background process running the session (Claude: the
@@ -441,7 +460,8 @@ pub const BACKGROUND_TASK: &str = "It's still running a background task.";
 /// session whisrs started.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRef {
-    /// The harness's session id (Claude: the conversation UUID).
+    /// The harness's session id (Claude: the conversation UUID; OpenCode:
+    /// `ses_...`, minted by whisrs).
     #[serde(default)]
     pub session_id: Option<String>,
     /// The id of the background process running it (Claude: the short id
@@ -628,7 +648,8 @@ pub struct TurnIo {
 pub trait Driver: Send + Sync {
     /// Run one turn from launch to its end. `session` is the agent's current
     /// session (empty for a new one). Dropped (aborted) on `--stop`, so a
-    /// child it spawns must use `kill_on_drop`.
+    /// child it spawns must be stopped when it is dropped (`kill_on_drop`,
+    /// or the stop of [`process::ProcessDriver`]).
     async fn run_turn(
         &self,
         agent: &Agent,
@@ -649,7 +670,7 @@ pub trait Driver: Send + Sync {
     ) -> TurnOutcome;
 
     /// Stop the running turn and keep the session. Called after the turn's
-    /// task was aborted.
+    /// task was aborted; returns once the turn's process is gone.
     async fn stop(&self, agent: &Agent, session: &SessionRef) -> Result<(), String>;
 
     /// The runtime forgot `session` (`--new`, `--reset`): drop what the
@@ -815,7 +836,7 @@ feedback = "Conversational"
         let mut missing_dir = entry("missing");
         missing_dir.dir = "/nope".into();
         let mut unknown_harness = entry("oc");
-        unknown_harness.harness = "opencode".into();
+        unknown_harness.harness = "aider".into();
         let mut unknown_perm = entry("perm");
         unknown_perm.permissions = "bypassPermissions".into();
         let entries = vec![
@@ -839,7 +860,12 @@ feedback = "Conversational"
         assert!(warnings[2].contains("duplicate name 'jarvis'"));
         assert!(warnings[3].contains("has no dir"));
         assert!(warnings[4].contains("/nope does not exist"));
-        assert!(warnings[5].contains("unknown harness 'opencode'"));
+        assert!(
+            warnings[5].contains("unknown harness 'aider'")
+                && warnings[5].contains("drives: claude, opencode"),
+            "{}",
+            warnings[5]
+        );
         assert!(warnings[6].contains("unknown permissions value 'bypassPermissions'"));
     }
 
@@ -874,6 +900,18 @@ feedback = "Conversational"
     }
 
     #[test]
+    fn an_opencode_entry_runs_opencode_by_default() {
+        let mut e = entry("coder");
+        e.harness = " OpenCode ".into();
+        let (agents, warnings) = resolve(&[e]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(agents[0].harness, Harness::OpenCode);
+        assert_eq!(agents[0].command, "opencode");
+        assert_eq!(Harness::OpenCode.to_string(), "opencode");
+        assert_eq!(Harness::OpenCode.label(), "OpenCode");
+    }
+
+    #[test]
     fn tilde_expands_to_home() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_tilde("~"), home);
@@ -898,7 +936,11 @@ feedback = "Conversational"
     #[test]
     fn harness_and_permissions_parse_case_insensitively() {
         assert_eq!(Harness::parse(" Claude "), Some(Harness::Claude));
-        assert_eq!(Harness::parse("codex"), None);
+        assert_eq!(Harness::parse("OpenCode"), Some(Harness::OpenCode));
+        assert_eq!(Harness::parse("aider"), None);
+        for harness in Harness::ALL {
+            assert_eq!(Harness::parse(harness.as_str()), Some(*harness));
+        }
         assert_eq!(Permissions::parse("BYPASS"), Some(Permissions::Bypass));
         assert_eq!(Permissions::parse("yolo"), None);
     }

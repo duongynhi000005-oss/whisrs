@@ -424,17 +424,17 @@ response_format = "wav"     # audio format requested from the API
 # hotkey = "Super+Shift+J"       # optional: records a voice turn, same syntax as [hotkeys]
 # new_session_hotkey = "Super+Shift+N"  # optional: records a voice turn that starts a
 #                                #   fresh session (whisrs agent <name> --new)
-# harness = "claude"             # claude (Claude Code) is the one supported today
+# harness = "claude"             # claude (Claude Code, default) | opencode (OpenCode 2)
 # dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist
 # permissions = "auto"           # auto (default) | bypass | ask
-# command = "claude"             # optional: the binary. Set its full path when the
-#                                #   daemon's PATH lacks it (a systemd user service often
-#                                #   has no ~/.local/bin)
+# command = "claude"             # optional: the binary (default: claude or opencode on
+#                                #   PATH). Set its full path when the daemon's PATH lacks
+#                                #   it (a systemd user service often has no ~/.local/bin)
 # args = ["--model", "sonnet"]   # optional: extra arguments for the first turn of a session
 # reply_instruction = "..."      # optional: replaces the built-in voice instruction
-#                                #   (permissions, args and reply_instruction apply, after
-#                                #   the restart, from the next new session:
-#                                #   whisrs agent <name> --new)
+#                                #   (args and reply_instruction apply, after the restart,
+#                                #   from the next new session: whisrs agent <name> --new;
+#                                #   with Claude Code, permissions too)
 # feedback = "brief"             # optional: what the agent says while it works. summary
 #                                #   (the reply only) | brief (default: a short
 #                                #   acknowledgement, then the reply) | conversational
@@ -614,9 +614,10 @@ everything whisrs types, pastes or copies, wherever it is going.
 
 Agent mode lets you talk to a coding agent. Press an agent's hotkey (or run
 `whisrs agent <name>`), say what you want, and press again. whisrs sends the
-words to a Claude Code session working in that agent's `dir`, and when the turn
-ends it speaks a short reply. The next press continues the same session, so you
-can answer the question the agent asked or make the decision it needs.
+words to a Claude Code or OpenCode session working in that agent's `dir`, and
+when the turn ends it speaks a short reply. The next press continues the same
+session, so you can answer the question the agent asked or make the decision
+it needs.
 
 ```toml
 [tts]
@@ -628,11 +629,19 @@ name = "jarvis"
 hotkey = "Super+Shift+J"
 new_session_hotkey = "Super+Shift+N"   # optional: a voice turn in a fresh session
 dir = "~/Projects/whisrs"
+
+[[agents]]
+name = "coder"
+harness = "opencode"
+hotkey = "Super+Shift+K"
+dir = "~/Projects/site"
 ```
 
 ```
 whisrs agent                       # list the agents: name, harness, idle | working | needs-you, and
-                                   #   the background id of each session (what claude attach <id> takes)
+                                   #   the id of each session: Claude Code's background id (what
+                                   #   claude attach <id> takes), OpenCode's session id (what
+                                   #   opencode --session <id> takes)
 whisrs agent jarvis                # record a voice turn (same as the hotkey; press again to stop)
 whisrs agent jarvis --text "..."   # send a typed turn (`--text -` reads stdin)
 whisrs agent jarvis --new          # record a voice turn that starts a fresh session (same as
@@ -648,6 +657,11 @@ What you need:
 - The agent's `dir` trusted in Claude Code: background sessions refuse a
   directory you never trusted. Open it with `claude` once and accept the trust
   prompt. whisrs tells you so when it hits this.
+- Or, for `harness = "opencode"`: OpenCode 2 (`opencode`; tested on 2.0.29,
+  and OpenCode 1 has no `run --standalone`), with a model it can use from
+  `opencode run` (a provider you set up with `opencode auth`; the free
+  OpenCode Zen models refused `opencode run` when tested). See "OpenCode"
+  below.
 - `[tts] enabled = true` to hear the replies. Without it they arrive as
   notifications only, and `whisrsd` warns at startup.
 - `whisrs restart` after adding or changing an `[[agents]]` entry: the daemon
@@ -688,13 +702,13 @@ How a turn goes:
   transcript starts a new session instead of continuing the old one. Press
   either key again (or run `--new` again) to stop and send; the press that
   started the recording decides. The old session is forgotten only once there
-  is something to send, and stays in Claude Code. `--new --text "..."` does
+  is something to send, and stays in Claude Code or OpenCode. `--new --text "..."` does
   the same with typed text, and `--reset` only forgets the session. Both are
   refused while a turn of that agent runs: stop it first with `--stop`. While
   that turn waits for you, the refusal says what it waits for ("Waiting for
   your approval to use Bash."), since a plain press answers it.
-- The session can also work on its own: when a command it started in the
-  background finishes, Claude Code goes on without you. Its reply is spoken
+- With Claude Code, the session can also work on its own: when a command it
+  started in the background finishes, Claude Code goes on without you. Its reply is spoken
   like any other, and while it works `whisrs agent` shows it as working and a
   new turn is refused rather than stopping that work: whisrs says "It's still
   running a background task." Claude Code counts a session as working for as
@@ -706,8 +720,8 @@ How a turn goes:
 - When a turn fails (the session ended, `claude` was not found, the folder is
   not trusted), whisrs says so in a short sentence and, with `[general] notify`
   on, shows the full message as a notification.
-- When the agent waits for a permission prompt, `whisrs agent` shows it as
-  needs-you and whisrs says so ("Waiting for your approval to use Bash."), for
+- When a Claude Code agent waits for a permission prompt, `whisrs agent`
+  shows it as needs-you and whisrs says so ("Waiting for your approval to use Bash."), for
   a turn you sent and for work the session does on its own alike. The next
   turn you send replaces the waiting one. To approve the prompt itself, open
   the session in Claude Code (`claude attach <id>`).
@@ -793,7 +807,8 @@ for how long.
   not on screen, the "Speak to 'jarvis'..." and "Sending to 'jarvis'..."
   notifications stand in for it (with `[general] notify` on).
 
-`permissions` maps to Claude Code's permission modes:
+With Claude Code, `permissions` maps to its permission modes (OpenCode's
+mapping is under "OpenCode" below):
 
 | `permissions` | Claude Code |
 |---|---|
@@ -801,7 +816,7 @@ for how long.
 | `bypass` | `--permission-mode bypassPermissions` |
 | `ask` | `--permission-mode default`: asks before acting, even when your own default mode is `auto` |
 
-`permissions` and `args` are passed when a session starts. A later turn resumes
+With Claude Code, `permissions` and `args` are passed when a session starts. A later turn resumes
 the session with the options it was started with (its hooks, the permission
 mode and your `args` included). So a change to them needs `whisrs restart`
 first, like any `[[agents]]` change, and then applies from the next new
@@ -830,7 +845,7 @@ that also starts a copy, the turn fails with
 "Claude Code could not continue the session" and `whisrs agent <name> --new`
 starts a fresh one.
 
-Sessions. Each agent's session is a Claude Code background session named
+Sessions. Each Claude Code agent's session is a background session named
 `whisrs-<name>`: it shows up in `claude agents`, and `claude attach <id>` opens it
 (`<id>` is the background id `whisrs agent` shows, which `claude logs` and
 `claude stop` take too). whisrs keeps its session ids in
@@ -870,6 +885,84 @@ a systemd service, whisrs starts `claude --bg` in a scope of its own
 (`systemd-run --user --scope`): restarting or stopping `whisrs.service` then
 leaves the service and every session running. Without `systemd-run` it starts
 `claude` directly.
+
+### OpenCode
+
+With `harness = "opencode"`, each turn is one `opencode run` process, which
+ends with the turn:
+
+```
+opencode run --standalone --format json --session <id> [--title whisrs-<name> <args>] [--auto]
+```
+
+The words go in on stdin. `--standalone` gives the turn a private OpenCode
+server that ends with it, instead of OpenCode's shared background service,
+which would outlive the turn, ignore the environment whisrs passes, and keep a
+turn running after whisrs stopped it. A server starts with every turn, which
+takes a second or two.
+
+Sessions. whisrs makes up the session id (`ses_...`, in OpenCode's own form)
+and passes it on every turn: the first turn creates the session, titled
+`whisrs-<name>`, and every later one continues it. `whisrs agent` shows the
+whole id; `opencode --session <id>` opens the session in OpenCode, and it is
+in `opencode session list`. A turn that never reached OpenCode (it was not
+found, say) leaves no session behind, and the next turn starts one.
+
+The voice instruction (the built-in one or your `reply_instruction`, with the
+request of your `feedback` level) opens the first message of a session.
+`opencode run` has no option for a system prompt, and the ways around that
+either replace OpenCode's own prompt or did not reach the model. In the
+session's history, the instruction holds for every later turn. It shows in the
+session's first message when you open it in OpenCode, and a compaction of a
+long session may summarize it away (start a fresh one with `--new`).
+
+`permissions` for OpenCode:
+
+| `permissions` | OpenCode |
+|---|---|
+| `auto` (default) | no flag: your own OpenCode rules (OpenCode allows most tools unless you set rules) |
+| `bypass` | `--auto`: approves every permission request; rules that deny still apply |
+| `ask` | adds rules that ask before shell commands and file changes (`shell` and `edit`) to `OPENCODE_CONFIG_CONTENT`, after your own: reading and searching work, commands and edits are refused |
+
+Nobody can answer OpenCode's permission questions during a turn: a request
+that would ask is refused, the agent is told so and goes on without it, and
+the reply usually says what it could not do. So an OpenCode agent never shows
+needs-you, and a turn never waits for you. With `ask`, a daemon whose
+`OPENCODE_CONFIG_CONTENT` is not a plain JSON object fails the turn instead of
+running it without the rules.
+
+Which keys apply when: `permissions` is passed on every turn, so after
+`whisrs restart` a change applies from the next turn. `args` is passed on the
+first turn of a session: a model (`args = ["-m", "anthropic/claude-sonnet-4-5"]`)
+or an agent (`--agent plan`) chosen there stays the session's. `reply_instruction`
+and `feedback` are fixed when a session starts, as with Claude Code. `command`
+is the `opencode` binary.
+
+What you hear and see works as with Claude Code, with two differences.
+OpenCode reports a tool call when it finishes, so the overlay's activity line,
+and the acknowledgement the agent wrote before its first tool call, come when
+that call ends. And between turns no OpenCode process runs: a session never
+works on its own, and a new turn is never refused for that.
+
+`--stop` interrupts the turn: whisrs sends `opencode run` SIGINT, then
+SIGTERM and SIGKILL if it is still running a few seconds later, and returns
+once it is gone. The session keeps what it did; the next turn continues it,
+the stopped tool call in its history.
+
+A daemon restart during a turn ends that turn: under a systemd service it
+stops with the rest of `whisrs.service`, and otherwise whisrs has the kernel
+interrupt it when the daemon exits. The restarted daemon says "whisrs
+restarted during that turn, which stopped it before OpenCode replied." The
+session keeps what it did so far, and the next turn continues it.
+
+`opencode` runs in the agent's `dir`, with `PWD` set to it (OpenCode takes its
+directory from `PWD`), and the daemon's environment minus what a parent Claude
+Code session sets (the list above), what a parent OpenCode session sets
+(`OPENCODE`, `OPENCODE_SESSION_ID`, `OPENCODE_TERMINAL`, `AGENT`,
+`OPENCODE_PASSWORD`, `OPENCODE_SERVER_PASSWORD`) and whisrs's own `WHISRS_*`
+keys. Everything else is passed on, OpenCode's own settings included
+(`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG_DIR`, the XDG
+directories).
 
 ## Choosing the microphone
 

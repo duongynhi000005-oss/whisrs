@@ -44,6 +44,8 @@ use tracing::{debug, error, info, warn};
 
 use whisrs::agent::claude::ClaudeDriver;
 use whisrs::agent::display::{AgentVisual, Board};
+use whisrs::agent::opencode::OpenCode;
+use whisrs::agent::process::ProcessDriver;
 use whisrs::agent::progress::{InterimKind, ProgressGate};
 use whisrs::agent::spoken::same_reply;
 use whisrs::agent::store::{self, AgentRecord, AgentStore};
@@ -433,6 +435,7 @@ impl AgentRuntime {
             Harness::Claude,
             Arc::new(ClaudeDriver::new(&whisrs, socket)),
         );
+        drivers.insert(Harness::OpenCode, Arc::new(ProcessDriver::new(OpenCode)));
         let (board_tx, board_rx) = mpsc::unbounded_channel();
         Self {
             agents: agents.into_iter().map(Arc::new).collect(),
@@ -839,9 +842,15 @@ impl AgentRuntime {
             .map(|s| s.phase)
             .unwrap_or(AgentPhase::Idle);
         let record = inner.store.agents.get(&agent.name);
-        let session = record
-            .and_then(|r| r.session_id.as_deref())
-            .map(|id| id.chars().take(8).collect());
+        // Short beside a bg id (what Claude Code's commands take); whole
+        // otherwise, as the harness takes it (`opencode --session <id>`).
+        let session = record.and_then(|r| {
+            let id = r.session_id.as_deref()?;
+            Some(match r.bg_id {
+                Some(_) => id.chars().take(8).collect(),
+                None => id.to_string(),
+            })
+        });
         AgentInfo {
             name: agent.name.clone(),
             harness: agent.harness.to_string(),
@@ -2142,8 +2151,9 @@ async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     if let Some(old) = record.session_id.take() {
         info!(
             "agent '{}': forgot session {old}; the next turn starts a new one (the old session \
-             stays in Claude Code)",
-            agent.name
+             stays in {})",
+            agent.name,
+            agent.harness.label()
         );
     }
     record.clear_session();

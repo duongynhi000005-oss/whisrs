@@ -121,15 +121,17 @@ reads it from standard input); a read-aloud in progress is stopped first.
 \fBagent\fR [\fINAME\fR] [\fB\-\-text\fR \fITEXT\fR] [\fB\-\-new\fR] [\fB\-\-reset\fR] [\fB\-\-stop\fR]
 Talk to a coding agent configured in
 .B [[agents]]
-(Claude Code). Without
+(Claude Code or OpenCode). Without
 .IR NAME ,
 list the agents with their harness, state
 .RB ( idle ,
 .BR working ,
 or
 .BR needs\-you )
-and the session's background id (the id
+and the session's id (Claude Code's background id, which
 .B claude attach
+takes; OpenCode's session id, which
+.B opencode \-\-session
 takes). With
 .IR NAME ,
 record a voice instruction for that agent (the same as its hotkey; run again
