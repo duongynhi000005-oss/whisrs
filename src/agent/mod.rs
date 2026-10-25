@@ -65,7 +65,8 @@ pub struct AgentConfig {
     /// Which coding agent: `claude` (default), `opencode` or `codex`.
     #[serde(default = "default_harness")]
     pub harness: String,
-    /// The directory the agent works in. `~` is expanded; it must exist.
+    /// The directory the agent works in. `~` is expanded, and a relative
+    /// path is taken from the daemon's working directory; it must exist.
     #[serde(default)]
     pub dir: String,
     /// `auto` (default), `bypass` or `ask`, mapped per harness.
@@ -192,7 +193,8 @@ pub struct Agent {
     /// The hotkey of a fresh-session voice turn, if any.
     pub new_session_hotkey: Option<String>,
     pub harness: Harness,
-    /// `dir` with `~` expanded; an existing directory at load time.
+    /// `dir` as an absolute path ([`absolute_dir`]); an existing directory
+    /// at load time.
     pub dir: PathBuf,
     pub permissions: Permissions,
     /// The binary to run: `command`, or the harness default.
@@ -227,6 +229,21 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// An agent's `dir` as an absolute path: `~` expanded ([`expand_tilde`]),
+/// and a relative path joined to `cwd`, the daemon's working directory (`None`
+/// when it has none, which leaves the path relative). A harness is started
+/// in the dir and some take their directory from `PWD` instead (OpenCode),
+/// which must then be absolute. `.` components are dropped; `..` and
+/// symlinks are kept as written.
+pub fn absolute_dir(dir: &str, cwd: Option<&Path>) -> PathBuf {
+    let dir = expand_tilde(dir);
+    let dir = match cwd {
+        Some(cwd) if dir.is_relative() => cwd.join(dir),
+        _ => dir,
+    };
+    dir.components().collect()
+}
+
 /// Validate `[[agents]]`: the usable agents, plus a warning for each entry
 /// skipped or partly ignored. Shared by `Config::validate` (which logs the
 /// warnings at startup) and the daemon runtime (which drives the agents), so
@@ -237,12 +254,15 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 /// warned about but keeps the entry (the CLI still reaches it), and so does
 /// an unknown feedback level, which is `brief` then.
 pub fn resolve_agents(entries: &[AgentConfig]) -> (Vec<Agent>, Vec<String>) {
-    resolve_agents_with(entries, |p| p.is_dir())
+    let cwd = std::env::current_dir().ok();
+    resolve_agents_with(entries, cwd.as_deref(), |p| p.is_dir())
 }
 
-/// [`resolve_agents`] with the directory check injected, for tests.
+/// [`resolve_agents`] with the working directory and the directory check
+/// injected, for tests.
 fn resolve_agents_with(
     entries: &[AgentConfig],
+    cwd: Option<&Path>,
     is_dir: impl Fn(&Path) -> bool,
 ) -> (Vec<Agent>, Vec<String>) {
     let mut agents: Vec<Agent> = Vec::new();
@@ -293,7 +313,7 @@ fn resolve_agents_with(
             ));
             continue;
         }
-        let dir = expand_tilde(&entry.dir);
+        let dir = absolute_dir(&entry.dir, cwd);
         if !is_dir(&dir) {
             warnings.push(format!(
                 "[[agents]] '{name}' is skipped: its dir {} does not exist",
@@ -480,6 +500,14 @@ pub struct SessionRef {
     /// Where the harness writes the conversation, once known.
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
+    /// The id is known, but no turn has shown the agent working in the
+    /// session yet (a text or a tool call): OpenCode's id, which whisrs
+    /// mints and reports as the session's first turn starts, so a turn
+    /// stopped or cut off before its first line keeps it. Until then every
+    /// turn starts the session over, with the first turn's options and
+    /// instruction, on the same id. Never set for an id the harness named.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// One turn to run.
@@ -629,6 +657,13 @@ impl TurnUpdates {
         stopped
     }
 
+    /// Whether the turn was stopped, in one step with [`TurnUpdates::stop`]
+    /// as [`TurnUpdates::report_session`] is: a process registered for the
+    /// stop before this returns `false` is one the stop finds.
+    pub fn stopped(&self) -> bool {
+        self.shared().stopped
+    }
+
     /// Mark the turn stopped and return the newest ids it reported.
     pub fn stop(&self) -> Option<SessionRef> {
         let mut shared = self.shared();
@@ -739,7 +774,7 @@ mod tests {
     }
 
     fn resolve(entries: &[AgentConfig]) -> (Vec<Agent>, Vec<String>) {
-        resolve_agents_with(entries, |p| {
+        resolve_agents_with(entries, Some(Path::new("/daemon/cwd")), |p| {
             p == Path::new("/proj") || p.ends_with("Projects")
         })
     }
@@ -946,6 +981,47 @@ feedback = "Conversational"
         assert_eq!(agents[0].dir, home.join("Projects"));
     }
 
+    /// Every harness gets an absolute dir: OpenCode takes its directory from
+    /// `PWD`, which a relative dir would leave pointing nowhere once the
+    /// child is in it.
+    #[test]
+    fn a_relative_dir_is_taken_from_the_daemons_working_directory() {
+        let cwd = Path::new("/home/u");
+        assert_eq!(
+            absolute_dir("Projects/site", Some(cwd)),
+            PathBuf::from("/home/u/Projects/site")
+        );
+        assert_eq!(
+            absolute_dir("./site/./src/", Some(cwd)),
+            PathBuf::from("/home/u/site/src")
+        );
+        // `..` is kept: it means what the filesystem says.
+        assert_eq!(
+            absolute_dir("../site", Some(cwd)),
+            PathBuf::from("/home/u/../site")
+        );
+        assert_eq!(absolute_dir("/proj/", Some(cwd)), PathBuf::from("/proj"));
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(absolute_dir("~/Projects", Some(cwd)), home.join("Projects"));
+        // No working directory to resolve against: left as written.
+        assert_eq!(absolute_dir("site", None), PathBuf::from("site"));
+        for harness in ["claude", "opencode", "codex"] {
+            let mut e = entry("rel");
+            e.harness = harness.into();
+            e.dir = "Projects".into();
+            let (agents, warnings) = resolve_agents_with(&[e], Some(Path::new("/home/u")), |p| {
+                p == Path::new("/home/u/Projects")
+            });
+            assert!(warnings.is_empty(), "{harness}: {warnings:?}");
+            assert_eq!(
+                agents[0].dir,
+                PathBuf::from("/home/u/Projects"),
+                "{harness}"
+            );
+            assert!(agents[0].dir.is_absolute());
+        }
+    }
+
     #[test]
     fn names_are_lowercase_ascii_words() {
         assert!(valid_agent_name("jarvis"));
@@ -1002,6 +1078,7 @@ feedback = "Conversational"
             session_id: None,
             bg_id: Some("cc7a37cf".into()),
             transcript_path: None,
+            pending: false,
         };
         // The launch reports first: the stop gets the bg id.
         let (updates, mut rx) = TurnUpdates::channel();
@@ -1010,7 +1087,9 @@ feedback = "Conversational"
         assert_eq!(rx.try_recv().unwrap(), TurnUpdate::Session(session.clone()));
         // The stop comes first: the launch is told to stop what it started.
         let (updates, _rx) = TurnUpdates::channel();
+        assert!(!updates.stopped());
         assert_eq!(updates.stop(), None);
+        assert!(updates.stopped());
         assert!(updates.report_session(session.clone()));
         // Plain sends keep the newest ids too.
         let (updates, _rx) = TurnUpdates::channel();

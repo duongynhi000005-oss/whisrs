@@ -46,7 +46,7 @@ use whisrs::agent::claude::ClaudeDriver;
 use whisrs::agent::codex::Codex;
 use whisrs::agent::display::{AgentVisual, Board};
 use whisrs::agent::opencode::OpenCode;
-use whisrs::agent::process::ProcessDriver;
+use whisrs::agent::process::{ProcessDriver, TurnScopes};
 use whisrs::agent::progress::{InterimKind, ProgressGate};
 use whisrs::agent::spoken::same_reply;
 use whisrs::agent::store::{self, AgentRecord, AgentStore};
@@ -354,6 +354,10 @@ impl Drop for ReplyHold<'_> {
 pub(crate) struct AgentRuntime {
     agents: Vec<Arc<Agent>>,
     drivers: HashMap<Harness, Arc<dyn Driver>>,
+    /// The transient scopes process-per-turn turns run in, shared by their
+    /// drivers: what a previous daemon's turn left in one is stopped at
+    /// startup ([`start_background`]).
+    scopes: Arc<TurnScopes>,
     store_path: PathBuf,
     inner: Mutex<Inner>,
     /// Replies and notices waiting for the daemon to be Idle.
@@ -436,12 +440,20 @@ impl AgentRuntime {
             Harness::Claude,
             Arc::new(ClaudeDriver::new(&whisrs, socket)),
         );
-        drivers.insert(Harness::OpenCode, Arc::new(ProcessDriver::new(OpenCode)));
-        drivers.insert(Harness::Codex, Arc::new(ProcessDriver::new(Codex)));
+        let scopes = Arc::new(TurnScopes::new(&store_path));
+        drivers.insert(
+            Harness::OpenCode,
+            Arc::new(ProcessDriver::new(OpenCode, Arc::clone(&scopes))),
+        );
+        drivers.insert(
+            Harness::Codex,
+            Arc::new(ProcessDriver::new(Codex, Arc::clone(&scopes))),
+        );
         let (board_tx, board_rx) = mpsc::unbounded_channel();
         Self {
             agents: agents.into_iter().map(Arc::new).collect(),
             drivers,
+            scopes,
             store_path,
             inner: Mutex::new(Inner {
                 store,
@@ -469,6 +481,7 @@ impl AgentRuntime {
         Self {
             agents: Vec::new(),
             drivers: HashMap::new(),
+            scopes: Arc::new(TurnScopes::off()),
             store_path: PathBuf::new(),
             inner: Mutex::new(Inner {
                 store: AgentStore::default(),
@@ -1113,6 +1126,12 @@ pub(crate) async fn start_background(
         ));
         tokio::spawn(idle_loop(Arc::clone(&context)));
     }
+
+    // What a previous daemon's process-per-turn turns left in their scopes
+    // (a process that ignored the SIGINT its end sent), stopped before any
+    // turn of this daemon runs: every such turn waits for this.
+    let scopes = Arc::clone(&context.agents.scopes);
+    tokio::spawn(async move { scopes.sweep().await });
 
     let rt = &context.agents;
     let mut inner = rt.inner.lock().await;
@@ -3757,6 +3776,7 @@ mod tests {
             session_id: Some("sid-1".into()),
             bg_id: Some("bg1".into()),
             transcript_path: None,
+            pending: false,
         };
         let store_session = |context: Arc<DaemonContext>| {
             let stored = stored.clone();

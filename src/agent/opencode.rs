@@ -10,11 +10,20 @@
 //!   when its `run` is killed. whisrs mints the session id in OpenCode's own
 //!   layout ([`new_session_id`]): `--session` creates a session it does not
 //!   find, so the first turn creates it and every later one continues it
-//!   with the same command. The id is reported once the output names it,
-//!   so a turn that never reached OpenCode leaves no session behind to
-//!   continue. `--title` and `args` are passed on the first turn only:
-//!   `--title` names the session (and saves the model call that would title
-//!   it), and a model or agent chosen with `args` stays the session's.
+//!   with the same command. The id is the agent's as soon as the first
+//!   turn's process runs ([`Launch::session`]), so a turn stopped or cut off
+//!   before its first line keeps it, but pending ([`SessionRef::pending`])
+//!   until a text or a tool call shows the agent working in the session.
+//!   `--title`, `args` and the instruction are passed on the first turn,
+//!   and on every turn while the session is pending: `--title` names the
+//!   session (and saves the model call that would title it), a model or
+//!   agent chosen with `args` stays the session's, and OpenCode keeps the
+//!   title of a session it has and takes the rest again (measured on
+//!   2.0.29: a first turn that failed on `-m nosuch/model`, then the same
+//!   id with `-m mock/mock-1`, ran on the new model in the same session).
+//!   So a first turn that only failed (a typo in `args`) does not pin the
+//!   session to it, and one stopped before OpenCode made the session does
+//!   not leave a session without the instruction.
 //! - **The voice instruction** opens the first turn's prompt. `run` has no
 //!   system prompt option; an agent's `system` (through
 //!   `OPENCODE_CONFIG_CONTENT`) replaces OpenCode's own prompt, and the
@@ -27,9 +36,13 @@
 //!   nothing (the user's rules; OpenCode allows most tools by default),
 //!   `bypass` passes `--auto` (every ask approved, deny rules still hold),
 //!   and `ask` adds rules that ask for shell commands and file changes to
-//!   `OPENCODE_CONFIG_CONTENT`, after the user's own (the last match wins).
-//!   Nobody can approve in `run`: an ask is rejected with feedback to the
-//!   model, which goes on without it, so the turn never waits for you.
+//!   `OPENCODE_CONFIG_CONTENT`, after the user's config rules (the last
+//!   match wins). Nobody can approve in `run`: an ask is rejected with
+//!   feedback to the model, which goes on without it, so the turn never
+//!   waits for you. OpenCode's own saved approvals ("always" answers) and a
+//!   session's allows come after every config rule, so they win over these:
+//!   `ask` refuses commands and edits unless OpenCode already has an
+//!   approval saved for them.
 //! - **Output:** one JSON object per line, `{type, timestamp, sessionID,
 //!   part | error}`. `text` is a finished text part (`part.messageID`,
 //!   `part.text`), `tool_use` a finished tool call (`part.tool`), `error` a
@@ -68,7 +81,9 @@ pub const CONFIG_CONTENT_VAR: &str = "OPENCODE_CONFIG_CONTENT";
 
 /// The rules `permissions = "ask"` adds: shell commands and file changes
 /// (edit, write and patch all ask as `edit`) ask, so a headless run rejects
-/// them. Reads and searches keep the user's rules.
+/// them, unless OpenCode has an approval of its own saved for them ("always"
+/// answers, a session's allows), which wins over config rules. Reads and
+/// searches keep the user's rules.
 const ASK_RULES: [(&str, &str); 2] = [("shell", "ask"), ("edit", "ask")];
 
 /// The OpenCode harness.
@@ -85,7 +100,8 @@ impl TurnHarness for OpenCode {
         session: &SessionRef,
         request: &TurnRequest,
     ) -> Result<Launch, String> {
-        let first = session.session_id.is_none();
+        // A pending session may not exist in OpenCode yet: started over.
+        let first = session.session_id.is_none() || session.pending;
         let session_id = session.session_id.clone().unwrap_or_else(new_session_id);
         let mut env = Vec::new();
         if agent.permissions == Permissions::Ask {
@@ -108,6 +124,7 @@ impl TurnHarness for OpenCode {
             args: turn_args(agent, &session_id, first),
             stdin: Some(prompt),
             env,
+            session: Some(session_id),
         })
     }
 
@@ -131,8 +148,8 @@ pub fn session_title(agent: &Agent) -> String {
     format!("whisrs-{}", agent.name)
 }
 
-/// The arguments of a turn in `session_id`; `first` for the turn that
-/// creates the session.
+/// The arguments of a turn in `session_id`; `first` for a turn that may
+/// create the session (the first, or one of a pending session).
 pub fn turn_args(agent: &Agent, session_id: &str, first: bool) -> Vec<String> {
     let mut args: Vec<String> = ["run", "--standalone", "--format", "json", "--session"]
         .map(String::from)
@@ -329,6 +346,14 @@ mod tests {
             session_id: Some(id.into()),
             bg_id: None,
             transcript_path: None,
+            pending: false,
+        }
+    }
+
+    fn pending(id: &str) -> SessionRef {
+        SessionRef {
+            pending: true,
+            ..resumed(id)
         }
     }
 
@@ -400,6 +425,8 @@ mod tests {
             .unwrap();
         let id = &first.args[5];
         assert!(id.starts_with("ses_") && id.len() == 30, "{id}");
+        // Named to the base, which makes it the agent's once the run starts.
+        assert_eq!(first.session.as_ref(), Some(id));
         assert_eq!(
             first.stdin.as_deref(),
             Some("Answer by voice.\n\nfix the build")
@@ -415,9 +442,29 @@ mod tests {
             .unwrap();
         assert_eq!(&next.args[5], id);
         assert_eq!(next.stdin.as_deref(), Some("and the tests"));
+        assert_eq!(next.session.as_ref(), Some(id));
         assert!(!next.args.contains(&"--title".to_string()));
         assert!(!next.args.contains(&"-m".to_string()));
         assert_eq!(first_prompt("  ", "hi"), "hi");
+    }
+
+    /// A pending session (its first turn only failed, or was stopped or cut
+    /// off before the agent worked in it) is started over on the same id:
+    /// the title, `args` and the instruction again.
+    #[test]
+    fn a_pending_session_is_started_over_on_the_same_id() {
+        let a = agent(Permissions::Auto);
+        let again = OpenCode
+            .launch(&a, &pending("ses_1"), &request("fix the build"))
+            .unwrap();
+        assert_eq!(again.args, turn_args(&a, "ses_1", true));
+        assert_eq!(again.session.as_deref(), Some("ses_1"));
+        assert!(again.args.contains(&"--title".to_string()));
+        assert!(again.args.contains(&"anthropic/claude-sonnet".to_string()));
+        assert_eq!(
+            again.stdin.as_deref(),
+            Some("Answer by voice.\n\nfix the build")
+        );
     }
 
     #[test]
@@ -502,8 +549,12 @@ mod tests {
     /// Run a fixture through the parser and the base's state, as a turn
     /// would: the updates sent and the state at the end.
     fn replay(fixture: &str, session: Option<&str>) -> (Vec<TurnUpdate>, StreamState) {
+        replay_in(fixture, session.map(resumed).unwrap_or_default())
+    }
+
+    fn replay_in(fixture: &str, session: SessionRef) -> (Vec<TurnUpdate>, StreamState) {
         let (updates, mut rx) = TurnUpdates::channel();
-        let mut state = StreamState::new(session.map(String::from));
+        let mut state = StreamState::for_session(&session);
         for line in fixture.lines() {
             for event in OpenCode.events(line) {
                 state.event(event, &updates);
@@ -518,6 +569,20 @@ mod tests {
 
     fn session(id: &str) -> TurnUpdate {
         TurnUpdate::Session(resumed(id))
+    }
+
+    /// A pending first turn that works is confirmed by its first text.
+    #[test]
+    fn the_first_text_confirms_a_pending_session() {
+        let (sent, _) = replay_in(ACK_THEN_TOOL, pending("ses_whisrsfixtureacktool"));
+        assert_eq!(
+            sent,
+            [
+                session("ses_whisrsfixtureacktool"),
+                TurnUpdate::Activity("Running a command".into()),
+                TurnUpdate::Interim("<spoken>On it.</spoken> Let me run that.".into()),
+            ]
+        );
     }
 
     #[test]
@@ -596,9 +661,28 @@ mod tests {
     fn an_error_line_fails_the_turn_with_its_message() {
         let failed = Exit::Status(std::os::unix::process::ExitStatusExt::from_raw(1 << 8));
         let a = agent(Permissions::Auto);
-        let (sent, state) = replay(MODEL_UNAVAILABLE, None);
-        // The session was created before the model failed: kept.
-        assert_eq!(sent, [session("ses_whisrsfixturenoroute")]);
+        // The first turn's id, reported pending as the run started: an error
+        // line names it, but shows no agent working, so it stays pending and
+        // the next turn passes `args` (the model a typo broke) again.
+        let (sent, mut state) = replay_in(MODEL_UNAVAILABLE, pending("ses_whisrsfixturenoroute"));
+        assert!(sent.is_empty(), "{sent:?}");
+        // Still pending: a text would confirm it.
+        let (updates, mut rx) = TurnUpdates::channel();
+        state.event(
+            StreamEvent::Text {
+                message: "m".into(),
+                text: "t".into(),
+            },
+            &updates,
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(session("ses_whisrsfixturenoroute"))
+        );
+        let next = OpenCode
+            .launch(&a, &pending("ses_whisrsfixturenoroute"), &request("x"))
+            .unwrap();
+        assert!(next.args.contains(&"-m".to_string()));
         let TurnOutcome::Failed(message) = outcome(&a, &OpenCode, &state, &[], &failed) else {
             panic!("an error line fails the turn");
         };

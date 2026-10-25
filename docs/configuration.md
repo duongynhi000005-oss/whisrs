@@ -426,7 +426,8 @@ response_format = "wav"     # audio format requested from the API
 #                                #   fresh session (whisrs agent <name> --new)
 # harness = "claude"             # claude (Claude Code, default) | opencode (OpenCode 2) |
 #                                #   codex (Codex CLI)
-# dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist
+# dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist (a
+#                                #   relative path is taken from whisrsd's working directory)
 # permissions = "auto"           # auto (default) | bypass | ask
 # command = "claude"             # optional: the binary (default: claude, opencode or codex
 #                                #   on PATH). Set its full path when the daemon's PATH lacks
@@ -434,8 +435,9 @@ response_format = "wav"     # audio format requested from the API
 # args = ["--model", "sonnet"]   # optional: extra arguments for the first turn of a session
 #                                #   (Codex: for every turn)
 # reply_instruction = "..."      # optional: replaces the built-in voice instruction
-#                                #   (args and reply_instruction apply, after the restart,
-#                                #   from the next new session: whisrs agent <name> --new;
+#                                #   (after the restart, reply_instruction applies from the
+#                                #   next new session, whisrs agent <name> --new; so do args,
+#                                #   except with Codex, which takes them on every turn; and
 #                                #   with Claude Code, permissions too)
 # feedback = "brief"             # optional: what the agent says while it works. summary
 #                                #   (the reply only) | brief (default: a short
@@ -917,8 +919,15 @@ Sessions. whisrs makes up the session id (`ses_...`, in OpenCode's own form)
 and passes it on every turn: the first turn creates the session, titled
 `whisrs-<name>`, and every later one continues it. `whisrs agent` shows the
 whole id; `opencode --session <id>` opens the session in OpenCode, and it is
-in `opencode session list`. A turn that never reached OpenCode (it was not
-found, say) leaves no session behind, and the next turn starts one.
+in `opencode session list`. The id is the agent's as soon as the turn's
+`opencode run` starts, so a first turn you stop (or a restart cuts off) before
+OpenCode printed anything keeps it, and the next turn continues that session
+instead of leaving it behind. Until a turn shows the agent at work in it (a
+reply or a tool call), each turn starts the session over on the same id, with
+the title, `args` and the voice instruction. So a first turn that only failed
+(a mistyped model in `args`, say) does not tie the session to it: fix `args`,
+run `whisrs restart`, and the next turn uses them. A turn that never started
+`opencode` (it was not found, say) leaves no session behind.
 
 The voice instruction (the built-in one or your `reply_instruction`, with the
 request of your `feedback` level) opens the first message of a session.
@@ -934,7 +943,7 @@ long session may summarize it away (start a fresh one with `--new`).
 |---|---|
 | `auto` (default) | no flag: your own OpenCode rules (OpenCode allows most tools unless you set rules) |
 | `bypass` | `--auto`: approves every permission request; rules that deny still apply |
-| `ask` | adds rules that ask before shell commands and file changes (`shell` and `edit`) to `OPENCODE_CONFIG_CONTENT`, after your own: reading and searching work, commands and edits are refused |
+| `ask` | adds rules that ask before shell commands and file changes (`shell` and `edit`) to `OPENCODE_CONFIG_CONTENT`, after your own config rules (the last match wins): reading and searching work, commands and edits are refused unless OpenCode already has an approval saved for them (see below) |
 
 Nobody can answer OpenCode's permission questions during a turn: a request
 that would ask is refused, the agent is told so and goes on without it, and
@@ -942,6 +951,12 @@ the reply usually says what it could not do. So an OpenCode agent never shows
 needs-you, and a turn never waits for you. With `ask`, a daemon whose
 `OPENCODE_CONFIG_CONTENT` is not a plain JSON object fails the turn instead of
 running it without the rules.
+
+OpenCode's own approvals win over the rules `ask` adds: an "always" answer you
+gave in OpenCode (saved for the project) and what a session allows come after
+every config rule, and the last match wins. So `ask` refuses commands and
+edits unless OpenCode already has an approval saved for them: a command you
+approved with "always" in OpenCode still runs.
 
 Which keys apply when: `permissions` is passed on every turn, so after
 `whisrs restart` a change applies from the next turn. `args` is passed on the
@@ -956,16 +971,28 @@ and the acknowledgement the agent wrote before its first tool call, come when
 that call ends. And between turns no OpenCode process runs: a session never
 works on its own, and a new turn is never refused for that.
 
-`--stop` interrupts the turn: whisrs sends `opencode run` SIGINT, then
-SIGTERM and SIGKILL if it is still running a few seconds later, and returns
-once it is gone. The session keeps what it did; the next turn continues it,
-the stopped tool call in its history.
+Each turn runs in a systemd scope of its own (`systemd-run --user --scope`, a
+unit named `whisrs-agent-<id>-<name>-<turn>.scope`), so a stop reaches every
+process the turn started, also one that put itself in a session of its own.
+`--stop` interrupts the turn: whisrs sends SIGINT, then SIGTERM and SIGKILL to
+whatever of the turn is still running a few seconds later (`opencode run`, its
+process group, every process of its tree and the scope), and returns once all
+of it is gone. Without `systemd-run`, or a user systemd it can reach, the turn
+starts directly, and a stop reaches the process group and every process of the
+tree whisrs can still find (one whose parent already exited is out of its
+reach). The session keeps what it did; the next turn continues it, the stopped
+tool call in its history.
 
-A daemon restart during a turn ends that turn: under a systemd service it
-stops with the rest of `whisrs.service`, and otherwise whisrs has the kernel
-interrupt it when the daemon exits. The restarted daemon says "whisrs
-restarted during that turn, which stopped it before OpenCode replied." The
-session keeps what it did so far, and the next turn continues it.
+A daemon restart during a turn ends that turn: whisrs has the kernel interrupt
+`opencode run` (SIGINT) when the daemon exits or is killed, and when the
+daemon starts again it stops whatever that turn left in its scope (a process
+that ignored the SIGINT) before it runs any turn. The scope is not part of
+`whisrs.service`, so such a process outlives a stopped service until whisrsd
+starts again. The restarted daemon says "whisrs restarted during that turn,
+which stopped it before OpenCode replied." The session keeps what it did so
+far, and the next turn continues it. When the agent had not been seen at work
+in the session yet, it says instead that the turn may not have reached
+OpenCode at all, so say it again.
 
 `opencode` runs in the agent's `dir`, with `PWD` set to it (OpenCode takes its
 directory from `PWD`), and the daemon's environment minus what a parent Claude
@@ -984,12 +1011,15 @@ model, not a real account. The first turn starts a session, every later one
 resumes it:
 
 ```
-codex exec --json --skip-git-repo-check <permissions> -c analytics.enabled=false -c developer_instructions=<instruction> [<args>] -
-codex exec --json --skip-git-repo-check <permissions> -c analytics.enabled=false -c developer_instructions=<instruction> [<args>] resume <id> -
+codex exec --json <permissions> -c analytics.enabled=false -c developer_instructions=<instruction> [<args>] --skip-git-repo-check -
+codex exec --json <permissions> -c analytics.enabled=false -c developer_instructions=<instruction> [<args>] --skip-git-repo-check resume <id> -
 ```
 
 The words go in on stdin. `--skip-git-repo-check` lets `dir` be any folder,
-not only a git repository. `analytics.enabled=false` turns Codex's usage
+not only a git repository. It comes after your `args` so that an option there
+that takes several values (`-i`/`--image`) ends before `resume`, the id and
+the `-` of the prompt; leave `--skip-git-repo-check` itself out of `args`
+(Codex refuses it twice). `analytics.enabled=false` turns Codex's usage
 metrics off for these runs: with them on, `codex exec` sends them after the
 turn and exits only once they are sent, which held every reply back by 4 to
 10 seconds when tested. To keep them, put `"-c", "analytics.enabled=true"` in
@@ -1010,7 +1040,9 @@ on every turn. The model gets it as a developer message, so it never shows as
 your words. Passing it again on a later turn does not repeat it, and it
 survives a compaction of a long session, which drops an instruction that was
 given only on the first turn (both measured). A changed instruction applies
-from the next new session, as with the other harnesses.
+from the next new session, as with the other harnesses. It replaces any
+`developer_instructions` you set in Codex's own `config.toml` or a profile:
+put text of your own in `reply_instruction`.
 
 `permissions` for Codex:
 
@@ -1045,7 +1077,9 @@ takes precedence over a ChatGPT sign-in, and whisrs passes it on. With
 `auto`, each review by the automatic reviewer is one more model call. When
 Codex is not signed in, the turn fails after about 40 seconds of retries with
 "it is not signed in, or its sign-in expired": run `codex login` in a
-terminal.
+terminal. When the daemon's environment has a `CODEX_API_KEY` (which Codex
+uses before any sign-in), a refused key fails the turn with "the API key in
+CODEX_API_KEY was refused" instead.
 
 What you hear and see works as with Claude Code, with two differences. Codex
 reports a tool call when it starts, so the overlay's activity line, and the
@@ -1055,8 +1089,9 @@ when tested: Codex printed no line for it). And between turns no Codex process
 runs: a session never works on its own, and a new turn is never refused for
 that.
 
-`--stop` interrupts the turn: whisrs sends `codex exec` SIGINT, then SIGTERM
-and SIGKILL if it is still running a few seconds later, and returns once it
+`--stop` interrupts the turn as with OpenCode (in the turn's own systemd
+scope): whisrs sends `codex exec` SIGINT, then SIGTERM and SIGKILL to whatever
+of the turn is still running a few seconds later, and returns once all of it
 is gone. Codex ends the command it runs with it, sandboxed or not. The session
 keeps what it did; the next turn continues it. Stopping a command that runs in
 the workspace-write sandbox (`auto`) can leave empty `.git`, `.codex`,
@@ -1064,10 +1099,11 @@ the workspace-write sandbox (`auto`) can leave empty `.git`, `.codex`,
 mount points, which Codex does not remove when it is interrupted (measured).
 Delete them if they are in the way.
 
-A daemon restart during a turn ends that turn, as with OpenCode, and the
-restarted daemon says "whisrs restarted during that turn, which stopped it
-before Codex replied." The session keeps what it did so far, and the next turn
-continues it.
+A daemon restart during a turn ends that turn, as with OpenCode (the restarted
+daemon stops whatever the turn left in its scope first), and the restarted
+daemon says "whisrs restarted during that turn, which stopped it before Codex
+replied." The session keeps what it did so far, and the next turn continues
+it.
 
 `codex` runs in the agent's `dir`, with `PWD` set to it, and the daemon's
 environment minus what a parent Claude Code session sets (the list above),

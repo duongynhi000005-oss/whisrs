@@ -16,7 +16,7 @@ name = "jarvis"                  # required, unique, [a-z0-9_-]
 hotkey = "Super+Shift+J"         # optional, same syntax as [hotkeys]
 new_session_hotkey = "Super+Shift+N"   # optional: a voice turn in a fresh session
 harness = "claude"               # claude (phase 1); opencode | codex | copilot (phase 2)
-dir = "~/Projects/whisrs"        # required, ~ expanded, must exist
+dir = "~/Projects/whisrs"        # required, ~ expanded, relative = from whisrsd's cwd, must exist
 permissions = "auto"             # auto (default) | bypass | ask
 command = "claude"               # optional binary path; default: the harness name on PATH
 args = ["--remote-control", "jarvis"]   # optional, passed on the first turn of a session
@@ -45,6 +45,10 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
   next turn after the restart; `args` and the instruction are fixed at session start there too.
   Codex passes `permissions` and `args` on every turn (`exec resume` keeps neither, measured);
   the instruction is fixed at session start there too.
+- `dir` is made absolute at load (`agent::absolute_dir`): `~` expanded, a relative path joined
+  to the daemon's working directory, `.` dropped (`..` and symlinks kept). Every harness gets
+  it; OpenCode takes its directory from `PWD`, which a relative dir would leave meaningless
+  once the child is in it (every turn failed).
 - Validation warns (and skips the entry, `resolve_agents`) on a missing, invalid (not
   `[a-z0-9_-]`) or duplicate name, an unknown harness or `permissions` value, and a missing
   or nonexistent dir; a hotkey clash is reported like the `[[llm_commands]]` clashes. Agents
@@ -181,9 +185,14 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
   the user's own included. Measured: started from a whisrsd in a unit with the default
   `KillMode=control-group`, the service and its sessions sat in the unit's cgroup and died
   with it on stop. So when whisrsd runs as a service (`INVOCATION_ID`, or a `.service`
-  cgroup), `--bg` launches run under `systemd-run --user --scope --quiet --collect --`
-  (environment, cwd and pipes kept); a missing `systemd-run`, or one that cannot reach the
-  user manager, falls back to a direct spawn. `claude agents` and `claude stop` never start
+  cgroup), `--bg` launches run under `systemd-run --user --scope --quiet --collect
+  --expand-environment=no --` (environment, cwd and pipes kept); a missing `systemd-run`, or
+  one that cannot reach the user manager, falls back to a direct spawn. Since systemd 254 a
+  scope's command line has `$NAME` and `${NAME}` expanded like a service's `ExecStart=`
+  (measured on 262: `$HOME` arrived as the home directory), which would change the instruction
+  or the user's words; `--expand-environment=no` keeps them. An older systemd-run refuses the
+  option (and expands nothing), so the launch is retried without it
+  (`claude::expand_option_refused`). `claude agents` and `claude stop` never start
   the service (measured) and run directly.
 - **First turn:** `claude --bg --name whisrs-<agent> --permission-mode <m>
   --append-system-prompt <instruction> --settings <hooks json> [args…] -- "<text>"`.
@@ -438,15 +447,16 @@ Deviations from the plan, as built:
   `DaemonState`. The state machine only gains the agent recording sink; `DaemonState`
   also says whose voice it is (`agent_transcribing`, `tts_agent`) for the StateBus.
 - `$XDG_DATA_HOME/whisrs/agents.json` (0600): per agent `harness`, `dir`, `session_id`,
-  `bg_id`, `transcript_path`, `turn_running`, `turn_started_at`, `updated_at`. Written on
+  `bg_id`, `transcript_path`, `session_pending` (`SessionRef::pending`), `turn_running`,
+  `turn_started_at`, `updated_at`. Written on
   every change, off the
   async runtime (`spawn_blocking`, numbered snapshots so the newest always lands last), as is
   every transcript read. At startup an agent with `turn_running` is watched again (poll), so
   a reply that lands after a daemon restart is still spoken. A changed `harness` or `dir`
   starts a fresh session.
 - Daemon shutdown leaves agent sessions running; they belong to the harness. A
-  process-per-turn turn (OpenCode, Codex) ends with the daemon (see "OpenCode driver"); its
-  session stays, and the next turn continues it.
+  process-per-turn turn (OpenCode, Codex) ends with the daemon (see "The process-per-turn
+  base"); its session stays, and the next turn continues it.
 
 ## Layout
 
@@ -491,28 +501,78 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
 
 - **Spawn:** `command` in `dir`, own process group, `PWD` = dir, the daemon's environment minus
   `claude::strips_env` (Claude's parent-session list and `WHISRS_*`) and the harness's own list,
-  then `Launch::env`. Spawned from a thread that registers the child for `--stop` before the turn
-  hears of it, writes the prompt, closes stdin and waits for the child, with
-  `PR_SET_PDEATHSIG` = SIGINT (checked against `getppid` after the prctl): the thread lives as
-  long as the child, so the child is interrupted only when the daemon exits or dies.
-- **Output:** stdout lines go through `events` into `StreamState`: a session id other than the
-  agent's is reported (`TurnUpdate::Session`), so a first turn's id is stored once the harness
-  names it; `Tool` sends `Activity` (deduplicated) and releases the text before it through
-  `InterimTracker`; the reply is the text parts of the last message, joined. Stderr keeps its
-  last 40 lines. Reading ends when both pipes end and the process exited, or two seconds after
-  the exit (a leftover process can hold stdout open).
+  then `Launch::env`. In a transient scope of its own: `systemd-run --user --scope --quiet
+  --collect --expand-environment=no --unit=whisrs-agent-<instance>-<agent>-<turn>.scope --
+  <command> <args>` (`claude::scope_args`; `<instance>` is eight hex digits of a hash of the
+  daemon's `agents.json` path, so a test daemon beside the user's never touches the user's
+  scopes, `<turn>` eight random ones). systemd-run execs the harness as the same process (pid,
+  group, pipes, environment and PDEATHSIG kept; systemd adds `INVOCATION_ID`), and every process
+  the turn starts is in the scope's cgroup whatever its group or session. A start that never ran
+  the harness (no stdout line, a failed exit, stderr of systemd-run's own) is retried: without
+  `--expand-environment` when an older systemd-run refused it, directly when it could not make
+  the scope or found no harness (`Wrap::after`; a missing `systemd-run` goes direct at once).
+  Spawned from a thread that registers the child for `--stop` before the turn hears of it,
+  writes the prompt, closes stdin and waits for the child, with `PR_SET_PDEATHSIG` = SIGINT
+  (checked against `getppid` after the prctl): the thread lives as long as the child, so the
+  child is interrupted only when the daemon exits or dies.
+- **Stop before registration:** right after registering, the thread reports the launch's new
+  session id (`TurnUpdates::report_session`) or reads the stop flag (`TurnUpdates::stopped`), in
+  one step with the runtime's `TurnUpdates::stop` (which comes before `Driver::stop`): either
+  that stop finds the process registered, or the thread sees the stop, leaves the prompt
+  unwritten and stops the process itself with the whole escalation (`stop_detached`), as it does
+  for a process whose turn was dropped while it spawned. It stays registered until it is gone,
+  so the next turn waits for it.
+- **Session:** a session the launch names (`Launch::session`, OpenCode's minted id) that the
+  agent does not have yet is reported at spawn with `pending = true` (`SessionRef::pending`,
+  persisted), so a turn stopped or cut off before its first line keeps it; the first `Text` or
+  `Tool` of a turn confirms it (reported with `pending = false`). An id the output names that
+  differs from the agent's is reported confirmed. A start that never ran the harness (not found)
+  reports the agent's old session back.
+- **Output:** stdout lines go through `events` into `StreamState`: `Tool` sends `Activity`
+  (deduplicated) and releases the text before it through `InterimTracker`; the reply is the text
+  parts of the last message, joined (an empty last message is no reply). Stderr keeps its last 40
+  lines. A line is read through a capped reader (`LineReader`, cancel safe like `read_until`):
+  a stdout line over 1 MiB (`STDOUT_LINE_MAX`) is skipped, a stderr line over 8 KiB
+  (`STDERR_LINE_MAX`) keeps its start, each with one warning per turn; neither is ever buffered
+  whole. Reading ends when both pipes end and the process exited, or two seconds after the exit
+  (a leftover process can hold stdout open).
 - **Outcome:** an `Error` event fails the turn ("Agent 'x': OpenCode failed: ..."); else the
   reply (a non-zero exit after it is only logged); else "ended the turn without a reply" on exit
   0, or what `stderr_failure` recognizes, or the stderr line that mentions an error (else its
   last), or the exit status.
-- **Stop:** SIGINT, SIGTERM, SIGKILL to the group (`STOP_GRACES` 3 s, 2 s, 2 s), each only while
-  something of the group is left (the exit seen and `kill(-pgid, 0)` = ESRCH); never `kill(0)`
-  or `kill(-1)`. Run once per process (`OnceCell`), so `Driver::stop` after the abort and the
-  stop a dropped turn starts (`Registered`'s drop) are the same stop, and both wait for it. The
-  next turn of the agent waits for a previous process still stopping: never two on a session.
+- **Stop:** SIGINT, SIGTERM, SIGKILL (`STOP_GRACES` 3 s, 2 s, 2 s), each only while something
+  of the turn is left, to the group (never `kill(0)` or `kill(-1)`), to every process of its
+  tree seen so far (`Tree`: `/proc/<pid>/task/*/children` walked from the leader and from every
+  process seen, each kept with its start time, so a `setsid` child is found through its parent
+  and still signalled once that parent exited; walked at each step and each 50 ms poll), and
+  to the scope (`systemctl --user kill --signal=<SIG> <unit>`). Gone = the exit seen,
+  `kill(-pgid, 0)` = ESRCH, no tree process alive and the scope's `cgroup.procs` empty (its
+  cgroup from `systemctl --user show -p ControlGroup`, cgroup v2). Then `systemctl --user stop
+  --no-block <unit>` as a backstop. Run once per process (`OnceCell`), so `Driver::stop` after
+  the abort and the stop a dropped turn starts (`Registered`'s drop) are the same stop, and
+  both wait for it. The next turn of the agent waits for a previous process still stopping:
+  never two on a session. Copilot's tool shells take a session of their own and survive a
+  SIGKILL of the group (contract 3.6), which is why the tree and the scope exist. Without a
+  scope, a process whose parent exited before any walk saw it is out of reach.
+- **Restart:** the scope is outside the daemon's cgroup (`whisrs.service`'s, under systemd), so
+  a stopped or restarted daemon no longer takes the turn along: PDEATHSIG interrupts the
+  harness, and `TurnScopes::sweep` stops what a turn left in its scope (a process that ignored
+  that SIGINT) when the next daemon starts: `systemctl --user list-units --all --plain
+  --type=scope 'whisrs-agent-<instance>-*'`, then the same escalation on each scope still
+  running (`Scope::stop_leftover`). Spawned by `start_background`, run once (`OnceCell`), and
+  awaited by every turn and rewatch before they spawn anything. Measured with a fake harness
+  that starts `setsid sleep 300 &` (SIGINT ignored, a background job) and sleeps: `--stop`
+  returned after 3.08 s (the SIGTERM after the first grace) with no `sleep 300` left, also when
+  its parent had exited at once (an orphan, reached only through the scope); a SIGKILL of the
+  daemon left the `sleep 300` running until the restarted daemon's sweep stopped it, with no
+  scope left. Without a reachable user systemd the turn started directly, `--stop` still ended
+  the setsid child (the tree) but not the orphan. Real runs (mock models): `--stop` mid tool
+  call left no `opencode`/`codex`/sandbox/`sleep` process (191 ms OpenCode, 90 ms Codex), and so
+  did a SIGTERM or SIGKILL of the daemon mid-turn; the next turn continued the session.
 - **Rewatch:** the turn ended with the old daemon, so it fails at once with `cut_off`: "whisrs
   restarted during that turn, which stopped it before OpenCode replied. The session keeps what
-  it did so far." It never stays working.
+  it did so far." For a session the agent was never seen working in (none yet, or pending):
+  "... It may not have reached OpenCode at all, so say it again." It never stays working.
 - Between turns nothing runs: `session_phase(s)` is Idle, no hooks (`hook_matches` false,
   `idle_event` ignored), `forget` has nothing to drop. No needs-you: none of the three harnesses
   waits on an approval headless.
@@ -527,11 +587,16 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
 - **Session id:** whisrs mints it in OpenCode's layout (`ses_` + twelve hex digits of the
   inverted `ms * 4096 + counter`, so newer sorts first, + fourteen base62 characters,
   `opencode::new_session_id`); `--session` creates a session it does not find, so the same
-  command continues it later. It is reported once a line names it (every line carries
-  `sessionID`; a failure before the session resolved names `""`), so a turn that never reached
-  OpenCode leaves nothing to continue. `--title` and `args` go on the first turn only (the title
-  also saves the title-generation model call, measured); a `-m` model or `--agent` stays the
-  session's (measured).
+  command continues it later. It is reported at spawn, pending (see the base), so a first turn
+  stopped or cut off before its first line keeps it and the next turn continues it instead of
+  leaving a `whisrs-<agent>` session behind. `--title`, `args` and the instruction go on the
+  first turn, and again on every turn while the session is pending (the title also saves the
+  title-generation model call, measured); a `-m` model or `--agent` stays the session's
+  (measured). OpenCode keeps the title of a session it has (a second `--title` changed nothing)
+  and takes the rest again (measured on 2.0.29: a first turn that failed on `-m nosuch/model`,
+  then the same id with `-m mock/mock-1`, ran on the new model in the same session, the
+  instruction twice in its history), so a first turn that only errored does not pin a typo in
+  `args`, and one stopped before OpenCode made the session leaves none without the instruction.
 - **Instruction:** prefixed to the first prompt, then a blank line. `run` has no system prompt
   option; `agents.<name>.system` replaces OpenCode's base prompt and the session then cannot
   resume without that agent; config `instructions` did not reach the model; `AGENTS.md` would
@@ -542,8 +607,10 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
   tools); `bypass` passes `--auto` (asks approved, deny rules hold); `ask` appends
   `[{shell, *, ask}, {edit, *, ask}]` (edit, write and patch all assert `edit`) to
   `OPENCODE_CONFIG_CONTENT`, after the daemon's own content (merged; rules are last-match-wins,
-  and the env layer comes after the config files, measured). Content that is not a JSON object
-  fails the turn rather than running without the rules.
+  and the env layer comes after the config files, measured). OpenCode's own saved approvals
+  ("always" answers) and a session's allows come after every config rule, so they win: `ask`
+  refuses commands and edits unless OpenCode already has an approval saved for them. Content
+  that is not a JSON object fails the turn rather than running without the rules.
 - **Events:** `text` → `Text { part.messageID, part.text }` (printed when the part ends; a fast
   turn's texts come after the turn, from the run's reconcile, in order); `tool_use` →
   `Tool(part.tool)`, printed when the call ends (completed or rejected), so the activity and the
@@ -553,9 +620,9 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
   server and the tool's shell (its own session) go with it, and the next turn continues the
   session with the stopped call in its history (measured, also after SIGTERM to every process
   at once, as a cgroup kill does).
-- **Restart:** under systemd the run dies with the unit's cgroup; otherwise `PR_SET_PDEATHSIG`
-  interrupts it when whisrsd exits or is killed (measured both ways). The restarted daemon's
-  rewatch ends the turn with `cut_off`.
+- **Restart:** `PR_SET_PDEATHSIG` interrupts the run when whisrsd exits or is killed (measured),
+  the next daemon sweeps its scope, and the restarted daemon's rewatch ends the turn with
+  `cut_off`.
 - **Environment:** besides the base's stripping, `OPENCODE`, `OPENCODE_SESSION_ID`,
   `OPENCODE_TERMINAL`, `AGENT` (set in OpenCode's tool shells), `OPENCODE_PASSWORD`,
   `OPENCODE_SERVER_PASSWORD`. `OPENCODE_CONFIG_CONTENT`, `OPENCODE_CONFIG*` and the XDG
@@ -569,16 +636,21 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
 Tested with the npm-packed `codex` 0.164.0, an isolated `CODEX_HOME` whose `model_providers.mock`
 points at a scripted Responses API server; no account and no real model.
 
-- **Every turn:** `codex exec --json --skip-git-repo-check <permissions> -c
-  analytics.enabled=false -c developer_instructions=<TOML string> [args…] -`, the prompt on
-  stdin; a later turn adds `resume <thread id>` before the `-`. Every option goes before
-  `resume` (`--sandbox` and `--approve-for-me` are a usage error after it). The skip lets `dir`
-  be any folder (without it Codex exits 1 outside a git repo).
+- **Every turn:** `codex exec --json <permissions> -c analytics.enabled=false -c
+  developer_instructions=<TOML string> [args…] --skip-git-repo-check -`, the prompt on stdin; a
+  later turn adds `resume <thread id>` before the `-`. Every option goes before `resume`
+  (`--sandbox` and `--approve-for-me` are a usage error after it). The skip lets `dir` be any
+  folder (without it Codex exits 1 outside a git repo), and comes after `args` because exec's
+  `-i`/`--image` takes `1..` values: `-i x.png resume <id> -` takes the resume as image files
+  (0.164.0's parser: `--help` after it printed `codex exec`'s help, not `codex exec resume`'s),
+  while a flag after `-i x.png` ends it (`resume`'s help, and `-` parsed as the prompt). The
+  flag may not be given twice (clap refuses it), so `args` must not hold it.
 - **Session id:** Codex mints it; the first line is `thread.started{thread_id}` (a UUIDv7), and a
   resumed turn repeats the same id. Only a UUID is taken (`codex::is_thread_id`) and resumed: a
   stored id that is not one fails the turn, since Codex would look it up as a thread name (and
   start a new thread when none matches). A turn that failed after `thread.started` (a provider
-  400) keeps a resumable thread (measured). A thread Codex no longer has fails the resume on
+  400) keeps a resumable thread (measured), and is never pending: nothing is first-turn only
+  (every turn passes the permissions, `args` and the instruction), so keeping it pins nothing. A thread Codex no longer has fails the resume on
   stderr (`no rollout found for thread id`, exit 1), which `stderr_failure` turns into "Codex no
   longer has this agent's session ... `--new` starts a new one".
 - **On every turn:** `args` (a `-m` model of turn 1 was gone on turn 2, measured) and the
@@ -594,6 +666,8 @@ points at a scripted Responses API server; no account and no real model.
   every turn when passed every turn; a changed value on a resumed turn is not added (the stored
   one stays); with it passed on the first turn only, a compaction drops it from every later
   request, and passed on every turn it survives the compaction. So it is passed on every turn.
+  It replaces any `developer_instructions` of the user's `config.toml` or profile (a `-c`
+  override wins); `reply_instruction` is the place for the user's own text.
 - **Permissions:** `codex exec` forces approval policy `never` and refuses every approval request
   (commands, patches, `request_user_input`), so a turn never waits. `auto` = `--approve-for-me`
   (workspace-write sandbox, network off; an escalation goes to the automatic reviewer, an extra
@@ -604,12 +678,16 @@ points at a scripted Responses API server; no account and no real model.
   `[projects."<dir>"] trust_level = "trusted"` into `$CODEX_HOME/config.toml` (measured; read-only
   writes nothing): Codex's own behavior, documented for users.
 - **Events:** `item.completed` of an `agent_message` → `Text { item.id, text }` (one message per
-  item; the last is the reply, as Codex's own final message); `item.started` of
+  item; the last is the reply, as Codex's own final message; an empty one is kept, so an empty
+  final message is "ended the turn without a reply", never the acknowledgement before a tool
+  call, which was spoken already); `item.started` of
   `command_execution`, `file_change`, `web_search`, `todo_list`, `collab_tool_call` → `Tool(type)`,
   and of `mcp_tool_call` → `Tool("mcp__<server>__<tool>")`, so the activity and the interim come
   when a call starts (file changes and web searches also start, measured); `turn.failed` →
   `Error(error.message)`, a provider's JSON body reduced to its `error.message` and a
-  `401 Unauthorized` turned into "it is not signed in, or its sign-in expired ... `codex login`".
+  `401 Unauthorized` turned into "it is not signed in, or its sign-in expired ... `codex login`",
+  or, when the child has a `CODEX_API_KEY` (Codex uses it before any saved sign-in; `codex exec`
+  reads no other key variable, 0.164.0 source), "the API key in CODEX_API_KEY was refused".
   Nothing from top-level `error` lines and `error` items (retries and warnings; a fatal one
   comes back in `turn.failed`), from `item.completed` of tools (an unfinished one is completed
   after the final message at `turn.completed`, and would release the reply as an interim), nor
@@ -621,7 +699,8 @@ points at a scripted Responses API server; no account and no real model.
   empty mount points (`.git`, `.codex`, `.agents`, `.aws`) in a dir that lacked them (measured;
   a command that runs to its end leaves none). Codex's behavior; documented, not cleaned up.
 - **Restart:** as OpenCode's: `PR_SET_PDEATHSIG` interrupts the turn when whisrsd exits, the
-  rewatch fails it with `cut_off` (measured), and the next turn resumes the thread.
+  next daemon sweeps its scope, the rewatch fails it with `cut_off` (measured), and the next turn
+  resumes the thread.
 - **Environment:** besides the base's stripping, what a parent Codex session sets in its tool
   shells (`CODEX_THREAD_ID`, `CODEX_SESSION_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_CI`, `CODEX_SANDBOX`,
   `CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_VERSION`, `CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS`)

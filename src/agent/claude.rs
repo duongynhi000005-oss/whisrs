@@ -513,15 +513,48 @@ fn in_service_unit() -> bool {
 }
 
 /// `systemd-run` arguments that run `command args` in a transient scope of
-/// its own. The scope keeps the environment, the working directory and the
-/// output pipes (`systemd-run --scope` execs the command itself).
-pub fn scope_args(command: &str, args: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = ["--user", "--scope", "--quiet", "--collect", "--"]
+/// its own, named `unit` when given. The scope keeps the environment, the
+/// working directory and the output pipes (`systemd-run --scope` execs the
+/// command itself, as the same process). `no_expand` adds
+/// `--expand-environment=no`: since systemd 254, `--scope` expands `$NAME`
+/// and `${NAME}` in the command line as a service's `ExecStart=` does
+/// (measured on 262: `$HOME` arrived as the home directory), which would
+/// change an instruction or the user's words. An older systemd-run has no
+/// such option, expands nothing and refuses the option
+/// ([`expand_option_refused`]), so the launch is tried again without it.
+pub fn scope_args(
+    unit: Option<&str>,
+    no_expand: bool,
+    command: &str,
+    args: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = ["--user", "--scope", "--quiet", "--collect"]
         .map(String::from)
         .to_vec();
+    if no_expand {
+        out.push("--expand-environment=no".to_string());
+    }
+    if let Some(unit) = unit {
+        out.push(format!("--unit={unit}"));
+    }
+    out.push("--".to_string());
     out.push(command.to_string());
     out.extend(args.iter().cloned());
     out
+}
+
+/// Whether a failed `systemd-run` refused `--expand-environment` (systemd
+/// older than 254), so the command never ran.
+pub fn expand_option_refused(success: bool, stdout: &str, stderr: &str) -> bool {
+    !success
+        && stdout.trim().is_empty()
+        && stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .is_some_and(|first| {
+                first.contains("unrecognized option") && first.contains("--expand-environment")
+            })
 }
 
 /// Whether a failed `systemd-run --scope` failed itself (no user manager,
@@ -848,25 +881,42 @@ async fn run_claude(agent: &Agent, args: &[String], timeout: Duration) -> Result
 /// when `systemd-run` is missing or cannot create the scope.
 async fn run_launch(agent: &Agent, args: &[String], use_scope: bool) -> Result<Output, String> {
     if use_scope {
-        let scoped = scope_args(&agent.command, args);
-        match exec(agent, "systemd-run", &scoped, LAUNCH_TIMEOUT).await {
-            Ok(out) if !scope_unavailable(out.success, &out.stdout, &out.stderr) => {
-                debug!("agent '{}': launched in a scope of its own", agent.name);
-                return Ok(out);
+        for no_expand in [true, false] {
+            let scoped = scope_args(None, no_expand, &agent.command, args);
+            match exec(agent, "systemd-run", &scoped, LAUNCH_TIMEOUT).await {
+                Ok(out)
+                    if no_expand
+                        && expand_option_refused(out.success, &out.stdout, &out.stderr) =>
+                {
+                    debug!(
+                        "agent '{}': systemd-run has no --expand-environment (older than \
+                         254, which expands nothing); launching without it",
+                        agent.name
+                    );
+                }
+                Ok(out) if !scope_unavailable(out.success, &out.stdout, &out.stderr) => {
+                    debug!("agent '{}': launched in a scope of its own", agent.name);
+                    return Ok(out);
+                }
+                Ok(out) => {
+                    warn!(
+                        "agent '{}': cannot start claude in a scope of its own ({}); starting \
+                         it directly, so Claude Code's background service may run inside the \
+                         whisrs unit",
+                        agent.name,
+                        out.stderr.lines().next().unwrap_or("").trim()
+                    );
+                    break;
+                }
+                Err(ExecError::Spawn(e)) => {
+                    debug!(
+                        "agent '{}': systemd-run unavailable ({e}); starting claude directly",
+                        agent.name
+                    );
+                    break;
+                }
+                Err(e) => return Err(exec_failure(agent, args, LAUNCH_TIMEOUT, e)),
             }
-            Ok(out) => warn!(
-                "agent '{}': cannot start claude in a scope of its own ({}); starting it \
-                 directly, so Claude Code's background service may run inside the whisrs unit",
-                agent.name,
-                out.stderr.lines().next().unwrap_or("").trim()
-            ),
-            Err(ExecError::Spawn(e)) => {
-                debug!(
-                    "agent '{}': systemd-run unavailable ({e}); starting claude directly",
-                    agent.name
-                );
-            }
-            Err(e) => return Err(exec_failure(agent, args, LAUNCH_TIMEOUT, e)),
         }
     }
     run_claude(agent, args, LAUNCH_TIMEOUT).await
@@ -2230,12 +2280,13 @@ mod tests {
     fn a_scoped_launch_wraps_the_command_unchanged() {
         let args = vec!["--bg".to_string(), "--".to_string(), "-x".to_string()];
         assert_eq!(
-            scope_args("/usr/bin/claude", &args),
+            scope_args(None, true, "/usr/bin/claude", &args),
             [
                 "--user",
                 "--scope",
                 "--quiet",
                 "--collect",
+                "--expand-environment=no",
                 "--",
                 "/usr/bin/claude",
                 "--bg",
@@ -2243,6 +2294,45 @@ mod tests {
                 "-x"
             ]
         );
+        // Named, for an older systemd-run (no expansion option).
+        assert_eq!(
+            scope_args(Some("whisrs-agent-x.scope"), false, "sh", &[]),
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--unit=whisrs-agent-x.scope",
+                "--",
+                "sh"
+            ]
+        );
+    }
+
+    /// systemd-run before 254 refuses `--expand-environment` (getopt's own
+    /// message); anything else is not that.
+    #[test]
+    fn an_older_systemd_run_refusing_the_expansion_option_is_recognized() {
+        assert!(expand_option_refused(
+            false,
+            "",
+            "systemd-run: unrecognized option '--expand-environment=no'\n"
+        ));
+        assert!(!expand_option_refused(
+            false,
+            "",
+            "systemd-run: unrecognized option '--bogus'\n"
+        ));
+        assert!(!expand_option_refused(
+            true,
+            "",
+            "systemd-run: unrecognized option '--expand-environment=no'\n"
+        ));
+        assert!(!expand_option_refused(
+            false,
+            "backgrounded",
+            "systemd-run: unrecognized option '--expand-environment=no'\n"
+        ));
     }
 
     /// systemd-run's own failures fall back to a direct launch; a failure of
@@ -2307,6 +2397,7 @@ mod tests {
             session_id: Some("cc7a37cf-9343".into()),
             bg_id: Some("cc7a37cf".into()),
             transcript_path: None,
+            pending: false,
         };
         let ours = serde_json::json!({"session_id": "cc7a37cf-9343"});
         let theirs = serde_json::json!({"session_id": "ddc53afe-477f"});
@@ -2455,6 +2546,7 @@ esac
                 session_id: Some("abc12345-1111".into()),
                 bg_id: Some("abc12345".into()),
                 transcript_path: Some(self.dir.path().join("transcript.jsonl")),
+                pending: false,
             }
         }
     }

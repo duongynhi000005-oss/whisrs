@@ -77,10 +77,11 @@ src/
 │   ├── spoken.rs           #   <spoken> extraction + sanitize + 400-char cap (pure)
 │   ├── claude.rs           #   Claude Code driver: claude --bg, stop + --bg --resume, hooks via --settings, poll
 │   ├── claude_tail.rs      #   Transcript tail while a turn runs: tool activity + interims (pure parse_line)
-│   ├── process.rs          #   Process-per-turn base: ProcessDriver<H: TurnHarness> (spawn in own pgid + PDEATHSIG,
-│   │                       #   JSON lines -> StreamEvent -> TurnUpdates, SIGINT/TERM/KILL stop, outcome)
+│   ├── process.rs          #   Process-per-turn base: ProcessDriver<H: TurnHarness> (spawn in own pgid + own
+│   │                       #   systemd scope + PDEATHSIG, JSON lines -> StreamEvent -> TurnUpdates, SIGINT/TERM/KILL
+│   │                       #   stop of group + tree + scope, leftover-scope sweep at startup, outcome)
 │   ├── opencode.rs         #   OpenCode driver (TurnHarness): opencode run --standalone --format json --session <id>
-│   ├── codex.rs            #   Codex driver (TurnHarness): codex exec --json [... resume <thread id>] -
+│   ├── codex.rs            #   Codex driver (TurnHarness): codex exec --json ... --skip-git-repo-check [resume <id>] -
 │   ├── progress.rs         #   feedback levels + instruction deltas, activity labels, InterimTracker, ProgressGate
 │   ├── display.rs          #   Agent overlay model: Board (voice > needs-you > working > done/error), rows, timer
 │   └── store.rs            #   $XDG_DATA_HOME/whisrs/agents.json (0600, atomic), written only with agents
@@ -335,7 +336,8 @@ press refused while its turn runs stops only that agent's own reply or notice an
 notice (`AgentRuntime::is_playing_for`); another agent's reply plays on, the notice after it. The Claude driver starts `claude --bg` sessions with `--settings` hooks (`Stop`,
 `Notification`) that run `whisrs agent-hook --socket <sock>`; under a systemd service the `--bg`
 launch runs in its own `systemd-run --user --scope` (Claude Code's background service must not
-live in the whisrs unit). The next turn is refused while `claude agents` lists the session
+live in the whisrs unit), with `--expand-environment=no` (systemd 254+ expands `$VAR` in a scope's
+command line; an older one refuses the option and is retried without it, `claude::expand_option_refused`). The next turn is refused while `claude agents` lists the session
 `working`, else `claude stop`, a wait until its listed pid has exited (`Exits::wait_for_exit`:
 `claude stop` returns, and the listing drops the pid, before Claude Code settles it; capped at 10 s,
 then the turn fails), then `claude --bg --resume <id> -- <text>` with no other flag (any flag, or a
@@ -350,25 +352,35 @@ permission prompt with no turn running marks needs-you. A session working on its
 (`TurnOutcome::Busy`, "It's still running a background task."). The child gets the daemon's env minus
 `claude::PARENT_SESSION_VARS` and `WHISRS_*`. Only stored ids are ever passed to `claude`.
 A process-per-turn harness (OpenCode, Codex) implements `process::TurnHarness` only (`label`, `launch`
--> `Launch` {args, stdin, env}, `strips_env`, `events`: one stdout line -> `StreamEvent`s Session /
-Text {message} / Tool / Error, `stderr_failure`: a failure it recognizes in stderr, else `None`);
-`process::ProcessDriver` does the rest: spawn from a thread that
-waits for the child (own process group, `PWD` = dir, stdin the prompt then closed, `PR_SET_PDEATHSIG`
-= SIGINT so a turn dies with the daemon, as the cgroup kill does under systemd), `StreamState`
-(a new session id reported once, `InterimTracker` on Text/Tool, the reply = the last message's text
-parts), the outcome (an Error event fails, else the reply, else stderr), `--stop` (SIGINT, SIGTERM,
-SIGKILL to the group, `STOP_GRACES`; a dropped turn is stopped too, `Registered`), `rewatch` =
-`process::cut_off` (the turn ended with the old daemon). No hooks, always Idle between turns.
-OpenCode: whisrs mints the `ses_` id (`opencode::new_session_id`), the first turn passes
-`--title whisrs-<name>` + `args` and prefixes the voice instruction to the prompt, `bypass` =
-`--auto`, `ask` = shell/edit ask rules appended to `OPENCODE_CONFIG_CONTENT` (`opencode::ask_config`).
+-> `Launch` {args, stdin, env, session: an id it names up front}, `strips_env`, `events`: one stdout
+line -> `StreamEvent`s Session / Text {message} / Tool / Error, `stderr_failure`: a failure it
+recognizes in stderr, else `None`); `process::ProcessDriver` does the rest: spawn from a thread that
+waits for the child (own process group, own transient scope `whisrs-agent-<instance>-<name>-<turn>.scope`
+via `systemd-run --user --scope` when it works, else direct; `<instance>` hashes the `agents.json`
+path, so two daemons never touch each other's scopes; `PWD` = dir, stdin the prompt then closed,
+`PR_SET_PDEATHSIG` = SIGINT so a turn dies with the daemon), registers it and, in one step with the
+runtime's stop, reports the launch's new session id (`SessionRef::pending` until a Text/Tool shows the
+agent working in it) or sees the stop (then stops the process itself, `stop_detached`); `StreamState`
+(`InterimTracker` on Text/Tool, the reply = the last message's text parts; output lines capped,
+`STDOUT_LINE_MAX`, `STDERR_LINE_MAX`), the outcome (an Error event fails, else the reply, else stderr),
+`--stop` (SIGINT, SIGTERM, SIGKILL to the group, every process of the tree seen (`Tree`, so a `setsid`
+child is reached) and the scope (`systemctl --user kill`), `STOP_GRACES`; a dropped turn is stopped
+too, `Registered`), `TurnScopes::sweep` (at startup, and awaited by every turn and rewatch: stops what a
+previous daemon's turns left in their scopes), `rewatch` = `process::cut_off` (the turn ended with the
+old daemon). No hooks, always Idle between turns. Agent dirs are absolute (`agent::absolute_dir`).
+OpenCode: whisrs mints the `ses_` id (`opencode::new_session_id`), a turn of a new or pending session
+passes `--title whisrs-<name>` + `args` and prefixes the voice instruction to the prompt, `bypass` =
+`--auto`, `ask` = shell/edit ask rules appended to `OPENCODE_CONFIG_CONTENT` (`opencode::ask_config`;
+OpenCode's saved "always" approvals still win over them).
 Codex (tested against a mock model only): the id is the `thread.started` UUID (only a UUID is ever
 resumed, `codex::is_thread_id`); every turn passes the permission flags (`auto` = `--approve-for-me`,
 `bypass` = `--dangerously-bypass-approvals-and-sandbox`, `ask` = `--sandbox read-only`),
 `-c analytics.enabled=false` (else the exit, and the reply, waits seconds for a metrics upload),
 `-c developer_instructions=<TOML string>` (survives compaction only when passed every turn) and `args`,
-all before `resume <id>`; `item.started` of a tool -> Tool, `item.completed` agent_message -> Text,
-`turn.failed` -> Error; `RUST_LOG` and `codex::PARENT_SESSION_VARS` are stripped.
+then `--skip-git-repo-check` (it ends a many-valued `-i` of `args`), all before `resume <id>`;
+`item.started` of a tool -> Tool, `item.completed` agent_message -> Text (an empty one too: no reply),
+`turn.failed` -> Error (a 401 names `CODEX_API_KEY` when it is set); `RUST_LOG` and
+`codex::PARENT_SESSION_VARS` are stripped.
 `DaemonContext::state_tx` is a `StateBus` (`context.rs`), sent only by `publish(&ds)`: `raw` (the state
 machine: hooks, the reply queue), `ui` (Idle while the voice is an agent's, `DaemonState::agent_voice`:
 tray, pill, GNOME pill) and `voice` (which agent, for the board). The runtime's board channel

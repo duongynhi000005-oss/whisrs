@@ -444,6 +444,7 @@ mod tests {
             session_id: Some("55c757bc".into()),
             bg_id: Some("55c757bc".into()),
             transcript_path: Some(path.clone()),
+            pending: false,
         };
         let (updates, mut rx) = TurnUpdates::channel();
         let _tail = TranscriptTail::spawn_every(
@@ -527,6 +528,7 @@ mod tests {
             session_id: None,
             bg_id: Some("abc12345".into()),
             transcript_path: None,
+            pending: false,
         };
         let _tail = TranscriptTail::spawn_every(
             session.clone(),

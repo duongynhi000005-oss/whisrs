@@ -31,6 +31,9 @@ pub struct AgentRecord {
     pub bg_id: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<PathBuf>,
+    /// The session id is not confirmed yet ([`SessionRef::pending`]).
+    #[serde(default)]
+    pub session_pending: bool,
     /// A turn was running when this was written: the daemon watches it again
     /// at startup, so its reply is still spoken.
     #[serde(default)]
@@ -50,6 +53,7 @@ impl AgentRecord {
             session_id: None,
             bg_id: None,
             transcript_path: None,
+            session_pending: false,
             turn_running: false,
             turn_started_at: None,
             updated_at: Utc::now(),
@@ -62,6 +66,7 @@ impl AgentRecord {
             session_id: self.session_id.clone(),
             bg_id: self.bg_id.clone(),
             transcript_path: self.transcript_path.clone(),
+            pending: self.session_pending,
         }
     }
 
@@ -70,6 +75,7 @@ impl AgentRecord {
         self.session_id = session.session_id.clone();
         self.bg_id = session.bg_id.clone();
         self.transcript_path = session.transcript_path.clone();
+        self.session_pending = session.pending;
     }
 
     /// Forget the session (and any turn).
@@ -77,6 +83,7 @@ impl AgentRecord {
         self.session_id = None;
         self.bg_id = None;
         self.transcript_path = None;
+        self.session_pending = false;
         self.turn_running = false;
         self.turn_started_at = None;
     }
@@ -193,6 +200,7 @@ mod tests {
             session_id: Some("cc7a37cf-9343-40fc-bd3c-9c8b77339da2".into()),
             bg_id: Some("cc7a37cf".into()),
             transcript_path: Some("/t/cc7a37cf.jsonl".into()),
+            pending: false,
         });
         record.turn_running = true;
         record.turn_started_at = Some(Utc::now());
@@ -229,10 +237,33 @@ mod tests {
         assert!(!r.matches("claude", Path::new("/other")));
         assert!(!r.matches("codex", Path::new("/proj")));
         r.session_id = Some("s".into());
+        r.session_pending = true;
         r.turn_running = true;
         r.clear_session();
         assert_eq!(r.session(), SessionRef::default());
         assert!(!r.turn_running);
+    }
+
+    /// A pending OpenCode id survives a restart, and a file written before
+    /// the flag existed reads as confirmed.
+    #[test]
+    fn a_pending_session_round_trips_and_old_files_are_confirmed() {
+        let mut r = AgentRecord::new("opencode", Path::new("/proj"));
+        let pending = SessionRef {
+            session_id: Some("ses_1".into()),
+            bg_id: None,
+            transcript_path: None,
+            pending: true,
+        };
+        r.set_session(&pending);
+        let json = serde_json::to_string(&r).unwrap();
+        let back: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session(), pending);
+        let old: AgentRecord = serde_json::from_str(
+            r#"{"harness":"opencode","dir":"/proj","session_id":"ses_1","updated_at":"2026-10-25T10:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(!old.session().pending);
     }
 
     #[test]
@@ -246,6 +277,7 @@ mod tests {
             "session_id",
             "bg_id",
             "transcript_path",
+            "session_pending",
             "turn_running",
             "turn_started_at",
             "updated_at",

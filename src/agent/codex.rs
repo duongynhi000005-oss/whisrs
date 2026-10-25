@@ -2,15 +2,22 @@
 //! on the process-per-turn base ([`super::process`]). Verified on 0.164.0
 //! against a local mock model, not a real account.
 //!
-//! - **First turn:** `codex exec --json --skip-git-repo-check <permissions>
-//!   -c analytics.enabled=false -c developer_instructions=<instruction>
-//!   [args…] -`, the prompt on stdin. **Later turns:** the same, then `resume <thread id> -`. Every
-//!   option goes before `resume` (`--sandbox` and `--approve-for-me` are
-//!   refused after it). `--skip-git-repo-check` because the dir may be any
-//!   folder. Codex mints the thread id: the first line names it
+//! - **First turn:** `codex exec --json <permissions> -c
+//!   analytics.enabled=false -c developer_instructions=<instruction>
+//!   [args…] --skip-git-repo-check -`, the prompt on stdin. **Later turns:**
+//!   the same, then `resume <thread id> -`. Every option goes before
+//!   `resume` (`--sandbox` and `--approve-for-me` are refused after it).
+//!   `--skip-git-repo-check` because the dir may be any folder, and after
+//!   `args`: a flag there ends an option of `args` that takes several
+//!   values (`-i`/`--image`), which would take `resume`, the id and `-` as
+//!   more values (checked on 0.164.0's argument parser; the flag may be
+//!   given once only). Codex mints the thread id: the first line names it
 //!   (`thread.started`), and a resumed turn's first line names the same id.
 //!   Only an id in UUID form is taken or resumed: Codex would look anything
-//!   else up as a thread name, and start a new thread when none has it.
+//!   else up as a thread name, and start a new thread when none has it. A
+//!   turn that failed after `thread.started` keeps its thread (it resumes,
+//!   measured): nothing is passed on the first turn only, so a failed one
+//!   pins nothing, and the id is never pending.
 //! - **On every turn:** `args` and the permissions, because `codex exec
 //!   resume` keeps neither from the first turn (a `-m` model of turn 1 was
 //!   gone on turn 2, measured; permission flags on a resumed turn apply to
@@ -26,7 +33,8 @@
 //!   turn it is not repeated (one copy per request, measured), and a
 //!   compaction, which drops it from a session that got it once, keeps it
 //!   (measured). A changed instruction does not replace the stored one: it
-//!   applies from the next `--new`, as on the other harnesses.
+//!   applies from the next `--new`, as on the other harnesses. It replaces
+//!   any `developer_instructions` of the user's Codex config or profile.
 //! - **Permissions** ([`permission_args`]): `auto` is `--approve-for-me`
 //!   (the workspace-write sandbox, writes in the dir; a command that needs
 //!   more goes to Codex's automatic reviewer, an extra model call),
@@ -38,7 +46,9 @@
 //! - **Output:** one JSON object per line on stdout, `{type, ...}`.
 //!   `thread.started` names the thread; `item.completed` of an
 //!   `agent_message` is a message (its `item.id`, its `text`), the last one
-//!   the reply; `item.started` of a command, file change, MCP tool call, web
+//!   the reply, an empty one included (the turn then ended without a reply,
+//!   never with an earlier message as one); `item.started` of a command,
+//!   file change, MCP tool call, web
 //!   search, plan update or helper agent is a tool call, printed when it
 //!   starts; `turn.failed` fails the turn. Top-level `error` lines and
 //!   `error` items are retries and warnings (a fatal one comes back in
@@ -76,6 +86,17 @@ pub const DAEMON_VARS: &[&str] = &["RUST_LOG"];
 /// after the turn, which delays its exit, and so the reply, by seconds.
 pub const NO_ANALYTICS: &str = "analytics.enabled=false";
 
+/// The API key Codex takes from the environment before any sign-in it has
+/// saved (`codex exec` reads no other key variable). It passes to the
+/// child.
+pub const API_KEY_VAR: &str = "CODEX_API_KEY";
+
+/// Whether the daemon's environment, and so the child's, has a key in
+/// [`API_KEY_VAR`].
+fn api_key_set() -> bool {
+    std::env::var(API_KEY_VAR).is_ok_and(|key| !key.trim().is_empty())
+}
+
 /// The Codex harness.
 pub struct Codex;
 
@@ -105,6 +126,8 @@ impl TurnHarness for Codex {
             args: turn_args(agent, thread),
             stdin: Some(request.text.clone()),
             env: Vec::new(),
+            // Codex names it: the first line.
+            session: None,
         })
     }
 
@@ -113,7 +136,7 @@ impl TurnHarness for Codex {
     }
 
     fn events(&self, line: &str) -> Vec<StreamEvent> {
-        parse_line(line)
+        parse_line(line, api_key_set())
     }
 
     /// A thread Codex no longer has (its rollout deleted or archived), and
@@ -144,11 +167,12 @@ impl TurnHarness for Codex {
 }
 
 /// The arguments of a turn: a new thread's (`thread` `None`), or one that
-/// resumes `thread`. The prompt follows on stdin (`-`).
+/// resumes `thread`. The prompt follows on stdin (`-`). `args` come after
+/// whisrs's `-c` overrides, so one of theirs wins, and before
+/// `--skip-git-repo-check`, which ends an option of theirs that takes
+/// several values (see the module doc).
 pub fn turn_args(agent: &Agent, thread: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = ["exec", "--json", "--skip-git-repo-check"]
-        .map(String::from)
-        .to_vec();
+    let mut args: Vec<String> = ["exec", "--json"].map(String::from).to_vec();
     args.extend(
         permission_args(agent.permissions)
             .iter()
@@ -161,6 +185,7 @@ pub fn turn_args(agent: &Agent, thread: Option<&str>) -> Vec<String> {
         args.push(config);
     }
     args.extend(agent.args.iter().cloned());
+    args.push("--skip-git-repo-check".to_string());
     if let Some(thread) = thread {
         args.push("resume".to_string());
         args.push(thread.to_string());
@@ -219,11 +244,12 @@ pub fn is_thread_id(id: &str) -> bool {
         })
 }
 
-/// The events of one `codex exec --json` line (see the module doc).
+/// The events of one `codex exec --json` line (see the module doc);
+/// `api_key` when the child has a key in [`API_KEY_VAR`] ([`failure`]).
 /// Nothing for `turn.started`, `turn.completed`, `item.updated`, a
-/// completed tool, reasoning, an `error` line or item, an empty message and
-/// anything that is not JSON.
-pub fn parse_line(line: &str) -> Vec<StreamEvent> {
+/// completed tool, reasoning, an `error` line or item, a message with no
+/// id and anything that is not JSON.
+pub fn parse_line(line: &str, api_key: bool) -> Vec<StreamEvent> {
     let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else {
         return Vec::new();
     };
@@ -239,14 +265,14 @@ pub fn parse_line(line: &str) -> Vec<StreamEvent> {
             .and_then(Value::as_str)
             .filter(|id| is_thread_id(id))
             .map(|id| StreamEvent::Session(id.to_string())),
+        // An empty message is still the last one: the turn then ended
+        // without a reply, rather than with an earlier message (spoken
+        // already, as the interim before a tool call).
         Some("item.completed") if item("type") == Some("agent_message") => {
-            match (item("id"), item("text").filter(|t| !t.trim().is_empty())) {
-                (Some(message), Some(text)) => Some(StreamEvent::Text {
-                    message: message.to_string(),
-                    text: text.to_string(),
-                }),
-                _ => None,
-            }
+            item("id").map(|message| StreamEvent::Text {
+                message: message.to_string(),
+                text: item("text").unwrap_or("").to_string(),
+            })
         }
         Some("item.started") => entry.get("item").and_then(tool_name).map(StreamEvent::Tool),
         Some("turn.failed") => Some(StreamEvent::Error(failure(
@@ -254,6 +280,7 @@ pub fn parse_line(line: &str) -> Vec<StreamEvent> {
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
+            api_key,
         ))),
         _ => None,
     };
@@ -277,8 +304,10 @@ fn tool_name(item: &Value) -> Option<String> {
 }
 
 /// What a `turn.failed` message says: the message of a provider's JSON
-/// error body, and a refused sign-in as one, actionable.
-pub fn failure(message: &str) -> String {
+/// error body, and a refused sign-in as one, actionable. With `api_key`
+/// (the child has [`API_KEY_VAR`], which Codex uses before its saved
+/// sign-in) a 401 is that key, refused.
+pub fn failure(message: &str, api_key: bool) -> String {
     let message = message.trim();
     let message = serde_json::from_str::<Value>(message)
         .ok()
@@ -289,6 +318,12 @@ pub fn failure(message: &str) -> String {
         })
         .unwrap_or_else(|| message.to_string());
     if message.contains("401 Unauthorized") {
+        if api_key {
+            return format!(
+                "the API key in {API_KEY_VAR} was refused (401 Unauthorized). Fix it in \
+                 whisrsd's environment, or remove it there to use the sign-in of `codex login`"
+            );
+        }
         return "it is not signed in, or its sign-in expired (401 Unauthorized). Run `codex \
                 login` in a terminal, then try again"
             .to_string();
@@ -356,6 +391,7 @@ mod tests {
             session_id: Some(id.into()),
             bg_id: None,
             transcript_path: None,
+            pending: false,
         }
     }
 
@@ -397,7 +433,7 @@ mod tests {
                     &request("fix the build"),
                 )
                 .unwrap();
-            let mut want = strings(&["exec", "--json", "--skip-git-repo-check"]);
+            let mut want = strings(&["exec", "--json"]);
             want.extend(strings(flags));
             want.extend(strings(&[
                 "-c",
@@ -406,12 +442,15 @@ mod tests {
                 "developer_instructions=\"Answer by voice.\"",
                 "-m",
                 "gpt-5.1-codex",
+                "--skip-git-repo-check",
                 "-",
             ]));
             assert_eq!(launch.args, want, "{permissions:?}");
             // The words go in on stdin, alone: the instruction is not in them.
             assert_eq!(launch.stdin.as_deref(), Some("fix the build"));
             assert!(launch.env.is_empty());
+            // Codex names the thread itself.
+            assert_eq!(launch.session, None);
         }
     }
 
@@ -439,7 +478,6 @@ mod tests {
             strings(&[
                 "exec",
                 "--json",
-                "--skip-git-repo-check",
                 "--sandbox",
                 "read-only",
                 "-c",
@@ -448,10 +486,74 @@ mod tests {
                 "developer_instructions=\"Answer by voice.\"",
                 "-m",
                 "gpt-5.1-codex",
+                "--skip-git-repo-check",
                 "resume",
                 THREAD,
                 "-",
             ])
+        );
+    }
+
+    /// An option of `args` that takes several values (`-i`/`--image`, `1..`
+    /// in 0.164.0's parser) ends at `--skip-git-repo-check`, so it never
+    /// takes `resume <id> -` or the `-` of the prompt as files. Checked
+    /// against the 0.164.0 binary's parser: `-i x.png resume <id> --help`
+    /// printed `codex exec`'s help (the subcommand was taken as images),
+    /// `-i x.png --skip-git-repo-check resume <id> --help` the help of
+    /// `codex exec resume`, and `-i x.png --skip-git-repo-check - extra`
+    /// refused `extra` (the `-` was the prompt).
+    #[test]
+    fn a_greedy_option_in_args_cannot_take_the_resume() {
+        let mut a = agent(Permissions::Auto);
+        a.args = strings(&["-i", "shot.png"]);
+        for (thread, tail) in [
+            (None, &["-i", "shot.png", "--skip-git-repo-check", "-"][..]),
+            (
+                Some(THREAD),
+                &[
+                    "-i",
+                    "shot.png",
+                    "--skip-git-repo-check",
+                    "resume",
+                    THREAD,
+                    "-",
+                ][..],
+            ),
+        ] {
+            let args = turn_args(&a, thread);
+            assert!(args.ends_with(&strings(tail)), "{args:?}");
+            // Once: the flag may not be repeated.
+            assert_eq!(
+                args.iter()
+                    .filter(|x| *x == "--skip-git-repo-check")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// A failed first turn keeps its thread, and the next turn passes
+    /// everything the first one did: nothing was first-turn only.
+    #[test]
+    fn a_failed_first_turns_thread_resumes_with_every_option() {
+        let (sent, _) = replay(TURN_FAILED, None);
+        let TurnUpdate::Session(kept) = &sent[0] else {
+            panic!("{sent:?}");
+        };
+        assert!(!kept.pending);
+        let a = agent(Permissions::Auto);
+        let first = Codex
+            .launch(&a, &SessionRef::default(), &request("x"))
+            .unwrap();
+        let next = Codex.launch(&a, kept, &request("x")).unwrap();
+        let id = kept.session_id.as_deref().unwrap();
+        assert_eq!(
+            next.args[..next.args.len() - 3],
+            first.args[..first.args.len() - 1]
+        );
+        assert_eq!(
+            next.args[next.args.len() - 3..],
+            strings(&["resume", id, "-"])
         );
     }
 
@@ -543,7 +645,7 @@ mod tests {
         let (updates, mut rx) = TurnUpdates::channel();
         let mut state = StreamState::new(session.map(String::from));
         for line in fixture.lines() {
-            for event in Codex.events(line) {
+            for event in parse_line(line, false) {
                 state.event(event, &updates);
             }
         }
@@ -557,24 +659,27 @@ mod tests {
     #[test]
     fn an_acknowledgement_then_a_command_is_an_interim_and_the_last_message_the_reply() {
         let lines: Vec<&str> = ACK_THEN_TOOL.lines().collect();
-        assert_eq!(parse_line(lines[0]), [StreamEvent::Session(THREAD.into())]);
-        // The mock's warning item and turn.started say nothing.
-        assert!(parse_line(lines[1]).is_empty());
-        assert!(parse_line(lines[2]).is_empty());
         assert_eq!(
-            parse_line(lines[3]),
+            parse_line(lines[0], false),
+            [StreamEvent::Session(THREAD.into())]
+        );
+        // The mock's warning item and turn.started say nothing.
+        assert!(parse_line(lines[1], false).is_empty());
+        assert!(parse_line(lines[2], false).is_empty());
+        assert_eq!(
+            parse_line(lines[3], false),
             [StreamEvent::Text {
                 message: "item_1".into(),
                 text: "<spoken>On it.</spoken> Running that now.".into(),
             }]
         );
         assert_eq!(
-            parse_line(lines[4]),
+            parse_line(lines[4], false),
             [StreamEvent::Tool("command_execution".into())]
         );
         // The command's completion and turn.completed say nothing.
-        assert!(parse_line(lines[5]).is_empty());
-        assert!(parse_line(lines[7]).is_empty());
+        assert!(parse_line(lines[5], false).is_empty());
+        assert!(parse_line(lines[7], false).is_empty());
         let (sent, state) = replay(ACK_THEN_TOOL, None);
         assert_eq!(
             sent,
@@ -639,19 +744,22 @@ mod tests {
     fn mcp_calls_plans_and_helpers_are_tools() {
         assert_eq!(
             parse_line(
-                r#"{"type":"item.started","item":{"id":"item_3","type":"mcp_tool_call","server":"whisrs","tool":"list_recordings","arguments":{},"result":null,"error":null,"status":"in_progress"}}"#
+                r#"{"type":"item.started","item":{"id":"item_3","type":"mcp_tool_call","server":"whisrs","tool":"list_recordings","arguments":{},"result":null,"error":null,"status":"in_progress"}}"#,
+                false
             ),
             [StreamEvent::Tool("mcp__whisrs__list_recordings".into())]
         );
         assert_eq!(
             parse_line(
-                r#"{"type":"item.started","item":{"id":"item_4","type":"todo_list","items":[{"text":"Read the code","completed":false}]}}"#
+                r#"{"type":"item.started","item":{"id":"item_4","type":"todo_list","items":[{"text":"Read the code","completed":false}]}}"#,
+                false
             ),
             [StreamEvent::Tool("todo_list".into())]
         );
         assert_eq!(
             parse_line(
-                r#"{"type":"item.started","item":{"id":"item_5","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"t","receiver_thread_ids":[],"prompt":null,"agents_states":{},"status":"in_progress"}}"#
+                r#"{"type":"item.started","item":{"id":"item_5","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"t","receiver_thread_ids":[],"prompt":null,"agents_states":{},"status":"in_progress"}}"#,
+                false
             ),
             [StreamEvent::Tool("collab_tool_call".into())]
         );
@@ -659,6 +767,7 @@ mod tests {
         let mut state = StreamState::new(None);
         for event in parse_line(
             r#"{"type":"item.started","item":{"id":"item_3","type":"mcp_tool_call","server":"whisrs","tool":"list_recordings","arguments":{},"result":null,"error":null,"status":"in_progress"}}"#,
+            false,
         ) {
             state.event(event, &updates);
         }
@@ -714,14 +823,79 @@ mod tests {
         // The retries before it are only warnings.
         for line in NOT_LOGGED_IN.lines().filter(|l| !l.contains("turn.failed")) {
             assert!(
-                parse_line(line)
+                parse_line(line, false)
                     .iter()
                     .all(|e| !matches!(e, StreamEvent::Error(_))),
                 "{line}"
             );
         }
-        assert_eq!(failure(""), "the turn failed with no message");
-        assert_eq!(failure("  plain words "), "plain words");
+        assert_eq!(failure("", false), "the turn failed with no message");
+        assert_eq!(failure("  plain words ", true), "plain words");
+    }
+
+    /// A key in `CODEX_API_KEY` comes before the sign-in, so a 401 with one
+    /// is that key, not a missing `codex login`.
+    #[test]
+    fn a_refused_api_key_is_not_a_missing_sign_in() {
+        let body = "unexpected status 401 Unauthorized: Missing bearer or basic authentication";
+        let keyed = failure(body, true);
+        assert_eq!(
+            keyed,
+            "the API key in CODEX_API_KEY was refused (401 Unauthorized). Fix it in whisrsd's \
+             environment, or remove it there to use the sign-in of `codex login`"
+        );
+        assert!(failure(body, false).contains("Run `codex login`"));
+        let line = NOT_LOGGED_IN
+            .lines()
+            .find(|l| l.contains("turn.failed"))
+            .unwrap();
+        let [StreamEvent::Error(message)] = &parse_line(line, true)[..] else {
+            panic!("turn.failed fails the turn");
+        };
+        assert!(
+            message.starts_with("the API key in CODEX_API_KEY was refused"),
+            "{message}"
+        );
+        assert!(!keyed.contains('\u{2014}'));
+    }
+
+    /// An empty final message is the turn's last message: no reply, never
+    /// the acknowledgement before the tool call (spoken already).
+    #[test]
+    fn an_empty_last_message_is_no_reply_not_the_acknowledgement() {
+        let empty_last = format!(
+            "{}\n{}\n",
+            ACK_THEN_TOOL
+                .lines()
+                .filter(|l| !(l.contains("agent_message") && l.contains("Tool output was")))
+                .filter(|l| !l.contains("turn.completed"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            r#"{"type":"item.completed","item":{"id":"item_9","type":"agent_message","text":""}}"#
+        );
+        let (sent, state) = replay(&empty_last, None);
+        assert_eq!(
+            sent[1..],
+            [
+                TurnUpdate::Activity("Running a command".into()),
+                TurnUpdate::Interim("<spoken>On it.</spoken> Running that now.".into()),
+            ]
+        );
+        assert_eq!(state.reply(), None);
+        assert_eq!(
+            outcome(&agent(Permissions::Auto), &Codex, &state, &[], &status(0)),
+            TurnOutcome::Failed("Agent 'cx': Codex ended the turn without a reply.".into())
+        );
+        assert_eq!(
+            parse_line(
+                r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message"}}"#,
+                false
+            ),
+            [StreamEvent::Text {
+                message: "item_1".into(),
+                text: String::new()
+            }]
+        );
     }
 
     #[test]
@@ -774,7 +948,6 @@ mod tests {
             r#"{"type":"error","message":"Reconnecting... 1/5"}"#,
             r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"warning"}}"#,
             r#"{"type":"item.completed","item":{"id":"item_1","type":"reasoning","text":"hmm"}}"#,
-            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"  "}}"#,
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"no id"}}"#,
             r#"{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"ls","aggregated_output":"","exit_code":0,"status":"completed"}}"#,
             r#"{"type":"item.completed","item":{"id":"item_4","type":"todo_list","items":[]}}"#,
@@ -783,10 +956,10 @@ mod tests {
             r#"{"type":"item.started","item":{"id":"item_7","type":"mcp_tool_call","tool":"x"}}"#,
             r#"{"type":"thread.started","thread_id":"my-named-thread"}"#,
         ] {
-            assert!(parse_line(line).is_empty(), "{line}");
+            assert!(parse_line(line, false).is_empty(), "{line}");
         }
         assert_eq!(
-            parse_line(r#"{"type":"turn.failed","error":{}}"#),
+            parse_line(r#"{"type":"turn.failed","error":{}}"#, false),
             [StreamEvent::Error("the turn failed with no message".into())]
         );
     }

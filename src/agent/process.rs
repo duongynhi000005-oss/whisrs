@@ -10,38 +10,54 @@
 //!   [`super::claude::strips_env`], and the harness's own,
 //!   [`TurnHarness::strips_env`]) and with `PWD` set to the dir: a cwd alone
 //!   leaves the daemon's `PWD`, and OpenCode resolves its directory from
-//!   `PWD`. In a process group of its own. Stdin is the prompt, then closed,
-//!   or `/dev/null`: OpenCode and Codex read an open stdin until it ends.
+//!   `PWD`. In a process group of its own, and in a transient systemd scope
+//!   of its own ([`TurnScopes`], `systemd-run --user --scope`, which execs
+//!   the harness as the same process), so a stop reaches every process the
+//!   turn started, also one that left the group for a session of its own
+//!   (Copilot's tool shells do). Without `systemd-run`, or when it cannot
+//!   make the scope, the harness is started directly. Stdin is the prompt,
+//!   then closed, or `/dev/null`: OpenCode and Codex read an open stdin until
+//!   it ends.
+//! - **The session:** an id the launch names that the agent does not have
+//!   yet (OpenCode's, minted by whisrs, [`Launch::session`]) is reported as
+//!   soon as the process runs, pending ([`SessionRef::pending`]) until a
+//!   text or a tool call shows the agent working in it; an id the output
+//!   names is reported when it is new.
 //! - **The daemon's end ends the turn:** the child is spawned from a thread
 //!   that waits for it, with `PR_SET_PDEATHSIG` = SIGINT, so it is
-//!   interrupted when the daemon exits or dies, as the cgroup kill of a
-//!   systemd unit ends it under a service. A turn never outlives its daemon
-//!   (it would run unwatched, and the next turn would run beside it), and a
-//!   turn watched again after a restart ends at once ([`cut_off`]).
-//! - **Output:** stdout line by line ([`TurnHarness::events`]): the session
-//!   id it names is reported when it is new ([`TurnUpdate::Session`]), a tool
-//!   call is an activity ([`activity_for_tool`]) and releases the assistant
-//!   text before it as an interim ([`InterimTracker`]), and the text of the
-//!   last message is the reply. Stderr is kept for the error, which the
-//!   harness may recognize ([`TurnHarness::stderr_failure`]).
-//! - **Stop:** SIGINT to the group, then SIGTERM, then SIGKILL, each sent
-//!   only while something of the group is left, after the previous one's
-//!   grace ([`STOP_GRACES`]). A turn dropped while its process runs (its task
-//!   aborted) is stopped the same way, and `--stop` waits for that stop.
+//!   interrupted when the daemon exits or dies. A turn never outlives its
+//!   daemon (it would run unwatched, and the next turn would run beside it):
+//!   what a turn left in its scope (a process that ignored the SIGINT) is
+//!   stopped when the next daemon starts ([`TurnScopes::sweep`]), and a turn
+//!   watched again after a restart ends at once ([`cut_off`]).
+//! - **Output:** stdout line by line ([`TurnHarness::events`]): a tool call
+//!   is an activity ([`activity_for_tool`]) and releases the assistant text
+//!   before it as an interim ([`InterimTracker`]), and the text of the last
+//!   message is the reply. Stderr is kept for the error, which the harness
+//!   may recognize ([`TurnHarness::stderr_failure`]). A line is never kept
+//!   whole past a cap ([`STDOUT_LINE_MAX`], [`STDERR_LINE_MAX`]).
+//! - **Stop:** SIGINT, then SIGTERM, then SIGKILL, each sent only while
+//!   something of the turn is left, after the previous one's grace
+//!   ([`STOP_GRACES`]), to the process group, to every process of the tree
+//!   seen so far ([`Tree`]) and to the scope (`systemctl --user kill`). A
+//!   turn dropped while its process runs (its task aborted), or stopped
+//!   before its process was registered, is stopped the same way, and
+//!   `--stop` waits for that stop.
 //!
 //! Between turns no process runs: a session never works on its own, waits
 //! for a prompt or sends a hook.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::{oneshot, watch, OnceCell};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -61,7 +77,14 @@ pub const STOP_GRACES: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 
-/// How often a stop checks whether the process group is gone.
+/// The stop signals, in order, with their names for `systemctl kill`.
+const STOP_SIGNALS: [(libc::c_int, &str); 3] = [
+    (libc::SIGINT, "SIGINT"),
+    (libc::SIGTERM, "SIGTERM"),
+    (libc::SIGKILL, "SIGKILL"),
+];
+
+/// How often a stop checks whether the turn's processes are gone.
 const STOP_POLL: Duration = Duration::from_millis(50);
 
 /// After the process exited, how long its output is still read: a process
@@ -71,11 +94,22 @@ const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
 /// The most stderr lines kept for an error.
 const STDERR_LINES: usize = 40;
 
+/// The longest stdout line read, in bytes. A longer one is skipped (a JSON
+/// line cut short says nothing), with a warning; it is never kept whole.
+pub const STDOUT_LINE_MAX: usize = 1 << 20;
+
+/// The longest stderr line kept, in bytes: only its start is ever quoted
+/// ([`ERROR_MAX`]). A longer one is cut there, with a warning.
+pub const STDERR_LINE_MAX: usize = 8 << 10;
+
 /// The longest output line logged, in characters.
 const LOG_LINE_MAX: usize = 300;
 
 /// The longest harness error quoted in a notification, in characters.
 const ERROR_MAX: usize = 300;
+
+/// How long a `systemctl --user` call may take.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // What a harness module provides
@@ -91,6 +125,12 @@ pub struct Launch {
     /// Set in the child's environment, after the stripped variables are
     /// removed.
     pub env: Vec<(String, String)>,
+    /// The session the turn runs in, when the launch names it (OpenCode's
+    /// `--session <id>`). An id the agent does not have yet is reported as
+    /// the process starts, pending, so a turn stopped or cut off before its
+    /// first line keeps it. `None` when the harness names it in its output
+    /// (Codex).
+    pub session: Option<String>,
 }
 
 /// What a line of a harness's output says about the turn.
@@ -115,8 +155,9 @@ pub trait TurnHarness: Send + Sync + 'static {
     fn label(&self) -> &'static str;
 
     /// How a turn starts. `session` is the agent's session, empty for its
-    /// first turn (or after `--new`). An error is actionable and fails the
-    /// turn as it is.
+    /// first turn (or after `--new`), and pending while no turn has shown
+    /// the agent working in it. An error is actionable and fails the turn
+    /// as it is.
     fn launch(
         &self,
         agent: &Agent,
@@ -150,6 +191,8 @@ pub trait TurnHarness: Send + Sync + 'static {
 pub struct StreamState {
     /// The session id known: the agent's, then the newest the output named.
     session_id: Option<String>,
+    /// That id is pending ([`SessionRef::pending`]).
+    pending: bool,
     tracker: InterimTracker,
     /// The last activity sent, so a run of the same tool sends it once.
     activity: Option<String>,
@@ -162,8 +205,17 @@ pub struct StreamState {
 impl StreamState {
     /// The state of a turn in `session_id` (`None` for a new session).
     pub fn new(session_id: Option<String>) -> Self {
-        Self {
+        Self::for_session(&SessionRef {
             session_id,
+            ..SessionRef::default()
+        })
+    }
+
+    /// The state of a turn in `session`, pending or not.
+    pub fn for_session(session: &SessionRef) -> Self {
+        Self {
+            session_id: session.session_id.clone(),
+            pending: session.pending && session.session_id.is_some(),
             tracker: InterimTracker::new(),
             activity: None,
             texts: Vec::new(),
@@ -176,19 +228,18 @@ impl StreamState {
         match event {
             StreamEvent::Session(id) => {
                 if self.session_id.as_deref() != Some(id.as_str()) {
-                    self.session_id = Some(id.clone());
-                    updates.send(TurnUpdate::Session(SessionRef {
-                        session_id: Some(id),
-                        bg_id: None,
-                        transcript_path: None,
-                    }));
+                    self.session_id = Some(id);
+                    self.pending = false;
+                    self.report(updates);
                 }
             }
             StreamEvent::Text { message, text } => {
+                self.confirm(updates);
                 self.tracker.on_text(&text);
                 self.texts.push((message, text));
             }
             StreamEvent::Tool(name) => {
+                self.confirm(updates);
                 let activity = activity_for_tool(&name);
                 if self.activity.as_ref() != Some(&activity) {
                     self.activity = Some(activity.clone());
@@ -202,8 +253,26 @@ impl StreamState {
         }
     }
 
+    /// The agent works in the session: a pending id is confirmed, so the
+    /// next turn continues it as it is.
+    fn confirm(&mut self, updates: &TurnUpdates) {
+        if self.pending {
+            self.pending = false;
+            self.report(updates);
+        }
+    }
+
+    fn report(&self, updates: &TurnUpdates) {
+        updates.send(TurnUpdate::Session(SessionRef {
+            session_id: self.session_id.clone(),
+            bg_id: None,
+            transcript_path: None,
+            pending: self.pending,
+        }));
+    }
+
     /// The turn's final message: the text parts of its last message, raw.
-    /// `None` when it wrote none.
+    /// `None` when it wrote none, or its last message is empty.
     pub fn reply(&self) -> Option<String> {
         let (last, _) = self.texts.last()?;
         let text = self
@@ -344,11 +413,18 @@ pub fn strip_ansi(text: &str) -> String {
 }
 
 /// The error of a turn watched again after a restart: its process ended
-/// with the old daemon (see the module doc), so it never replied.
-pub fn cut_off(agent: &Agent, label: &str) -> String {
+/// with the old daemon (see the module doc), so it never replied. A session
+/// the agent was never seen working in (none yet, or pending) may not have
+/// heard of the turn at all.
+pub fn cut_off(agent: &Agent, label: &str, session: &SessionRef) -> String {
+    let then = if session.session_id.is_none() || session.pending {
+        format!("It may not have reached {label} at all, so say it again.")
+    } else {
+        "The session keeps what it did so far.".to_string()
+    };
     format!(
         "Agent '{}': whisrs restarted during that turn, which stopped it before {label} replied. \
-         The session keeps what it did so far.",
+         {then}",
         agent.name
     )
 }
@@ -414,8 +490,13 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     bytes
 }
 
+/// `bytes` as lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // ---------------------------------------------------------------------------
-// The running process
+// Where a turn's processes are: its group, its tree, its scope
 // ---------------------------------------------------------------------------
 
 /// Whether any process of the group `pgid` is left (a zombie counts).
@@ -446,25 +527,440 @@ fn group_target(pgid: u32) -> Option<libc::pid_t> {
         .map(|p| -p)
 }
 
+/// The state letter and start time of process `pid` (`/proc/<pid>/stat`).
+fn proc_stat(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some((claude::stat_state(&stat)?, claude::stat_start(&stat)?))
+}
+
+/// The children of process `pid`, from every one of its threads
+/// (`/proc/<pid>/task/<tid>/children`).
+fn proc_children(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for task in tasks.flatten() {
+        if let Ok(list) = std::fs::read_to_string(task.path().join("children")) {
+            children.extend(
+                list.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    children
+}
+
+/// The processes of a turn's tree seen so far, by pid and start time (a pid
+/// the kernel gave to another process since has another start time). A
+/// process that left the turn's group (`setsid`) is found through its
+/// parent, and kept once seen, so it is still signalled after that parent
+/// exited. One whose parent exited before any walk saw it is out of reach
+/// here; the turn's scope still holds it ([`Scope`]).
+#[derive(Debug, Default)]
+struct Tree {
+    seen: Vec<(u32, u64)>,
+}
+
+impl Tree {
+    /// Add every live descendant of `root` and of the processes seen.
+    fn grow(&mut self, root: Option<u32>) {
+        let mut stack: Vec<u32> = root.into_iter().chain(self.alive()).collect();
+        let mut walked = HashSet::new();
+        while let Some(pid) = stack.pop() {
+            if !walked.insert(pid) {
+                continue;
+            }
+            for child in proc_children(pid) {
+                if let Some((_, start)) = proc_stat(child) {
+                    if !self.seen.contains(&(child, start)) {
+                        self.seen.push((child, start));
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    /// The processes seen that still run (a zombie does not).
+    fn alive(&self) -> Vec<u32> {
+        self.seen
+            .iter()
+            .filter(|&&(pid, start)| {
+                proc_stat(pid).is_some_and(|(state, now)| now == start && state != 'Z')
+            })
+            .map(|&(pid, _)| pid)
+            .collect()
+    }
+
+    /// Send `signal` to every process seen that still runs.
+    fn signal(&self, signal: libc::c_int) {
+        let daemon = std::process::id();
+        for pid in self.alive() {
+            if pid <= 1 || pid == daemon {
+                continue;
+            }
+            if let Ok(pid) = libc::pid_t::try_from(pid) {
+                // SAFETY: a plain kill(2) of a process of the turn's tree.
+                unsafe { libc::kill(pid, signal) };
+            }
+        }
+    }
+}
+
+/// Run `systemctl --user args`: its stdout, or why it gave none.
+async fn systemctl(args: &[&str]) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.arg("--user")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().map_err(|e| format!("systemctl: {e}"))?;
+    match tokio::time::timeout(SYSTEMCTL_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into()),
+        Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Ok(Err(e)) => Err(format!("systemctl: {e}")),
+        Err(_) => Err(format!(
+            "systemctl --user {} did not answer in {} seconds",
+            args.first().copied().unwrap_or(""),
+            SYSTEMCTL_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Whether the cgroup v2 hierarchy is mounted at `/sys/fs/cgroup`, where a
+/// scope's `cgroup.procs` lists its processes. Checked once.
+fn unified_cgroups() -> bool {
+    static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNIFIED.get_or_init(|| Path::new("/sys/fs/cgroup/cgroup.controllers").exists())
+}
+
+/// Whether the cgroup directory `dir` holds a process. A directory systemd
+/// removed with its unit holds none.
+fn cgroup_populated(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("cgroup.procs")).is_ok_and(|p| !p.trim().is_empty())
+}
+
+/// The transient scope a turn runs in. Every process of the turn is in it,
+/// whatever its group or session, so signalling the scope reaches them all.
+#[derive(Debug)]
+struct Scope {
+    unit: String,
+    /// Its cgroup directory, once systemd named it.
+    cgroup: Mutex<Option<PathBuf>>,
+}
+
+impl Scope {
+    fn new(unit: String) -> Self {
+        Self {
+            unit,
+            cgroup: Mutex::new(None),
+        }
+    }
+
+    fn cgroup(&self) -> Option<PathBuf> {
+        self.cgroup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Learn its cgroup from systemd, unless known. A unit systemd does not
+    /// have (not made yet, or gone) has none.
+    async fn locate(&self) {
+        if self.cgroup().is_some() || !unified_cgroups() {
+            return;
+        }
+        let args = ["show", "--property=ControlGroup", "--value", &self.unit];
+        if let Ok(out) = systemctl(&args).await {
+            let path = out.trim();
+            if path.starts_with('/') {
+                let dir = Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+                *self.cgroup.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+            }
+        }
+    }
+
+    /// Whether a process is left in it, as far as its cgroup shows: one not
+    /// located (made yet, or on a system without cgroup v2) shows none.
+    fn populated(&self) -> bool {
+        self.cgroup().is_some_and(|dir| cgroup_populated(&dir))
+    }
+
+    /// Send `signal` (`name`) to every process in it. A unit systemd does
+    /// not have is nothing to signal.
+    async fn signal(&self, name: &str) {
+        let signal = format!("--signal={name}");
+        if let Err(e) = systemctl(&["kill", &signal, &self.unit]).await {
+            debug!("{}: {name} not sent: {e}", self.unit);
+        }
+    }
+
+    /// Have systemd stop the unit, in case anything is left in it after the
+    /// signals; one that already ended is gone (`--collect`).
+    async fn release(&self) {
+        if let Err(e) = systemctl(&["stop", "--no-block", &self.unit]).await {
+            debug!("{}: not stopped: {e}", self.unit);
+        }
+    }
+
+    /// Stop a scope a previous daemon left (no process of it is ours to
+    /// wait for): each signal while something is left in it, after the
+    /// previous one's grace, then the unit.
+    async fn stop_leftover(&self, graces: &[Duration; 3]) -> Result<(), String> {
+        let mut result = Err(format!("something in {} did not exit", self.unit));
+        for (step, ((_, name), grace)) in STOP_SIGNALS.iter().zip(graces).enumerate() {
+            self.locate().await;
+            // The first signal goes out even to a scope whose cgroup cannot
+            // be read: systemd still delivers it.
+            if step > 0 && !self.populated() {
+                result = Ok(());
+                break;
+            }
+            self.signal(name).await;
+            let deadline = Instant::now() + *grace;
+            while self.populated() && Instant::now() < deadline {
+                tokio::time::sleep(STOP_POLL).await;
+            }
+            if !self.populated() {
+                result = Ok(());
+                break;
+            }
+        }
+        self.release().await;
+        result
+    }
+}
+
+/// The transient systemd scopes turns run in, one per turn:
+/// `whisrs-agent-<instance>-<agent>-<turn>.scope` in the user's systemd
+/// (`systemd-run --user --scope`). `<instance>` is a hash of the daemon's
+/// `agents.json` path, so a daemon only ever stops its own turns' scopes,
+/// never those of another whisrsd of the same user (a test daemon with its
+/// own data dir beside the real one).
+///
+/// A scope is outside the daemon's cgroup (`whisrs.service`'s, under
+/// systemd), so a stopped or restarted daemon does not take it along: the
+/// harness is interrupted when the daemon ends (`PR_SET_PDEATHSIG`), and
+/// whatever of a turn is still in its scope then is stopped when the next
+/// daemon starts ([`TurnScopes::sweep`]), before any turn runs.
+#[derive(Debug)]
+pub struct TurnScopes {
+    /// `whisrs-agent-<instance>-`, or `None` for no scopes at all.
+    prefix: Option<String>,
+    graces: [Duration; 3],
+    swept: OnceCell<()>,
+    /// A turn was started directly because systemd-run could not make its
+    /// scope: said once as a warning, then in the debug log.
+    unscoped: std::sync::atomic::AtomicBool,
+}
+
+impl TurnScopes {
+    /// The scopes of the daemon whose agents are kept at `store`.
+    pub fn new(store: &Path) -> Self {
+        Self::with_prefix(Some(scope_prefix(store)), STOP_GRACES)
+    }
+
+    /// No scopes: every turn starts directly, and nothing is swept.
+    pub fn off() -> Self {
+        Self::with_prefix(None, STOP_GRACES)
+    }
+
+    fn with_prefix(prefix: Option<String>, graces: [Duration; 3]) -> Self {
+        Self {
+            prefix,
+            graces,
+            swept: OnceCell::new(),
+            unscoped: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A turn of `agent` starts directly: systemd-run said `why`.
+    fn note_unscoped(&self, agent: &str, label: &str, why: &str) {
+        if self
+            .unscoped
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            debug!("agent '{agent}': no scope ({why}); starting {label} directly");
+        } else {
+            warn!(
+                "agent '{agent}': systemd-run did not start {label} in a scope ({why}); starting \
+                 it directly, so a stop reaches only its process tree (said once)"
+            );
+        }
+    }
+
+    /// How a turn of `agent` starts: in a scope of its own, named for it.
+    fn wrap(&self, agent: &str) -> Wrap {
+        match &self.prefix {
+            Some(prefix) => {
+                let agent: String = agent.chars().take(64).collect();
+                Wrap::Scope {
+                    unit: format!("{prefix}{agent}-{}.scope", hex(&random_bytes::<4>())),
+                    no_expand: true,
+                }
+            }
+            None => Wrap::Direct,
+        }
+    }
+
+    /// Stop what a previous daemon's turns left in their scopes, once:
+    /// started when the daemon starts, and waited for by every turn.
+    pub async fn sweep(&self) {
+        let Some(prefix) = &self.prefix else {
+            return;
+        };
+        self.swept
+            .get_or_init(|| async {
+                let pattern = format!("{prefix}*");
+                let listing = match systemctl(&[
+                    "list-units",
+                    "--all",
+                    "--plain",
+                    "--no-legend",
+                    "--no-pager",
+                    "--type=scope",
+                    &pattern,
+                ])
+                .await
+                {
+                    Ok(listing) => listing,
+                    Err(e) => {
+                        debug!("agents: no turn scopes to look for: {e}");
+                        return;
+                    }
+                };
+                for unit in listed_units(&listing, prefix) {
+                    info!("agents: stopping {unit}, which a turn left running before a restart");
+                    if let Err(e) = Scope::new(unit).stop_leftover(&self.graces).await {
+                        warn!("agents: {e}");
+                    }
+                }
+            })
+            .await;
+    }
+}
+
+/// `whisrs-agent-<instance>-` for the daemon whose agents are kept at
+/// `store`: eight hex digits of a 64-bit FNV-1a hash of the path.
+pub fn scope_prefix(store: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in store.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("whisrs-agent-{:08x}-", hash as u32)
+}
+
+/// The scope units of a `systemctl list-units --plain --no-legend` listing
+/// (`UNIT LOAD ACTIVE SUB DESCRIPTION`) whose names start with `prefix`,
+/// unless they already ended (`inactive`, `failed`).
+pub fn listed_units(listing: &str, prefix: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let unit = columns.next()?;
+            let active = columns.nth(1).unwrap_or("");
+            (unit.starts_with(prefix)
+                && unit.ends_with(".scope")
+                && !matches!(active, "inactive" | "failed"))
+            .then(|| unit.to_string())
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The running process
+// ---------------------------------------------------------------------------
+
+/// How a turn's process is started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Wrap {
+    /// In the transient scope `unit` (`systemd-run --user --scope`), with
+    /// `--expand-environment=no` when `no_expand`
+    /// ([`claude::scope_args`]).
+    Scope { unit: String, no_expand: bool },
+    /// Directly.
+    Direct,
+}
+
+impl Wrap {
+    /// What to try when a turn started this way never ran: `read` is all it
+    /// printed. A systemd-run older than 254 refused
+    /// `--expand-environment` (it expands nothing, so it goes without); one
+    /// that could not make the scope, or found no harness to run, leaves
+    /// the start to a direct spawn.
+    fn after(&self, read: &Read) -> Option<Wrap> {
+        let Wrap::Scope { unit, no_expand } = self else {
+            return None;
+        };
+        if read.stdout_lines > 0 {
+            return None;
+        }
+        let stderr = read.stderr.join("\n");
+        let success = read.exit.success();
+        if *no_expand && claude::expand_option_refused(success, "", &stderr) {
+            return Some(Wrap::Scope {
+                unit: unit.clone(),
+                no_expand: false,
+            });
+        }
+        claude::scope_unavailable(success, "", &stderr).then_some(Wrap::Direct)
+    }
+}
+
 /// A turn's running process, kept so `--stop` can end it.
 #[derive(Debug)]
 struct TurnProcess {
     /// Its pid, which is also its process group's id.
     pid: u32,
+    /// The scope it runs in, when it was started in one.
+    scope: Option<Scope>,
     /// Its exit, once the thread that waits for it saw it.
     exit: watch::Receiver<Option<Exit>>,
+    /// The processes it started, as far as a stop saw them.
+    tree: Mutex<Tree>,
     /// The stop, run once however many ask for it.
     stopped: OnceCell<Result<(), String>>,
 }
 
 impl TurnProcess {
+    fn new(pid: u32, scope: Option<Scope>, exit: watch::Receiver<Option<Exit>>) -> Self {
+        Self {
+            pid,
+            scope,
+            exit,
+            tree: Mutex::new(Tree::default()),
+            stopped: OnceCell::new(),
+        }
+    }
+
     fn exited(&self) -> bool {
         self.exit.borrow().is_some()
     }
 
-    /// The process exited and nothing of its group is left.
+    fn tree(&self) -> std::sync::MutexGuard<'_, Tree> {
+        self.tree.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Walk its tree again: from the process itself while it runs (once it
+    /// was reaped its pid may be another's), and from what was seen.
+    fn grow(&self) {
+        let root = (!self.exited()).then_some(self.pid);
+        self.tree().grow(root);
+    }
+
+    /// The process exited and nothing of its group, its tree or its scope
+    /// is left.
     fn gone(&self) -> bool {
-        self.exited() && !group_alive(self.pid)
+        self.exited()
+            && !group_alive(self.pid)
+            && self.tree().alive().is_empty()
+            && !self.scope.as_ref().is_some_and(Scope::populated)
     }
 
     /// Stop it ([`TurnProcess::escalate`]), once: a second caller waits for
@@ -476,29 +972,49 @@ impl TurnProcess {
             .clone()
     }
 
-    /// SIGINT, SIGTERM, SIGKILL to the group, each while something of it is
-    /// left, after the previous one's grace.
+    /// SIGINT, SIGTERM, SIGKILL to the group, the tree and the scope, each
+    /// while something of the turn is left, after the previous one's grace.
+    /// Then the scope's unit is stopped too.
     async fn escalate(&self, graces: &[Duration; 3]) -> Result<(), String> {
-        for (signal, grace) in [libc::SIGINT, libc::SIGTERM, libc::SIGKILL]
-            .into_iter()
-            .zip(graces)
-        {
-            if self.gone() {
-                return Ok(());
+        let mut result = Err(format!(
+            "its process {} or one it started did not exit",
+            self.pid
+        ));
+        for ((signal, name), grace) in STOP_SIGNALS.iter().zip(graces) {
+            if let Some(scope) = &self.scope {
+                scope.locate().await;
             }
-            debug!("turn process {}: signal {signal} to its group", self.pid);
-            signal_group(self.pid, signal);
+            self.grow();
+            if self.gone() {
+                result = Ok(());
+                break;
+            }
+            debug!(
+                "turn process {}: {name} to its group, tree and scope",
+                self.pid
+            );
+            signal_group(self.pid, *signal);
+            self.tree().signal(*signal);
+            if let Some(scope) = &self.scope {
+                scope.signal(name).await;
+            }
             if self.wait_gone(*grace).await {
-                return Ok(());
+                result = Ok(());
+                break;
             }
         }
-        Err(format!("its process {} did not exit", self.pid))
+        if let Some(scope) = &self.scope {
+            scope.release().await;
+        }
+        result
     }
 
-    /// Wait up to `within` for [`TurnProcess::gone`].
+    /// Wait up to `within` for [`TurnProcess::gone`], walking the tree as
+    /// it goes, so a child is seen before its parent exits.
     async fn wait_gone(&self, within: Duration) -> bool {
         let deadline = Instant::now() + within;
         loop {
+            self.grow();
             if self.gone() {
                 return true;
             }
@@ -538,10 +1054,31 @@ impl TurnProcesses {
     }
 }
 
+/// Stop `process` on a task of `runtime`, and forget it once it is gone:
+/// a process nobody reads any more (its turn was dropped, or stopped before
+/// the process was registered). It stays registered until then, so a
+/// `--stop` and the next turn wait for it.
+fn stop_detached(
+    runtime: &tokio::runtime::Handle,
+    processes: &Arc<TurnProcesses>,
+    agent: &str,
+    process: &Arc<TurnProcess>,
+    graces: [Duration; 3],
+) {
+    let processes = Arc::clone(processes);
+    let process = Arc::clone(process);
+    let agent = agent.to_string();
+    runtime.spawn(async move {
+        if let Err(e) = process.stop(&graces).await {
+            warn!("agent '{agent}': stopping a turn nobody reads: {e}");
+        }
+        processes.remove(&agent, &process);
+    });
+}
+
 /// Keeps a turn's process registered while the turn runs. Dropped with the
 /// turn: a process that still runs then (the turn's task was aborted) is
-/// stopped on a task of its own, and stays registered until it is gone, so
-/// a `--stop` and the next turn wait for it.
+/// stopped on a task of its own ([`stop_detached`]).
 struct Registered {
     processes: Arc<TurnProcesses>,
     agent: String,
@@ -555,22 +1092,17 @@ impl Drop for Registered {
             self.processes.remove(&self.agent, &self.process);
             return;
         }
-        let processes = Arc::clone(&self.processes);
-        let process = Arc::clone(&self.process);
-        let agent = self.agent.clone();
-        let graces = self.graces;
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    if let Err(e) = process.stop(&graces).await {
-                        warn!("agent '{agent}': stopping a dropped turn: {e}");
-                    }
-                    processes.remove(&agent, &process);
-                });
-            }
+            Ok(runtime) => stop_detached(
+                &runtime,
+                &self.processes,
+                &self.agent,
+                &self.process,
+                self.graces,
+            ),
             // No runtime left to wait on: interrupt it, as the daemon's exit
             // does (PR_SET_PDEATHSIG).
-            Err(_) => signal_group(process.pid, libc::SIGINT),
+            Err(_) => signal_group(self.process.pid, libc::SIGINT),
         }
     }
 }
@@ -586,7 +1118,9 @@ struct Spawned {
 
 /// In the child, between fork and exec: get SIGINT when the thread that
 /// spawned it ends (it waits for the child, so only with the daemon), and
-/// fail if the daemon is already gone. Only async-signal-safe calls.
+/// fail if the daemon is already gone. Only async-signal-safe calls. Kept
+/// across the exec of `systemd-run` and its exec of the harness (neither is
+/// set-user-ID).
 fn interrupt_with_parent(parent: u32) -> std::io::Result<()> {
     // SAFETY: prctl(PR_SET_PDEATHSIG) takes a signal number and changes
     // only this process.
@@ -600,19 +1134,43 @@ fn interrupt_with_parent(parent: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What a turn's process is started with, besides its [`Launch`].
+struct SpawnSpec<'a> {
+    wrap: &'a Wrap,
+    /// Removes the daemon's variable from the child.
+    strips: &'a (dyn Fn(&str) -> bool + Sync),
+    processes: &'a Arc<TurnProcesses>,
+    updates: &'a TurnUpdates,
+    /// A session to report once the process runs ([`Launch::session`]).
+    report: Option<SessionRef>,
+    graces: [Duration; 3],
+}
+
 /// Spawn `launch` for `agent` (see the module doc) from a thread that
 /// registers the child in `processes` (before the turn hears of it, so a
-/// turn dropped meanwhile leaves it to a stop), writes the prompt, waits
-/// for the child and reports its exit.
-async fn spawn(
-    agent: &Agent,
-    launch: Launch,
-    strips: impl Fn(&str) -> bool,
-    processes: &Arc<TurnProcesses>,
-) -> std::io::Result<Spawned> {
-    let mut cmd = std::process::Command::new(&agent.command);
-    cmd.args(&launch.args)
-        .current_dir(&agent.dir)
+/// turn dropped meanwhile leaves it to a stop), reports its session or
+/// learns that the turn was stopped meanwhile (then, or when nobody reads
+/// it, it stops the child itself, [`stop_detached`]), writes the prompt,
+/// waits for the child and reports its exit.
+async fn spawn(agent: &Agent, launch: &Launch, spec: SpawnSpec<'_>) -> std::io::Result<Spawned> {
+    let (mut cmd, scope) = match spec.wrap {
+        Wrap::Scope { unit, no_expand } => {
+            let mut cmd = std::process::Command::new("systemd-run");
+            cmd.args(claude::scope_args(
+                Some(unit),
+                *no_expand,
+                &agent.command,
+                &launch.args,
+            ));
+            (cmd, Some(unit.clone()))
+        }
+        Wrap::Direct => {
+            let mut cmd = std::process::Command::new(&agent.command);
+            cmd.args(&launch.args);
+            (cmd, None)
+        }
+    };
+    cmd.current_dir(&agent.dir)
         .stdin(if launch.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -623,7 +1181,7 @@ async fn spawn(
         .process_group(0);
     for (name, _) in std::env::vars_os() {
         if let Some(name) = name.to_str() {
-            if strips(name) {
+            if (spec.strips)(name) {
                 cmd.env_remove(name);
             }
         }
@@ -644,9 +1202,13 @@ async fn spawn(
     );
     let (ready_tx, ready_rx) = oneshot::channel::<std::io::Result<Pipes>>();
     let (exit_tx, exit_rx) = watch::channel(None);
-    let prompt = launch.stdin;
+    let prompt = launch.stdin.clone();
     let name = agent.name.clone();
-    let registry = Arc::clone(processes);
+    let registry = Arc::clone(spec.processes);
+    let updates = spec.updates.clone();
+    let report = spec.report;
+    let graces = spec.graces;
+    let runtime = tokio::runtime::Handle::current();
     let exit_seen = exit_rx.clone();
     std::thread::Builder::new()
         .name(format!("agent-{name}"))
@@ -659,19 +1221,31 @@ async fn spawn(
                 }
             };
             let pid = child.id();
-            let process = Arc::new(TurnProcess {
-                pid,
-                exit: exit_seen,
-                stopped: OnceCell::new(),
-            });
+            let process = Arc::new(TurnProcess::new(pid, scope.map(Scope::new), exit_seen));
             registry.insert(&name, Arc::clone(&process));
+            // In one step with the runtime's stop (`TurnUpdates::stop`):
+            // either that stop finds the process registered, or this sees
+            // the stop.
+            let stopped = match report {
+                Some(session) => updates.report_session(session),
+                None => updates.stopped(),
+            };
             let stdin = child.stdin.take();
-            let pipes = (process, child.stdout.take(), child.stderr.take());
-            if ready_tx.send(Ok(pipes)).is_err() {
-                // The turn was dropped while it spawned: nobody reads it.
-                signal_group(pid, libc::SIGINT);
-            }
-            if let (Some(mut stdin), Some(prompt)) = (stdin, prompt) {
+            let pipes = (
+                Arc::clone(&process),
+                child.stdout.take(),
+                child.stderr.take(),
+            );
+            let unread = ready_tx.send(Ok(pipes)).is_err();
+            if stopped || unread {
+                info!(
+                    "agent '{name}': the turn was {} as its process {pid} started; stopping it",
+                    if stopped { "stopped" } else { "dropped" }
+                );
+                // Its stdin closes unwritten: the prompt never reaches it.
+                drop(stdin);
+                stop_detached(&runtime, &registry, &name, &process, graces);
+            } else if let (Some(mut stdin), Some(prompt)) = (stdin, prompt) {
                 if let Err(e) = stdin.write_all(prompt.as_bytes()) {
                     debug!("turn process {pid}: the prompt was not written: {e}");
                 }
@@ -704,11 +1278,79 @@ fn for_log(line: &str) -> String {
     }
 }
 
+/// One line of a turn's output, at most its reader's cap long.
+#[derive(Debug, PartialEq, Eq)]
+struct Line {
+    bytes: Vec<u8>,
+    /// It was longer: the rest was dropped as it was read.
+    cut: bool,
+}
+
+/// Reads lines, keeping at most `max` bytes of each: the rest of a longer
+/// line is dropped as it arrives, never buffered. Cancel safe, as
+/// `read_until` is: a line read in part stays here for the next call.
+struct LineReader<R> {
+    reader: R,
+    max: usize,
+    line: Vec<u8>,
+    cut: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> LineReader<R> {
+    fn new(reader: R, max: usize) -> Self {
+        Self {
+            reader,
+            max,
+            line: Vec::new(),
+            cut: false,
+        }
+    }
+
+    /// The next line, with its newline when it fit; `None` at the end.
+    async fn next(&mut self) -> std::io::Result<Option<Line>> {
+        loop {
+            // The only await: nothing is taken from the reader before it
+            // returns, and what follows it is not interrupted.
+            let buf = self.reader.fill_buf().await?;
+            if buf.is_empty() {
+                if self.line.is_empty() && !self.cut {
+                    return Ok(None);
+                }
+                return Ok(Some(self.take()));
+            }
+            let (len, ends) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            };
+            let room = self.max.saturating_sub(self.line.len());
+            if len > room {
+                self.line.extend_from_slice(&buf[..room]);
+                self.cut = true;
+            } else {
+                self.line.extend_from_slice(&buf[..len]);
+            }
+            self.reader.consume(len);
+            if ends {
+                return Ok(Some(self.take()));
+            }
+        }
+    }
+
+    fn take(&mut self) -> Line {
+        Line {
+            bytes: std::mem::take(&mut self.line),
+            cut: std::mem::replace(&mut self.cut, false),
+        }
+    }
+}
+
 /// What reading a turn's process gave.
 struct Read {
     state: StreamState,
     stderr: Vec<String>,
     exit: Exit,
+    /// Lines on stdout, skipped ones included.
+    stdout_lines: usize,
 }
 
 /// Read the turn's stdout and stderr until both end and the process
@@ -722,11 +1364,13 @@ async fn read_turn(
     state: StreamState,
     updates: &TurnUpdates,
 ) -> Read {
+    let label = harness.label();
     let mut state = state;
-    let mut stdout = BufReader::new(stdout);
-    let mut stderr = BufReader::new(stderr);
-    let (mut out_line, mut err_line) = (Vec::new(), Vec::new());
+    let mut stdout = LineReader::new(BufReader::new(stdout), STDOUT_LINE_MAX);
+    let mut stderr = LineReader::new(BufReader::new(stderr), STDERR_LINE_MAX);
     let (mut out_done, mut err_done) = (false, false);
+    let (mut out_cut, mut err_cut) = (false, false);
+    let mut stdout_lines = 0;
     let mut errors: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut drain_until: Option<Instant> = exit
         .borrow()
@@ -738,12 +1382,23 @@ async fn read_turn(
         }
         let drain = drain_until.unwrap_or_else(Instant::now);
         tokio::select! {
-            read = stdout.read_until(b'\n', &mut out_line), if !out_done => {
+            read = stdout.next(), if !out_done => {
                 match read {
-                    Ok(0) | Err(_) => out_done = true,
-                    Ok(_) => {
-                        let line = String::from_utf8_lossy(&out_line).into_owned();
-                        out_line.clear();
+                    Ok(None) | Err(_) => out_done = true,
+                    Ok(Some(line)) if line.cut => {
+                        stdout_lines += 1;
+                        if !out_cut {
+                            out_cut = true;
+                            warn!(
+                                "agent '{agent}': {label} printed a line longer than {} KiB; \
+                                 skipped (said once per turn)",
+                                STDOUT_LINE_MAX >> 10
+                            );
+                        }
+                    }
+                    Ok(Some(line)) => {
+                        stdout_lines += 1;
+                        let line = String::from_utf8_lossy(&line.bytes);
                         debug!("agent '{agent}': {}", for_log(&line));
                         for event in harness.events(&line) {
                             state.event(event, updates);
@@ -751,12 +1406,19 @@ async fn read_turn(
                     }
                 }
             }
-            read = stderr.read_until(b'\n', &mut err_line), if !err_done => {
+            read = stderr.next(), if !err_done => {
                 match read {
-                    Ok(0) | Err(_) => err_done = true,
-                    Ok(_) => {
-                        let line = String::from_utf8_lossy(&err_line).into_owned();
-                        err_line.clear();
+                    Ok(None) | Err(_) => err_done = true,
+                    Ok(Some(line)) => {
+                        if line.cut && !err_cut {
+                            err_cut = true;
+                            warn!(
+                                "agent '{agent}': {label} printed a stderr line longer than {} \
+                                 KiB; only its start is kept (said once per turn)",
+                                STDERR_LINE_MAX >> 10
+                            );
+                        }
+                        let line = String::from_utf8_lossy(&line.bytes);
                         debug!("agent '{agent}': stderr: {}", for_log(&strip_ansi(&line)));
                         if errors.len() == STDERR_LINES {
                             errors.pop_front();
@@ -781,6 +1443,7 @@ async fn read_turn(
         state,
         stderr: errors.into(),
         exit,
+        stdout_lines,
     }
 }
 
@@ -792,19 +1455,23 @@ async fn read_turn(
 pub struct ProcessDriver<H> {
     harness: H,
     processes: Arc<TurnProcesses>,
+    scopes: Arc<TurnScopes>,
     graces: [Duration; 3],
 }
 
 impl<H: TurnHarness> ProcessDriver<H> {
-    pub fn new(harness: H) -> Self {
-        Self::with_graces(harness, STOP_GRACES)
+    /// A driver whose turns run in `scopes` (shared by every such driver
+    /// of the daemon, so a leftover is swept once).
+    pub fn new(harness: H, scopes: Arc<TurnScopes>) -> Self {
+        Self::with_graces(harness, scopes, STOP_GRACES)
     }
 
     /// [`ProcessDriver::new`] with the stop graces injected, for tests.
-    fn with_graces(harness: H, graces: [Duration; 3]) -> Self {
+    fn with_graces(harness: H, scopes: Arc<TurnScopes>, graces: [Duration; 3]) -> Self {
         Self {
             harness,
             processes: Arc::new(TurnProcesses::default()),
+            scopes,
             graces,
         }
     }
@@ -849,6 +1516,8 @@ impl<H: TurnHarness> Driver for ProcessDriver<H> {
                 agent.dir.display()
             ));
         }
+        // What a previous daemon's turn left running goes first.
+        self.scopes.sweep().await;
         self.wait_previous(agent).await;
         let launch = match self.harness.launch(agent, &session, &request) {
             Ok(launch) => launch,
@@ -860,51 +1529,120 @@ impl<H: TurnHarness> Driver for ProcessDriver<H> {
             agent.command,
             launch.args.join(" ")
         );
-        let spawned =
-            match spawn(agent, launch, |name| self.strips_env(name), &self.processes).await {
+        // A session the launch names that the agent does not have yet is
+        // the agent's once its process runs, pending.
+        let fresh = launch
+            .session
+            .as_ref()
+            .filter(|id| session.session_id.as_deref() != Some(id.as_str()))
+            .map(|id| SessionRef {
+                session_id: Some(id.clone()),
+                bg_id: None,
+                transcript_path: None,
+                pending: true,
+            });
+        let running = fresh.clone().unwrap_or_else(|| session.clone());
+        let mut report = fresh;
+        let mut wrap = self.scopes.wrap(&agent.name);
+        loop {
+            let strips = |name: &str| self.strips_env(name);
+            let spec = SpawnSpec {
+                wrap: &wrap,
+                strips: &strips,
+                processes: &self.processes,
+                updates: &updates,
+                report: report.clone(),
+                graces: self.graces,
+            };
+            let spawned = match spawn(agent, &launch, spec).await {
                 Ok(spawned) => spawned,
+                Err(e) if wrap != Wrap::Direct && e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(
+                        "agent '{}': systemd-run unavailable ({e}); starting {label} directly",
+                        agent.name
+                    );
+                    wrap = Wrap::Direct;
+                    continue;
+                }
                 Err(e) => {
-                    return TurnOutcome::Failed(spawn_failure(agent, label, &e, agent.dir.is_dir()))
+                    // A start that never ran the harness leaves the session
+                    // as it was.
+                    if report.is_none() && running != session {
+                        updates.send(TurnUpdate::Session(session.clone()));
+                    }
+                    return TurnOutcome::Failed(spawn_failure(
+                        agent,
+                        label,
+                        &e,
+                        agent.dir.is_dir(),
+                    ));
                 }
             };
-        info!(
-            "agent '{}': {label} turn running (pid {})",
-            agent.name, spawned.process.pid
-        );
-        let _registered = Registered {
-            processes: Arc::clone(&self.processes),
-            agent: agent.name.clone(),
-            process: Arc::clone(&spawned.process),
-            graces: self.graces,
-        };
-        let read = read_turn(
-            &self.harness,
-            &agent.name,
-            spawned.stdout,
-            spawned.stderr,
-            spawned.exit,
-            StreamState::new(session.session_id.clone()),
-            &updates,
-        )
-        .await;
-        info!(
-            "agent '{}': {label} exited with {} ({} text part(s))",
-            agent.name,
-            read.exit,
-            read.state.texts.len()
-        );
-        outcome(agent, &self.harness, &read.state, &read.stderr, &read.exit)
+            report = None;
+            match &wrap {
+                Wrap::Scope { unit, .. } => info!(
+                    "agent '{}': {label} turn running (pid {}, in {unit})",
+                    agent.name, spawned.process.pid
+                ),
+                Wrap::Direct => info!(
+                    "agent '{}': {label} turn running (pid {})",
+                    agent.name, spawned.process.pid
+                ),
+            }
+            let _registered = Registered {
+                processes: Arc::clone(&self.processes),
+                agent: agent.name.clone(),
+                process: Arc::clone(&spawned.process),
+                graces: self.graces,
+            };
+            let read = read_turn(
+                &self.harness,
+                &agent.name,
+                spawned.stdout,
+                spawned.stderr,
+                spawned.exit,
+                StreamState::for_session(&running),
+                &updates,
+            )
+            .await;
+            if let Some(next) = wrap.after(&read) {
+                let why = read.stderr.first().map(String::as_str).unwrap_or("").trim();
+                if next == Wrap::Direct && why.contains("find executable") {
+                    // No harness to run: the direct start says so.
+                    debug!("agent '{}': {why}; starting {label} directly", agent.name);
+                } else if next == Wrap::Direct {
+                    self.scopes.note_unscoped(&agent.name, label, why);
+                } else {
+                    debug!(
+                        "agent '{}': systemd-run has no --expand-environment (older than 254, \
+                         which expands nothing); trying again without it",
+                        agent.name
+                    );
+                }
+                wrap = next;
+                continue;
+            }
+            info!(
+                "agent '{}': {label} exited with {} ({} text part(s))",
+                agent.name,
+                read.exit,
+                read.state.texts.len()
+            );
+            return outcome(agent, &self.harness, &read.state, &read.stderr, &read.exit);
+        }
     }
 
-    /// The turn's process ended with the old daemon: it never replied.
+    /// The turn's process ended with the old daemon: it never replied. What
+    /// it left in its scope is stopped first.
     async fn rewatch(
         &self,
         agent: &Agent,
-        _session: SessionRef,
+        session: SessionRef,
         _request: TurnRequest,
         _io: TurnIo,
     ) -> TurnOutcome {
-        TurnOutcome::Failed(cut_off(agent, self.harness.label()))
+        self.scopes.sweep().await;
+        TurnOutcome::Failed(cut_off(agent, self.harness.label(), &session))
     }
 
     /// Stop the turn's process and wait until it is gone (also one a
@@ -959,9 +1697,12 @@ mod tests {
     /// A harness run by `sh -c <script>`, with a line protocol of its own:
     /// `S <id>` a session, `T <message> <text>` a text, `U <tool>` a tool
     /// call, `E <message>` an error; any other line is a text of message
-    /// `raw`. A stderr line `gone` is a session it no longer has.
+    /// `raw`. A stderr line `gone` is a session it no longer has. With
+    /// `session`, its launch names a session as OpenCode's does: the
+    /// agent's, else this one.
     struct Fake {
         script: String,
+        session: Option<String>,
     }
 
     impl TurnHarness for Fake {
@@ -972,13 +1713,17 @@ mod tests {
         fn launch(
             &self,
             _agent: &Agent,
-            _session: &SessionRef,
+            session: &SessionRef,
             request: &TurnRequest,
         ) -> Result<Launch, String> {
             Ok(Launch {
                 args: vec!["-c".into(), self.script.clone(), "fake".into()],
                 stdin: Some(request.text.clone()),
                 env: vec![("FAKE_SET".into(), "set by launch".into())],
+                session: self
+                    .session
+                    .as_ref()
+                    .map(|minted| session.session_id.clone().unwrap_or(minted.clone())),
             })
         }
 
@@ -1018,6 +1763,7 @@ mod tests {
     fn harness() -> Fake {
         Fake {
             script: String::new(),
+            session: None,
         }
     }
 
@@ -1062,6 +1808,16 @@ mod tests {
             session_id: Some(id.to_string()),
             bg_id: None,
             transcript_path: None,
+            pending: false,
+        })
+    }
+
+    fn pending(id: &str) -> TurnUpdate {
+        TurnUpdate::Session(SessionRef {
+            session_id: Some(id.to_string()),
+            bg_id: None,
+            transcript_path: None,
+            pending: true,
         })
     }
 
@@ -1227,7 +1983,7 @@ mod tests {
 
     #[test]
     fn every_driver_strips_a_parent_sessions_variables_and_whisrs_keys() {
-        let driver = ProcessDriver::new(harness());
+        let driver = ProcessDriver::new(harness(), Arc::new(TurnScopes::off()));
         for name in [
             "CLAUDECODE",
             "CLAUDE_CODE_SESSION_ID",
@@ -1254,16 +2010,30 @@ mod tests {
         assert_ne!(random_bytes::<16>(), random_bytes::<16>());
     }
 
+    const TEST_GRACES: [Duration; 3] = [
+        Duration::from_millis(600),
+        Duration::from_millis(600),
+        Duration::from_millis(1500),
+    ];
+
+    /// A driver of `script`, started directly (no scope): the process tree
+    /// is all a stop has.
     fn fake(script: &str) -> Arc<ProcessDriver<Fake>> {
+        fake_in(script, None, TurnScopes::off())
+    }
+
+    fn fake_in(
+        script: &str,
+        session: Option<&str>,
+        scopes: TurnScopes,
+    ) -> Arc<ProcessDriver<Fake>> {
         Arc::new(ProcessDriver::with_graces(
             Fake {
                 script: script.to_string(),
+                session: session.map(String::from),
             },
-            [
-                Duration::from_millis(600),
-                Duration::from_millis(600),
-                Duration::from_millis(1500),
-            ],
+            Arc::new(scopes),
+            TEST_GRACES,
         ))
     }
 
@@ -1310,14 +2080,22 @@ mod tests {
         a.name = "env".into();
         let (io, _rx) = turn_io();
         // `HOME` stands in for a stripped variable: the test process has it.
+        let launch = driver
+            .harness
+            .launch(&a, &SessionRef::default(), &request("x"))
+            .unwrap();
+        let strips = |name: &str| name == "HOME";
         let spawned = spawn(
             &a,
-            driver
-                .harness
-                .launch(&a, &SessionRef::default(), &request("x"))
-                .unwrap(),
-            |name| name == "HOME",
-            &driver.processes,
+            &launch,
+            SpawnSpec {
+                wrap: &Wrap::Direct,
+                strips: &strips,
+                processes: &driver.processes,
+                updates: &io.updates,
+                report: None,
+                graces: TEST_GRACES,
+            },
         )
         .await
         .unwrap();
@@ -1497,6 +2275,7 @@ mod tests {
             session_id: Some("ses_x".into()),
             bg_id: None,
             transcript_path: None,
+            pending: false,
         };
         assert_eq!(driver.session_phase(&a, &s).await, Ok(AgentPhase::Idle));
         assert_eq!(
@@ -1507,14 +2286,486 @@ mod tests {
         assert!(!driver.hook_matches(&payload, &s));
         assert_eq!(driver.idle_event(&payload, &s).await, IdleEvent::Ignored);
         let (io, _rx) = turn_io();
-        let TurnOutcome::Failed(message) = driver.rewatch(&a, s, request(""), io).await else {
+        let TurnOutcome::Failed(message) = driver.rewatch(&a, s.clone(), request(""), io).await
+        else {
             panic!("a rewatch ends the turn");
         };
-        assert_eq!(message, cut_off(&a, "Fake"));
+        assert_eq!(message, cut_off(&a, "Fake", &s));
         assert!(
-            message.contains("whisrs restarted during that turn"),
+            message.contains("whisrs restarted during that turn")
+                && message.ends_with("The session keeps what it did so far."),
             "{message}"
         );
         assert!(!message.contains('\u{2014}'));
+        // A turn that may not have reached the harness says so.
+        for unsure in [
+            SessionRef::default(),
+            SessionRef {
+                pending: true,
+                ..s.clone()
+            },
+        ] {
+            let message = cut_off(&a, "Fake", &unsure);
+            assert!(
+                message.ends_with("It may not have reached Fake at all, so say it again."),
+                "{message}"
+            );
+        }
+    }
+
+    /// Whether this machine can run a transient user scope
+    /// (`systemd-run --user --scope`): the scope tests skip without one, as
+    /// on CI.
+    fn user_scopes() -> bool {
+        std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Scopes with a prefix of their own, so a test only ever sweeps its own.
+    fn test_scopes() -> TurnScopes {
+        TurnScopes::with_prefix(
+            Some(format!("whisrs-agent-test{}-", hex(&random_bytes::<4>()))),
+            TEST_GRACES,
+        )
+    }
+
+    /// A pid that is still a live process (not a zombie).
+    fn alive_pid(path: &Path) -> Option<u32> {
+        let pid = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+        alive(pid).then_some(pid)
+    }
+
+    /// A process that left the turn's group into a session of its own
+    /// (`setsid`, as Copilot's tool shells do) and ignores SIGINT is found
+    /// through its parent, kept once seen, and ended by the SIGTERM after
+    /// the parent is gone: the tree, with no scope.
+    #[tokio::test]
+    async fn a_stop_reaches_a_process_that_left_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "setsid sleep 41 & echo $! > pid; sleep 30";
+        let (took, leader, child) = stop_after_start(script, dir.path()).await;
+        assert!(!alive(leader), "the leader is gone");
+        assert!(!alive(child), "the setsid child {child} is gone");
+        // SIGINT ended the shell; the child ignored it until the SIGTERM.
+        assert!(took >= Duration::from_millis(600), "{took:?}");
+    }
+
+    /// In a scope, a stop also reaches a process whose parent exited before
+    /// the stop, out of reach of any tree walk.
+    #[tokio::test]
+    async fn a_stop_reaches_an_orphan_through_the_scope() {
+        if !user_scopes() {
+            eprintln!("skipped: no systemd user scopes here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let scopes = test_scopes();
+        let driver = fake_in("(setsid sleep 42 & echo $! > pid); sleep 30", None, scopes);
+        let a = Arc::new(agent(dir.path()));
+        let (io, _rx) = turn_io();
+        let task = {
+            let (driver, a) = (Arc::clone(&driver), Arc::clone(&a));
+            tokio::spawn(async move {
+                driver
+                    .run_turn(&a, SessionRef::default(), request("x"), io)
+                    .await
+            })
+        };
+        let orphan = wait_for_pid(&dir.path().join("pid")).await;
+        let process = driver.processes.get("coder").expect("registered");
+        let unit = process.scope.as_ref().expect("in a scope").unit.clone();
+        // Not the leader's child: its subshell exited.
+        let stat = std::fs::read_to_string(format!("/proc/{orphan}/stat")).unwrap();
+        let ppid: u32 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(ppid, process.pid);
+        task.abort();
+        driver
+            .stop(&a, &SessionRef::default())
+            .await
+            .expect("the stop ends the scope");
+        assert!(!alive(orphan), "the orphan {orphan} is gone");
+        assert!(!alive(process.pid));
+        let listed = systemctl(&["list-units", "--all", "--plain", "--no-legend", &unit])
+            .await
+            .unwrap_or_default();
+        assert!(listed_units(&listed, &unit).is_empty(), "{listed}");
+    }
+
+    /// What a previous daemon's turn left in its scope (a process that
+    /// ignored the SIGINT the daemon's end sent) is stopped by the sweep,
+    /// once, before any turn; another daemon's scope is not touched.
+    #[tokio::test]
+    async fn the_sweep_stops_what_a_previous_daemon_left() {
+        if !user_scopes() {
+            eprintln!("skipped: no systemd user scopes here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let scopes = test_scopes();
+        let other = test_scopes();
+        let prefix = scopes.prefix.clone().unwrap();
+        let start = |unit: String, pid: &str| {
+            let pid = dir.path().join(pid);
+            std::process::Command::new("systemd-run")
+                .args(claude::scope_args(
+                    Some(&unit),
+                    true,
+                    "sh",
+                    &[
+                        "-c".to_string(),
+                        format!(
+                            "trap '' INT; (setsid sleep 43 & echo $! > {}); sleep 43",
+                            pid.display()
+                        ),
+                    ],
+                ))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut left = start(format!("{prefix}coder-0000aaaa.scope"), "left");
+        let other_unit = format!("{}coder-0000bbbb.scope", other.prefix.clone().unwrap());
+        let mut kept = start(other_unit.clone(), "kept");
+        let left_pid = wait_for_pid(&dir.path().join("left")).await;
+        let kept_pid = wait_for_pid(&dir.path().join("kept")).await;
+        let started = Instant::now();
+        scopes.sweep().await;
+        // SIGINT ignored by both: the SIGTERM a grace later ended them.
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert!(!alive(left_pid));
+        let _ = left.wait();
+        assert!(
+            alive_pid(&dir.path().join("kept")).is_some(),
+            "another daemon's scope is left alone"
+        );
+        // Once: a second sweep (a turn's) does nothing.
+        let again = Instant::now();
+        scopes.sweep().await;
+        assert!(again.elapsed() < Duration::from_millis(300));
+        // Clean up the other one.
+        Scope::new(other_unit)
+            .stop_leftover(&TEST_GRACES)
+            .await
+            .unwrap();
+        assert!(!alive(kept_pid));
+        let _ = kept.wait();
+    }
+
+    /// A turn stopped before its process was registered (`--stop` found
+    /// nothing to stop): the spawn sees the stop, never writes the prompt,
+    /// and stops the process itself, which stays registered until it is
+    /// gone.
+    #[tokio::test]
+    async fn a_process_started_after_the_stop_is_stopped_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = fake("read -r said; echo \"T m heard:$said\"; sleep 30");
+        let a = agent(dir.path());
+        let (io, _rx) = turn_io();
+        // The runtime's stop came first: nothing registered for it to find.
+        io.updates.stop();
+        assert_eq!(driver.stop(&a, &SessionRef::default()).await, Ok(()));
+        let started = Instant::now();
+        let outcome = driver
+            .run_turn(&a, SessionRef::default(), request("delete it"), io)
+            .await;
+        // Not the 30 s of its sleep: it was stopped.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            !matches!(&outcome, TurnOutcome::Reply(r) if r.contains("delete it")),
+            "the prompt reached it: {outcome:?}"
+        );
+        for _ in 0..100 {
+            if driver.processes.get("coder").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(driver.processes.get("coder").is_none());
+    }
+
+    /// A session the launch names is the agent's as soon as the process
+    /// runs, pending: a turn stopped before its first line keeps it.
+    #[tokio::test]
+    async fn a_minted_session_is_reported_at_spawn_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = fake_in(
+            "echo $$ > pid; sleep 30",
+            Some("ses_new"),
+            TurnScopes::off(),
+        );
+        let a = Arc::new(agent(dir.path()));
+        let (io, mut rx) = turn_io();
+        let updates = io.updates.clone();
+        let task = {
+            let (driver, a) = (Arc::clone(&driver), Arc::clone(&a));
+            tokio::spawn(async move {
+                driver
+                    .run_turn(&a, SessionRef::default(), request("x"), io)
+                    .await
+            })
+        };
+        wait_for_pid(&dir.path().join("pid")).await;
+        // What `--stop` reads: the pending id, though no line named it.
+        let latest = updates.stop().expect("reported at spawn");
+        assert_eq!(latest.session_id.as_deref(), Some("ses_new"));
+        assert!(latest.pending);
+        task.abort();
+        driver.stop(&a, &SessionRef::default()).await.unwrap();
+        assert_eq!(drain(&mut rx), [pending("ses_new")]);
+    }
+
+    /// A pending session stays pending through a turn that only failed
+    /// (nothing shows the agent working in it), and is confirmed by the
+    /// first text or tool call of a later one.
+    #[tokio::test]
+    async fn only_a_text_or_a_tool_confirms_a_pending_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let failed = fake_in(
+            "echo \"S ses_new\"; echo \"E Model unavailable\"; exit 1",
+            Some("ses_new"),
+            TurnScopes::off(),
+        );
+        let (io, mut rx) = turn_io();
+        let outcome = failed
+            .run_turn(&agent(dir.path()), SessionRef::default(), request("x"), io)
+            .await;
+        assert!(matches!(outcome, TurnOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(drain(&mut rx), [pending("ses_new")]);
+        let stored = SessionRef {
+            session_id: Some("ses_new".into()),
+            pending: true,
+            ..SessionRef::default()
+        };
+        // The next turn: the same id, still pending until the text.
+        let replied = fake_in(
+            "echo \"S ses_new\"; echo \"T m done\"",
+            Some("ses_other"),
+            TurnScopes::off(),
+        );
+        let (io, mut rx) = turn_io();
+        let outcome = replied
+            .run_turn(&agent(dir.path()), stored, request("x"), io)
+            .await;
+        assert_eq!(outcome, TurnOutcome::Reply("done".into()));
+        assert_eq!(drain(&mut rx), [session("ses_new")]);
+    }
+
+    /// A start that never ran the harness (not found) leaves the session as
+    /// it was: nothing to continue.
+    #[tokio::test]
+    async fn a_harness_that_never_ran_leaves_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = fake_in("true", Some("ses_new"), TurnScopes::off());
+        let mut a = agent(dir.path());
+        a.command = "/nonexistent/fake-harness".into();
+        let (io, mut rx) = turn_io();
+        let outcome = driver
+            .run_turn(&a, SessionRef::default(), request("x"), io)
+            .await;
+        assert!(matches!(outcome, TurnOutcome::Failed(_)), "{outcome:?}");
+        assert!(drain(&mut rx).is_empty());
+        // In a scope, systemd-run runs but finds no harness: it is started
+        // directly, and the session reported for the scope is taken back.
+        if user_scopes() {
+            let driver = fake_in("true", Some("ses_new"), test_scopes());
+            let (io, mut rx) = turn_io();
+            let TurnOutcome::Failed(message) = driver
+                .run_turn(&a, SessionRef::default(), request("x"), io)
+                .await
+            else {
+                panic!("a missing command fails the turn");
+            };
+            assert!(message.contains("was not found"), "{message}");
+            assert_eq!(
+                drain(&mut rx),
+                [
+                    pending("ses_new"),
+                    TurnUpdate::Session(SessionRef::default())
+                ]
+            );
+        }
+    }
+
+    /// In a scope, the turn is the same: the prompt in, the session, the
+    /// reply out, every variable as in a direct start.
+    #[tokio::test]
+    async fn a_turn_in_a_scope_reads_like_a_direct_one() {
+        if !user_scopes() {
+            eprintln!("skipped: no systemd user scopes here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let driver = fake_in(
+            "read -r said; echo \"S ses_s\"; echo \"T m $said / $FAKE_SET / ${PWD} / $(cat /proc/self/cgroup)\"",
+            None,
+            test_scopes(),
+        );
+        let (io, mut rx) = turn_io();
+        let outcome = driver
+            .run_turn(
+                &agent(dir.path()),
+                SessionRef::default(),
+                request("cost is $HOME"),
+                io,
+            )
+            .await;
+        let TurnOutcome::Reply(reply) = outcome else {
+            panic!("{outcome:?}");
+        };
+        // The prompt arrives as said: nothing expanded it.
+        assert!(
+            reply.starts_with("cost is $HOME / set by launch / "),
+            "{reply}"
+        );
+        assert!(reply.contains(&dir.path().display().to_string()), "{reply}");
+        assert!(
+            reply.contains("/whisrs-agent-test") && reply.ends_with(".scope"),
+            "{reply}"
+        );
+        assert_eq!(drain(&mut rx), [session("ses_s")]);
+    }
+
+    /// The scope's command line is not expanded either.
+    #[test]
+    fn scope_wraps_keep_the_command_line_as_written() {
+        let scopes = test_scopes();
+        let Wrap::Scope { unit, no_expand } = scopes.wrap("coder") else {
+            panic!("a scope");
+        };
+        assert!(no_expand);
+        assert!(unit.starts_with(scopes.prefix.as_deref().unwrap()));
+        assert!(
+            unit.ends_with(".scope") && unit.contains("-coder-"),
+            "{unit}"
+        );
+        assert_ne!(scopes.wrap("coder"), scopes.wrap("coder"));
+        assert_eq!(TurnScopes::off().wrap("coder"), Wrap::Direct);
+        // A long name is cut, so the unit name stays valid.
+        let Wrap::Scope { unit, .. } = scopes.wrap(&"a".repeat(300)) else {
+            panic!("a scope");
+        };
+        assert!(unit.len() < 120, "{unit}");
+    }
+
+    #[test]
+    fn scope_prefixes_name_the_daemon_by_its_store() {
+        let a = scope_prefix(Path::new("/home/u/.local/share/whisrs/agents.json"));
+        let b = scope_prefix(Path::new("/tmp/test/xdg/data/whisrs/agents.json"));
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            scope_prefix(Path::new("/home/u/.local/share/whisrs/agents.json"))
+        );
+        assert!(
+            a.starts_with("whisrs-agent-") && a.ends_with('-') && a.len() == 22,
+            "{a}"
+        );
+    }
+
+    #[test]
+    fn only_this_daemons_running_scopes_are_listed() {
+        let p = "whisrs-agent-0badcafe-";
+        let listing = "\
+whisrs-agent-0badcafe-coder-1a2b3c4d.scope loaded active running [systemd-run] /usr/bin/opencode run
+whisrs-agent-0badcafe-cx-5e6f7a8b.scope loaded inactive dead [systemd-run] codex
+whisrs-agent-0badcafe-cp-00000000.scope loaded failed failed [systemd-run] copilot
+whisrs-agent-12345678-coder-1a2b3c4d.scope loaded active running [systemd-run] opencode
+whisrs-agent-0badcafe-x.service loaded active running x
+";
+        assert_eq!(
+            listed_units(listing, p),
+            ["whisrs-agent-0badcafe-coder-1a2b3c4d.scope"]
+        );
+        assert!(listed_units("", p).is_empty());
+    }
+
+    /// What a start in a scope that never ran the harness tries next.
+    #[test]
+    fn a_scope_that_never_ran_falls_back() {
+        let wrap = Wrap::Scope {
+            unit: "u.scope".into(),
+            no_expand: true,
+        };
+        let read = |stderr: &str, lines: usize, code: i32| Read {
+            state: StreamState::new(None),
+            stderr: stderr.lines().map(String::from).collect(),
+            exit: status(code),
+            stdout_lines: lines,
+        };
+        assert_eq!(
+            wrap.after(&read(
+                "systemd-run: unrecognized option '--expand-environment=no'",
+                0,
+                1
+            )),
+            Some(Wrap::Scope {
+                unit: "u.scope".into(),
+                no_expand: false
+            })
+        );
+        for stderr in [
+            "Failed to connect to user scope bus via local transport: No such file or directory",
+            "Failed to start transient scope unit: Access denied",
+            "Failed to find executable opencode: No such file or directory",
+        ] {
+            assert_eq!(
+                wrap.after(&read(stderr, 0, 1)),
+                Some(Wrap::Direct),
+                "{stderr}"
+            );
+        }
+        // The harness ran: its own failure is the turn's.
+        assert_eq!(wrap.after(&read("Failed to connect to bus", 1, 1)), None);
+        assert_eq!(wrap.after(&read("error: unknown option --x", 0, 2)), None);
+        assert_eq!(wrap.after(&read("", 0, 0)), None);
+        assert_eq!(
+            Wrap::Direct.after(&read("Failed to start transient scope unit: x", 0, 1)),
+            None
+        );
+    }
+
+    /// A line past the cap is never kept whole: a long stdout line is
+    /// skipped and the turn goes on; a long stderr line keeps its start.
+    #[tokio::test]
+    async fn an_oversized_line_is_skipped_or_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = fake(
+            "head -c 2500000 /dev/zero | tr '\\0' 'x'; echo; echo \"T m after the long line\"; \
+             head -c 20000 /dev/zero | tr '\\0' 'e' >&2; echo >&2; echo 'error: the last line' >&2; \
+             exit 1",
+        );
+        let (io, _rx) = turn_io();
+        let outcome = driver
+            .run_turn(&agent(dir.path()), SessionRef::default(), request("x"), io)
+            .await;
+        assert_eq!(outcome, TurnOutcome::Reply("after the long line".into()));
+        // Directly: the stderr kept, cut.
+        let mut reader = LineReader::new(BufReader::new(&b"abcdefgh\nij\nklmnopqrstu"[..]), 4);
+        let mut lines = Vec::new();
+        while let Some(line) = reader.next().await.unwrap() {
+            lines.push((String::from_utf8(line.bytes).unwrap(), line.cut));
+        }
+        assert_eq!(
+            lines,
+            [
+                ("abcd".to_string(), true),
+                ("ij\n".to_string(), false),
+                ("klmn".to_string(), true)
+            ]
+        );
     }
 }
