@@ -27,9 +27,11 @@
 //!   that waits for it, with `PR_SET_PDEATHSIG` = SIGINT, so it is
 //!   interrupted when the daemon exits or dies. A turn never outlives its
 //!   daemon (it would run unwatched, and the next turn would run beside it):
-//!   what a turn left in its scope (a process that ignored the SIGINT) is
-//!   stopped when the next daemon starts ([`TurnScopes::sweep`]), and a turn
-//!   watched again after a restart ends at once ([`cut_off`]).
+//!   anything an earlier turn left in its scope, a background job included
+//!   (a process that ignored the SIGINT, or one a turn that ended normally
+//!   left running), is stopped when the next daemon starts
+//!   ([`TurnScopes::sweep`]), and a turn watched again after a restart ends
+//!   at once ([`cut_off`]).
 //! - **Output:** stdout line by line ([`TurnHarness::events`]): a tool call
 //!   is an activity ([`activity_for_tool`]) and releases the assistant text
 //!   before it as an interim ([`InterimTracker`]), and the text of the last
@@ -40,9 +42,12 @@
 //!   something of the turn is left, after the previous one's grace
 //!   ([`STOP_GRACES`]), to the process group, to every process of the tree
 //!   seen so far ([`Tree`]) and to the scope (`systemctl --user kill`). A
-//!   turn dropped while its process runs (its task aborted), or stopped
-//!   before its process was registered, is stopped the same way, and
-//!   `--stop` waits for that stop.
+//!   turn dropped while its process runs (its task aborted) is stopped the
+//!   same way, and `--stop` waits for that stop. A turn stopped while its
+//!   process was still being started (before it was registered) has
+//!   nothing for `--stop` to wait for, so `--stop` returns at once; the
+//!   process is stopped the same way in the background as soon as it runs,
+//!   and the agent's next turn waits for that.
 //!
 //! Between turns no process runs: a session never works on its own, waits
 //! for a prompt or sends a hook.
@@ -200,6 +205,9 @@ pub struct StreamState {
     texts: Vec<(String, String)>,
     /// The last error the harness reported.
     error: Option<String>,
+    /// A stdout line too long to read ([`STDOUT_LINE_MAX`]) came after the
+    /// last text: it may have been the final message, so there is no reply.
+    skipped_after_text: bool,
 }
 
 impl StreamState {
@@ -220,6 +228,7 @@ impl StreamState {
             activity: None,
             texts: Vec::new(),
             error: None,
+            skipped_after_text: false,
         }
     }
 
@@ -237,6 +246,7 @@ impl StreamState {
                 self.confirm(updates);
                 self.tracker.on_text(&text);
                 self.texts.push((message, text));
+                self.skipped_after_text = false;
             }
             StreamEvent::Tool(name) => {
                 self.confirm(updates);
@@ -251,6 +261,14 @@ impl StreamState {
             }
             StreamEvent::Error(message) => self.error = Some(message),
         }
+    }
+
+    /// A stdout line was skipped, too long to read: until a text comes
+    /// after it, the turn has no reply. The line may have been the final
+    /// message, and an earlier one (an acknowledgement, spoken already) is
+    /// never the reply in its place.
+    pub fn skipped_line(&mut self) {
+        self.skipped_after_text = true;
     }
 
     /// The agent works in the session: a pending id is confirmed, so the
@@ -272,8 +290,12 @@ impl StreamState {
     }
 
     /// The turn's final message: the text parts of its last message, raw.
-    /// `None` when it wrote none, or its last message is empty.
+    /// `None` when it wrote none, its last message is empty, or a line too
+    /// long to read came after it ([`StreamState::skipped_line`]).
     pub fn reply(&self) -> Option<String> {
+        if self.skipped_after_text {
+            return None;
+        }
         let (last, _) = self.texts.last()?;
         let text = self
             .texts
@@ -744,8 +766,10 @@ impl Scope {
 /// A scope is outside the daemon's cgroup (`whisrs.service`'s, under
 /// systemd), so a stopped or restarted daemon does not take it along: the
 /// harness is interrupted when the daemon ends (`PR_SET_PDEATHSIG`), and
-/// whatever of a turn is still in its scope then is stopped when the next
-/// daemon starts ([`TurnScopes::sweep`]), before any turn runs.
+/// anything an earlier turn left in its scope, a background job included
+/// (also one a turn that ended normally left running), is stopped when the
+/// next daemon starts ([`TurnScopes::sweep`]), before any turn runs: as a
+/// restart of the service's cgroup would stop it.
 #[derive(Debug)]
 pub struct TurnScopes {
     /// `whisrs-agent-<instance>-`, or `None` for no scopes at all.
@@ -806,8 +830,9 @@ impl TurnScopes {
         }
     }
 
-    /// Stop what a previous daemon's turns left in their scopes, once:
-    /// started when the daemon starts, and waited for by every turn.
+    /// Stop anything a previous daemon's turns left in their scopes, a
+    /// background job included, once: started when the daemon starts (also
+    /// a daemon with no agents left), and waited for by every turn.
     pub async fn sweep(&self) {
         let Some(prefix) = &self.prefix else {
             return;
@@ -833,7 +858,10 @@ impl TurnScopes {
                     }
                 };
                 for unit in listed_units(&listing, prefix) {
-                    info!("agents: stopping {unit}, which a turn left running before a restart");
+                    info!(
+                        "agents: stopping {unit}: anything an earlier turn left in its scope, a \
+                         background job included"
+                    );
                     if let Err(e) = Scope::new(unit).stop_leftover(&self.graces).await {
                         warn!("agents: {e}");
                     }
@@ -1387,6 +1415,7 @@ async fn read_turn(
                     Ok(None) | Err(_) => out_done = true,
                     Ok(Some(line)) if line.cut => {
                         stdout_lines += 1;
+                        state.skipped_line();
                         if !out_cut {
                             out_cut = true;
                             warn!(
@@ -1890,6 +1919,22 @@ mod tests {
         let mut blank = StreamState::new(None);
         blank.event(text("m1", "  "), &updates);
         assert_eq!(blank.reply(), None);
+    }
+
+    /// A line too long to read after the last text may have been the final
+    /// message: no reply, never the text before it. A text after the
+    /// skipped line is the reply again.
+    #[test]
+    fn a_skipped_line_after_the_last_text_leaves_no_reply() {
+        let (updates, _rx) = TurnUpdates::channel();
+        let mut state = StreamState::new(None);
+        state.skipped_line();
+        state.event(text("m1", "<spoken>On it.</spoken>"), &updates);
+        assert_eq!(state.reply().as_deref(), Some("<spoken>On it.</spoken>"));
+        state.skipped_line();
+        assert_eq!(state.reply(), None);
+        state.event(text("m2", "Done."), &updates);
+        assert_eq!(state.reply().as_deref(), Some("Done."));
     }
 
     fn status(code: i32) -> Exit {
@@ -2739,7 +2784,9 @@ whisrs-agent-0badcafe-x.service loaded active running x
     }
 
     /// A line past the cap is never kept whole: a long stdout line is
-    /// skipped and the turn goes on; a long stderr line keeps its start.
+    /// skipped and the turn goes on; a long stderr line keeps its start. A
+    /// skipped line after the last text may have been the final message:
+    /// the turn then has no reply, never the text before it.
     #[tokio::test]
     async fn an_oversized_line_is_skipped_or_cut() {
         let dir = tempfile::tempdir().unwrap();
@@ -2753,6 +2800,20 @@ whisrs-agent-0badcafe-x.service loaded active running x
             .run_turn(&agent(dir.path()), SessionRef::default(), request("x"), io)
             .await;
         assert_eq!(outcome, TurnOutcome::Reply("after the long line".into()));
+        let driver = fake(
+            "echo \"T m1 <spoken>On it.</spoken>\"; echo 'U shell'; \
+             head -c 2500000 /dev/zero | tr '\\0' 'x'; echo",
+        );
+        let (io, mut rx) = turn_io();
+        let outcome = driver
+            .run_turn(&agent(dir.path()), SessionRef::default(), request("x"), io)
+            .await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed("Agent 'coder': Fake ended the turn without a reply.".into())
+        );
+        // The acknowledgement was spoken once, as the interim.
+        assert!(drain(&mut rx).contains(&TurnUpdate::Interim("<spoken>On it.</spoken>".into())));
         // Directly: the stderr kept, cut.
         let mut reader = LineReader::new(BufReader::new(&b"abcdefgh\nij\nklmnopqrstu"[..]), 4);
         let mut lines = Vec::new();

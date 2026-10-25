@@ -82,6 +82,7 @@ src/
 │   │                       #   stop of group + tree + scope, leftover-scope sweep at startup, outcome)
 │   ├── opencode.rs         #   OpenCode driver (TurnHarness): opencode run --standalone --format json --session <id>
 │   ├── codex.rs            #   Codex driver (TurnHarness): codex exec --json ... --skip-git-repo-check [resume <id>] -
+│   ├── copilot.rs          #   Copilot driver (TurnHarness): copilot --output-format json --session-id=|--resume=<id>, prompt on stdin
 │   ├── progress.rs         #   feedback levels + instruction deltas, activity labels, InterimTracker, ProgressGate
 │   ├── display.rs          #   Agent overlay model: Board (voice > needs-you > working > done/error), rows, timer
 │   └── store.rs            #   $XDG_DATA_HOME/whisrs/agents.json (0600, atomic), written only with agents
@@ -321,7 +322,7 @@ Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realti
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
-Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude|opencode|codex`, `dir`, `permissions` =
+Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude|opencode|codex|copilot`, `dir`, `permissions` =
 `auto|bypass|ask`, `command`, `args`, `reply_instruction`, `feedback` = `summary|brief|conversational`;
 `agent::resolve_agents` validates and skips bad entries, shared by `Config::validate` and the runtime),
 plus `[agent_overlay]` (`enabled` follows `[general] overlay`, `style` = `orb|face`, `corner`). With none, nothing runs and no file
@@ -351,7 +352,7 @@ reply and is spoken, unless it repeats a turn that ended on a poll (`TurnOutcome
 permission prompt with no turn running marks needs-you. A session working on its own refuses a turn
 (`TurnOutcome::Busy`, "It's still running a background task."). The child gets the daemon's env minus
 `claude::PARENT_SESSION_VARS` and `WHISRS_*`. Only stored ids are ever passed to `claude`.
-A process-per-turn harness (OpenCode, Codex) implements `process::TurnHarness` only (`label`, `launch`
+A process-per-turn harness (OpenCode, Codex, Copilot) implements `process::TurnHarness` only (`label`, `launch`
 -> `Launch` {args, stdin, env, session: an id it names up front}, `strips_env`, `events`: one stdout
 line -> `StreamEvent`s Session / Text {message} / Tool / Error, `stderr_failure`: a failure it
 recognizes in stderr, else `None`); `process::ProcessDriver` does the rest: spawn from a thread that
@@ -365,8 +366,9 @@ agent working in it) or sees the stop (then stops the process itself, `stop_deta
 `STDOUT_LINE_MAX`, `STDERR_LINE_MAX`), the outcome (an Error event fails, else the reply, else stderr),
 `--stop` (SIGINT, SIGTERM, SIGKILL to the group, every process of the tree seen (`Tree`, so a `setsid`
 child is reached) and the scope (`systemctl --user kill`), `STOP_GRACES`; a dropped turn is stopped
-too, `Registered`), `TurnScopes::sweep` (at startup, and awaited by every turn and rewatch: stops what a
-previous daemon's turns left in their scopes), `rewatch` = `process::cut_off` (the turn ended with the
+too, `Registered`), `TurnScopes::sweep` (at startup, also with no agents, `agent::sweep_without_agents`,
+and awaited by every turn and rewatch: stops anything a previous daemon's turns left in their scopes, a
+background job included), `rewatch` = `process::cut_off` (the turn ended with the
 old daemon). No hooks, always Idle between turns. Agent dirs are absolute (`agent::absolute_dir`).
 OpenCode: whisrs mints the `ses_` id (`opencode::new_session_id`), a turn of a new or pending session
 passes `--title whisrs-<name>` + `args` and prefixes the voice instruction to the prompt, `bypass` =
@@ -381,6 +383,17 @@ then `--skip-git-repo-check` (it ends a many-valued `-i` of `args`), all before 
 `item.started` of a tool -> Tool, `item.completed` agent_message -> Text (an empty one too: no reply),
 `turn.failed` -> Error (a 401 names `CODEX_API_KEY` when it is set); `RUST_LOG` and
 `codex::PARENT_SESSION_VARS` are stripped.
+Copilot (tested against a mock model only, offline BYOK; with a GitHub account every turn uses the
+user's premium requests): whisrs mints a UUID (`copilot::new_session_id`); a new or pending session
+passes `--session-id=<id>` (creates or continues), a confirmed one `--resume=<id>` (fails when Copilot
+lost it, `stderr_failure`); the prompt goes on stdin (no `-p`, nothing in `ps`); every turn passes the
+permission flags (`auto` = `--allow-all-tools`, `bypass` = `--yolo`, `ask` = `--deny-tool=shell
+--deny-tool=write`) and `args`; the voice instruction is a file under `<data>/whisrs/copilot/<name>/`
+(`.github/instructions/whisrs-voice.instructions.md`) whose dir is appended to
+`COPILOT_CUSTOM_INSTRUCTIONS_DIRS` every turn (lands in the system prompt, never in history);
+`assistant.message` -> Text (+ Tool of its first `toolRequests` entry: the interim at once; a sub-agent's
+skipped), `tool.execution_start` -> Tool, `session.error` and `abort` -> Error (an interrupt exits 0),
+`result` -> Session; `copilot::PARENT_SESSION_VARS` (with `COPILOT_ALLOW_ALL`) are stripped.
 `DaemonContext::state_tx` is a `StateBus` (`context.rs`), sent only by `publish(&ds)`: `raw` (the state
 machine: hooks, the reply queue), `ui` (Idle while the voice is an agent's, `DaemonState::agent_voice`:
 tray, pill, GNOME pill) and `voice` (which agent, for the board). The runtime's board channel

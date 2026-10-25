@@ -128,7 +128,8 @@ pub fn feedback_delta(feedback: Feedback) -> &'static str {
 
 /// The activity label for a tool, by its name as the harness reports it
 /// (case-insensitive): Claude Code's tools, the phase 2 harnesses' (Codex,
-/// OpenCode), and `mcp__<server>__<tool>` through [`activity_for_mcp`].
+/// OpenCode, Copilot), and `mcp__<server>__<tool>` through
+/// [`activity_for_mcp`].
 /// [`WORKING`] for anything else.
 pub fn activity_for_tool(name: &str) -> String {
     let name = name.trim();
@@ -137,15 +138,17 @@ pub fn activity_for_tool(name: &str) -> String {
         return activity_for_mcp(server, tool);
     }
     let label = match name.to_ascii_lowercase().as_str() {
-        "bash" | "shell" | "command_execution" => "Running a command",
-        "read" => "Reading files",
-        "edit" | "multiedit" | "notebookedit" | "write" | "apply_patch" | "file_change" => {
-            "Editing files"
-        }
+        "bash" | "shell" | "command_execution" | "read_bash" | "write_bash" | "stop_bash"
+        | "list_bash" => "Running a command",
+        "read" | "view" => "Reading files",
+        "edit" | "multiedit" | "notebookedit" | "write" | "apply_patch" | "file_change"
+        | "create" => "Editing files",
         "grep" | "glob" => "Searching the code",
-        "webfetch" => "Reading a web page",
+        "webfetch" | "web_fetch" => "Reading a web page",
         "websearch" | "web_search" => "Searching the web",
-        "task" | "agent" | "collab_tool_call" => "Working with a helper",
+        "task" | "agent" | "collab_tool_call" | "read_agent" | "list_agents" | "write_agent" => {
+            "Working with a helper"
+        }
         "todowrite" | "todo_list" => "Planning",
         _ => WORKING,
     };
@@ -384,6 +387,17 @@ mod tests {
             ("collab_tool_call", "Working with a helper"),
             ("webfetch", "Reading a web page"),
             ("todowrite", "Planning"),
+            // Copilot's (1.0.103).
+            ("view", "Reading files"),
+            ("create", "Editing files"),
+            ("read_bash", "Running a command"),
+            ("write_bash", "Running a command"),
+            ("stop_bash", "Running a command"),
+            ("list_bash", "Running a command"),
+            ("web_fetch", "Reading a web page"),
+            ("read_agent", "Working with a helper"),
+            ("write_agent", "Working with a helper"),
+            ("list_agents", "Working with a helper"),
         ] {
             assert_eq!(activity_for_tool(tool), label, "{tool}");
         }

@@ -425,19 +425,20 @@ response_format = "wav"     # audio format requested from the API
 # new_session_hotkey = "Super+Shift+N"  # optional: records a voice turn that starts a
 #                                #   fresh session (whisrs agent <name> --new)
 # harness = "claude"             # claude (Claude Code, default) | opencode (OpenCode 2) |
-#                                #   codex (Codex CLI)
+#                                #   codex (Codex CLI) | copilot (GitHub Copilot CLI)
 # dir = "~/Projects/whisrs"      # required: the project the agent works in; must exist (a
 #                                #   relative path is taken from whisrsd's working directory)
 # permissions = "auto"           # auto (default) | bypass | ask
-# command = "claude"             # optional: the binary (default: claude, opencode or codex
-#                                #   on PATH). Set its full path when the daemon's PATH lacks
+# command = "claude"             # optional: the binary (default: claude, opencode, codex or
+#                                #   copilot on PATH). Set its full path when the daemon's PATH lacks
 #                                #   it (a systemd user service often has no ~/.local/bin)
 # args = ["--model", "sonnet"]   # optional: extra arguments for the first turn of a session
-#                                #   (Codex: for every turn)
+#                                #   (Codex and Copilot: for every turn)
 # reply_instruction = "..."      # optional: replaces the built-in voice instruction
 #                                #   (after the restart, reply_instruction applies from the
-#                                #   next new session, whisrs agent <name> --new; so do args,
-#                                #   except with Codex, which takes them on every turn; and
+#                                #   next new session, whisrs agent <name> --new, except with
+#                                #   Copilot, which reads it on every turn; so do args, except
+#                                #   with Codex and Copilot, which take them on every turn; and
 #                                #   with Claude Code, permissions too)
 # feedback = "brief"             # optional: what the agent says while it works. summary
 #                                #   (the reply only) | brief (default: a short
@@ -618,7 +619,8 @@ everything whisrs types, pastes or copies, wherever it is going.
 
 Agent mode lets you talk to a coding agent. Press an agent's hotkey (or run
 `whisrs agent <name>`), say what you want, and press again. whisrs sends the
-words to a Claude Code, OpenCode or Codex session working in that agent's `dir`, and
+words to a Claude Code, OpenCode, Codex or GitHub Copilot CLI session working in that
+agent's `dir`, and
 when the turn ends it speaks a short reply. The next press continues the same
 session, so you can answer the question the agent asked or make the decision
 it needs.
@@ -645,6 +647,12 @@ name = "cx"
 harness = "codex"
 hotkey = "Super+Shift+C"
 dir = "~/Projects/api"
+
+[[agents]]
+name = "pilot"
+harness = "copilot"
+hotkey = "Super+Shift+P"
+dir = "~/Projects/docs"
 ```
 
 ```
@@ -652,7 +660,8 @@ whisrs agent                       # list the agents: name, harness, idle | work
                                    #   the id of each session: Claude Code's background id (what
                                    #   claude attach <id> takes), OpenCode's session id (what
                                    #   opencode --session <id> takes), Codex's thread id (what
-                                   #   codex resume <id> takes)
+                                   #   codex resume <id> takes), Copilot's session id (what
+                                   #   copilot --resume=<id> takes)
 whisrs agent jarvis                # record a voice turn (same as the hotkey; press again to stop)
 whisrs agent jarvis --text "..."   # send a typed turn (`--text -` reads stdin)
 whisrs agent jarvis --new          # record a voice turn that starts a fresh session (same as
@@ -676,6 +685,11 @@ What you need:
 - Or, for `harness = "codex"`: the Codex CLI (`codex`), signed in with
   `codex login` (a ChatGPT plan or an API key). Tested on 0.164.0 against a
   local mock model, not a real account. See "Codex" below.
+- Or, for `harness = "copilot"`: the GitHub Copilot CLI (`copilot`), signed in
+  with `copilot login`, or with a model provider of your own (Copilot's BYOK
+  mode). With a GitHub account, every turn uses your Copilot premium requests,
+  as Copilot bills them. Tested on 1.0.103 against a local mock model only,
+  never with a GitHub account. See "GitHub Copilot" below.
 - `[tts] enabled = true` to hear the replies. Without it they arrive as
   notifications only, and `whisrsd` warns at startup.
 - `whisrs restart` after adding or changing an `[[agents]]` entry: the daemon
@@ -716,7 +730,7 @@ How a turn goes:
   transcript starts a new session instead of continuing the old one. Press
   either key again (or run `--new` again) to stop and send; the press that
   started the recording decides. The old session is forgotten only once there
-  is something to send, and stays in Claude Code, OpenCode or Codex. `--new --text "..."` does
+  is something to send, and stays in Claude Code, OpenCode, Codex or Copilot. `--new --text "..."` does
   the same with typed text, and `--reset` only forgets the session. Both are
   refused while a turn of that agent runs: stop it first with `--stop`. While
   that turn waits for you, the refusal says what it waits for ("Waiting for
@@ -769,8 +783,9 @@ drop the ones still queued. A change to `feedback` needs `whisrs restart`
 first, like any `[[agents]]` change. A lower level then applies from the
 restart, since whisrs filters what it speaks. A higher one also needs a fresh
 session (`whisrs agent <name> --new`): like `reply_instruction`, the request
-is fixed when a session starts. An unknown value gets a warning at startup and
-means `brief`.
+is fixed when a session starts (with Copilot, both apply from the next turn:
+whisrs gives Copilot the instruction on every turn). An unknown value gets a
+warning at startup and means `brief`.
 
 The agent overlay. With an `[[agents]]` entry, whisrs shows a row for each
 agent at work in a screen corner, bottom right by default, apart from the
@@ -821,8 +836,9 @@ for how long.
   not on screen, the "Speak to 'jarvis'..." and "Sending to 'jarvis'..."
   notifications stand in for it (with `[general] notify` on).
 
-With Claude Code, `permissions` maps to its permission modes (OpenCode's and
-Codex's mappings are under "OpenCode" and "Codex" below):
+With Claude Code, `permissions` maps to its permission modes (OpenCode's,
+Codex's and Copilot's mappings are under "OpenCode", "Codex" and "GitHub
+Copilot" below):
 
 | `permissions` | Claude Code |
 |---|---|
@@ -985,10 +1001,13 @@ tool call in its history.
 
 A daemon restart during a turn ends that turn: whisrs has the kernel interrupt
 `opencode run` (SIGINT) when the daemon exits or is killed, and when the
-daemon starts again it stops whatever that turn left in its scope (a process
-that ignored the SIGINT) before it runs any turn. The scope is not part of
-`whisrs.service`, so such a process outlives a stopped service until whisrsd
-starts again. The restarted daemon says "whisrs restarted during that turn,
+daemon starts again it stops anything an earlier turn left in its scope, a
+background job included (a process that ignored the SIGINT, or one a turn
+that ended normally left running, a dev server started with `&` say), before
+it runs any turn, as a restart of `whisrs.service` stopping its own processes
+would. It does so even when you removed every `[[agents]]` entry since. The
+scope is not part of `whisrs.service`, so such a process outlives a stopped
+service until whisrsd starts again. The restarted daemon says "whisrs restarted during that turn,
 which stopped it before OpenCode replied." The session keeps what it did so
 far, and the next turn continues it. When the agent had not been seen at work
 in the session yet, it says instead that the turn may not have reached
@@ -1100,9 +1119,9 @@ mount points, which Codex does not remove when it is interrupted (measured).
 Delete them if they are in the way.
 
 A daemon restart during a turn ends that turn, as with OpenCode (the restarted
-daemon stops whatever the turn left in its scope first), and the restarted
-daemon says "whisrs restarted during that turn, which stopped it before Codex
-replied." The session keeps what it did so far, and the next turn continues
+daemon stops anything an earlier turn left in its scope first, a background
+job included), and the restarted daemon says "whisrs restarted during that
+turn, which stopped it before Codex replied." The session keeps what it did so far, and the next turn continues
 it.
 
 `codex` runs in the agent's `dir`, with `PWD` set to it, and the daemon's
@@ -1114,6 +1133,119 @@ what a parent Codex session sets for the commands it runs (`CODEX_THREAD_ID`,
 which Codex would take as its own and print its logs at) and whisrs's own
 `WHISRS_*` keys. Everything else is passed on, Codex's own settings included
 (`CODEX_HOME`, `CODEX_API_KEY`).
+
+### GitHub Copilot
+
+With `harness = "copilot"`, each turn is one `copilot` process (the GitHub
+Copilot CLI in its prompt mode), which ends with the turn. This was tested on
+Copilot CLI 1.0.103 against a local mock model only (Copilot's offline mode
+with a model provider of its own, `COPILOT_OFFLINE=true` and
+`COPILOT_PROVIDER_BASE_URL`), never with a GitHub account. The first turn
+starts a session, every later one resumes it:
+
+```
+copilot --output-format json --session-id=<id> <permissions> [<args>]
+copilot --output-format json --resume=<id> <permissions> [<args>]
+```
+
+The words go in on stdin, which Copilot's prompt mode reads when there is no
+`-p`, so they never show in the process list. `command` must be the `copilot`
+binary itself: `gh copilot` runs the same CLI, but cannot take these
+arguments as they are.
+
+Sessions. whisrs makes up the session id (a UUID) and starts the session with
+it. `whisrs agent` shows the whole id; `copilot --resume=<id>` opens the
+session in Copilot, which names it after its first words, as it does any
+session. Until a turn shows the agent at work in the session (a reply or a
+tool call), each turn passes `--session-id` again: it starts the session when
+Copilot never made it (a first turn you stopped at once, say) and continues
+it when it did. After that, whisrs resumes the session only by its id, never
+by a name. If Copilot no longer has it, the turn fails with "Copilot no longer
+has this agent's session" and `whisrs agent <name> --new` starts a new one.
+
+The voice instruction (the built-in one or your `reply_instruction`, with the
+request of your `feedback` level) goes to Copilot as a custom instructions
+file of whisrs's own,
+`~/.local/share/whisrs/copilot/<name>/.github/instructions/whisrs-voice.instructions.md`,
+whose directory whisrs adds to `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` on every
+turn, after any directories the daemon's environment already lists there.
+Copilot puts it into the system prompt of every request of the turn, so it
+never shows as your words, and nothing of it is kept in the session's history:
+opened in Copilot yourself, the session runs without it. whisrs writes the
+file before each turn, so after `whisrs restart` a changed `reply_instruction`
+or `feedback` applies from the next turn. `--no-custom-instructions` in `args`
+turns it off, with your own instruction files.
+
+`permissions` for Copilot:
+
+| `permissions` | Copilot |
+|---|---|
+| `auto` (default) | `--allow-all-tools`: commands and file changes in `dir` run without asking; a file outside `dir` and the temp directory, or a URL, still needs an approval, so it is refused |
+| `bypass` | `--yolo`: every tool, path and URL allowed |
+| `ask` | `--deny-tool=shell --deny-tool=write`: the agent reads and searches files; commands and file changes are refused, also when your Copilot settings or `args` allow them (a deny rule always wins, measured) |
+
+Nobody can answer Copilot's approval requests during a turn: prompt mode
+refuses what needs one, the agent is told so and goes on, and the reply
+usually says what it could not do. So a Copilot agent never shows needs-you,
+and a turn never waits for you. A tool from an MCP server keeps Copilot's own
+rules: one that needs an approval is refused. `COPILOT_ALLOW_ALL` in the
+daemon's environment is not passed on, so `permissions` decides.
+
+Which keys apply when: `permissions` and `args` are passed on every turn,
+since Copilot keeps neither between turns (an `--agent` given only on the
+first turn was gone on the next; a `--model` stays the session's either way;
+both measured). So after `whisrs restart` a change to either applies from the
+next turn. Leave `-p`, `--output-format`, `--session-id`, `--resume`, `--name`
+and `--trust-folder` out of `args`: whisrs passes the first ones itself, and
+Copilot refuses `--trust-folder` beside `--session-id` and `--resume`, and
+`--name` beside a session it already has (measured).
+
+Billing. With a GitHub account, every turn uses your Copilot premium requests
+(AI credits on Copilot's newer billing), counted by Copilot's own billing as
+the same prompt typed into Copilot would be. Copilot uses the sign-in it
+already has: `copilot login`, or a token in `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`
+or `GITHUB_TOKEN`, which whisrs passes on (a `GITHUB_TOKEN` meant for
+something else then wins over your sign-in). With a model provider of your own
+(`COPILOT_PROVIDER_BASE_URL` and the other `COPILOT_PROVIDER_*` variables in
+the daemon's environment), no GitHub sign-in is used. When Copilot is not
+signed in, the turn fails with "Copilot is not signed in to GitHub": run
+`copilot login` in a terminal. A provider that refuses its key, or that does
+not answer, fails the turn with Copilot's own message ("Authentication failed
+with provider at ...", "Could not connect to local model provider at ...").
+
+What you hear and see works as with Claude Code, with two differences.
+Copilot reports a tool call when it starts, so the overlay's activity line,
+and the acknowledgement the agent wrote before its first tool call, come as
+soon as the call begins. And between turns no Copilot process runs: a session
+never works on its own, and a new turn is never refused for that.
+
+`--stop` interrupts the turn as with OpenCode (in the turn's own systemd
+scope): whisrs sends `copilot` SIGINT, then SIGTERM and SIGKILL to whatever of
+the turn is still running a few seconds later, and returns once all of it is
+gone. Copilot ends the command it runs with it. That command runs in a session
+of its own and would outlive a SIGKILL of Copilot's process group; the scope
+reaches it (measured: no process left after a `--stop` during a command). The
+session keeps what it did; the next turn continues it. A turn something else
+interrupts fails with "it was interrupted before it replied" (Copilot itself
+reports such a turn as a success).
+
+A daemon restart during a turn ends that turn, as with OpenCode (the restarted
+daemon stops anything an earlier turn left in its scope first, a background
+job included), and the restarted daemon says "whisrs restarted during that
+turn, which stopped it before Copilot replied." The session keeps what it did so far, and the next
+turn continues it.
+
+`copilot` runs in the agent's `dir`, with `PWD` set to it, and the daemon's
+environment minus what a parent Claude Code session sets (the list above),
+what a parent Copilot session sets for the commands it runs (`COPILOT_CLI`,
+`COPILOT_AGENT_SESSION_ID`, `COPILOT_CLI_BINARY_VERSION`,
+`COPILOT_CLI_RESOLVED_DIST_DIR`, `COPILOT_LOADER_PID`), `COPILOT_ALLOW_ALL`
+and whisrs's own `WHISRS_*` keys. Everything else is passed on, Copilot's own
+settings included (`COPILOT_HOME`, the tokens, `COPILOT_OFFLINE`,
+`COPILOT_MODEL`, the `COPILOT_PROVIDER_*` variables). The `GIT_*` variables a
+parent Copilot session sets pass too: Copilot sets them again for its own
+commands. Copilot updates itself by default, so what it prints can change
+without a whisrs release: whisrs reads the output of 1.0.103.
 
 ## Choosing the microphone
 

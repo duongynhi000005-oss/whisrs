@@ -271,7 +271,7 @@ If the LLM call fails, times out, or returns nothing, the raw transcript is type
 
 ### Voice + coding agent
 
-An `[[agents]]` entry gives a coding agent its own hotkey. Press it, say what you want, press again: whisrs sends it to a Claude Code background session (or, with `harness = "opencode"`, an OpenCode session; with `harness = "codex"`, a Codex CLI session, tested against a local mock model only) in the agent's directory and goes back to dictation. When the turn ends, you hear a short spoken reply (through `[tts]`), and the next press continues the same session, so answering the agent's question is one press. Press it while a reply plays to cut in; while that agent is still working, a press only silences its own reply.
+An `[[agents]]` entry gives a coding agent its own hotkey. Press it, say what you want, press again: whisrs sends it to a Claude Code background session (or, with `harness = "opencode"`, an OpenCode session; with `harness = "codex"`, a Codex CLI session; with `harness = "copilot"`, a GitHub Copilot CLI session, where each turn uses your Copilot premium requests; Codex and Copilot were tested against a local mock model only) in the agent's directory and goes back to dictation. When the turn ends, you hear a short spoken reply (through `[tts]`), and the next press continues the same session, so answering the agent's question is one press. Press it while a reply plays to cut in; while that agent is still working, a press only silences its own reply.
 
 ```toml
 [[agents]]
@@ -284,7 +284,7 @@ feedback = "brief"     # summary | brief | conversational
 
 While it works, a small overlay in a screen corner (`[agent_overlay]`, an orb or a face) shows each agent listening, working, waiting for your approval or speaking, with what it does ("Running a command") and for how long. `feedback` sets what you hear before the reply: nothing (`summary`), a short "On it." (`brief`, the default), or that and short updates at milestones (`conversational`).
 
-`whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn, and `whisrs agent jarvis --new` (or an optional `new_session_hotkey`) records one that starts a fresh session. Sessions are named `whisrs-<name>` (in `claude agents`, or OpenCode's session list; Codex's are known by their thread id, which `whisrs agent` shows), and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
+`whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn, and `whisrs agent jarvis --new` (or an optional `new_session_hotkey`) records one that starts a fresh session. Sessions are named `whisrs-<name>` (in `claude agents`, or OpenCode's session list; Codex's and Copilot's are known by their id, which `whisrs agent` shows), and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
 
 ---
 

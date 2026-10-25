@@ -36,7 +36,8 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
   `auto`, and `ask` would not ask. OpenCode: `auto` → no flag, `bypass` → `--auto`, `ask` →
   shell and edit ask rules appended to `OPENCODE_CONFIG_CONTENT` (see "OpenCode driver").
   Codex: `auto` → `--approve-for-me`, `bypass` → `--dangerously-bypass-approvals-and-sandbox`,
-  `ask` → `--sandbox read-only` (see "Codex driver").
+  `ask` → `--sandbox read-only` (see "Codex driver"). Copilot: `auto` → `--allow-all-tools`,
+  `bypass` → `--yolo`, `ask` → `--deny-tool=shell --deny-tool=write` (see "Copilot driver").
 - `[[agents]]` (and `[agent_overlay]`) is read once, when the daemon starts
   (`AgentRuntime::new`): any change needs `whisrs restart` first.
 - `permissions`, `args` and `reply_instruction` are fixed when a session starts (a resume
@@ -44,7 +45,9 @@ corner = "bottom-right"          # bottom-right (default) | bottom-left | top-ri
   OpenCode passes `permissions` on every turn (`run` keeps none), so a change applies from the
   next turn after the restart; `args` and the instruction are fixed at session start there too.
   Codex passes `permissions` and `args` on every turn (`exec resume` keeps neither, measured);
-  the instruction is fixed at session start there too.
+  the instruction is fixed at session start there too. Copilot passes `permissions`, `args` and
+  the instruction on every turn (a resumed turn keeps none of them, measured), so all three
+  apply from the next turn after the restart.
 - `dir` is made absolute at load (`agent::absolute_dir`): `~` expanded, a relative path joined
   to the daemon's working directory, `.` dropped (`..` and symlinks kept). Every harness gets
   it; OpenCode takes its directory from `PWD`, which a relative dir would leave meaningless
@@ -455,7 +458,7 @@ Deviations from the plan, as built:
   a reply that lands after a daemon restart is still spoken. A changed `harness` or `dir`
   starts a fresh session.
 - Daemon shutdown leaves agent sessions running; they belong to the harness. A
-  process-per-turn turn (OpenCode, Codex) ends with the daemon (see "The process-per-turn
+  process-per-turn turn (OpenCode, Codex, Copilot) ends with the daemon (see "The process-per-turn
   base"); its session stays, and the next turn continues it.
 
 ## Layout
@@ -468,6 +471,7 @@ src/agent/claude_tail.rs  # transcript tail: activities and interims
 src/agent/process.rs    # process-per-turn base: ProcessDriver<H: TurnHarness>, StreamState, stop
 src/agent/opencode.rs   # OpenCode driver (a TurnHarness)
 src/agent/codex.rs      # Codex driver (a TurnHarness)
+src/agent/copilot.rs    # GitHub Copilot CLI driver (a TurnHarness)
 src/agent/progress.rs   # feedback levels, instruction deltas, labels, tracker, gate (pure)
 src/agent/display.rs    # the agent overlay's Board and rows (pure)
 src/agent/store.rs      # agents.json
@@ -487,7 +491,7 @@ from its JSON output (`kill_on_drop`). Adding one must not change the runtime.
 
 - OpenCode: built, see "OpenCode driver".
 - Codex: built, see "Codex driver".
-- GitHub Copilot CLI: `copilot -p ... --output-format json`, on the same base.
+- GitHub Copilot CLI: built, see "Copilot driver".
 - Each follows its own documentation; contracts are collected before phase 2 starts.
 
 ### The process-per-turn base (`src/agent/process.rs`)
@@ -522,7 +526,7 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
   unwritten and stops the process itself with the whole escalation (`stop_detached`), as it does
   for a process whose turn was dropped while it spawned. It stays registered until it is gone,
   so the next turn waits for it.
-- **Session:** a session the launch names (`Launch::session`, OpenCode's minted id) that the
+- **Session:** a session the launch names (`Launch::session`, OpenCode's or Copilot's minted id) that the
   agent does not have yet is reported at spawn with `pending = true` (`SessionRef::pending`,
   persisted), so a turn stopped or cut off before its first line keeps it; the first `Text` or
   `Tool` of a turn confirms it (reported with `pending = false`). An id the output names that
@@ -530,7 +534,9 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
   reports the agent's old session back.
 - **Output:** stdout lines go through `events` into `StreamState`: `Tool` sends `Activity`
   (deduplicated) and releases the text before it through `InterimTracker`; the reply is the text
-  parts of the last message, joined (an empty last message is no reply). Stderr keeps its last 40
+  parts of the last message, joined (an empty last message is no reply, and so is a skipped
+  over-long stdout line after the last text: it may have been the final message, and the text
+  before it, often the acknowledgement spoken already, is never the reply). Stderr keeps its last 40
   lines. A line is read through a capped reader (`LineReader`, cancel safe like `read_until`):
   a stdout line over 1 MiB (`STDOUT_LINE_MAX`) is skipped, a stderr line over 8 KiB
   (`STDERR_LINE_MAX`) keeps its start, each with one warning per turn; neither is ever buffered
@@ -556,8 +562,12 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
   scope, a process whose parent exited before any walk saw it is out of reach.
 - **Restart:** the scope is outside the daemon's cgroup (`whisrs.service`'s, under systemd), so
   a stopped or restarted daemon no longer takes the turn along: PDEATHSIG interrupts the
-  harness, and `TurnScopes::sweep` stops what a turn left in its scope (a process that ignored
-  that SIGINT) when the next daemon starts: `systemctl --user list-units --all --plain
+  harness, and `TurnScopes::sweep` stops anything an earlier turn left in its scope, a
+  background job included (a process that ignored that SIGINT, or one a turn that ended
+  normally left running, as `nohup npm run dev &`), when the next daemon starts, as the old
+  service-cgroup kill on restart did. A daemon with no agents sweeps too
+  (`agent::sweep_without_agents`, one `systemctl` listing), so a turn left by a daemon that died
+  before `[[agents]]` was emptied does not run forever: `systemctl --user list-units --all --plain
   --type=scope 'whisrs-agent-<instance>-*'`, then the same escalation on each scope still
   running (`Scope::stop_leftover`). Spawned by `start_background`, run once (`OnceCell`), and
   awaited by every turn and rewatch before they spawn anything. Measured with a fake harness
@@ -576,6 +586,9 @@ lines, such as a session it no longer has, else `None`). `ProcessDriver<H>` is t
 - Between turns nothing runs: `session_phase(s)` is Idle, no hooks (`hook_matches` false,
   `idle_event` ignored), `forget` has nothing to drop. No needs-you: none of the three harnesses
   waits on an approval headless.
+- A stop that lands while the process is being started (before it is registered) finds nothing
+  for `--stop` to wait for, which returns at once; the spawning thread sees the stop and stops
+  the process in the background, and the agent's next turn waits for that.
 
 ### OpenCode driver (verified on 2.0.29)
 
@@ -707,6 +720,94 @@ points at a scripted Responses API server; no account and no real model.
   and `RUST_LOG` (Codex reads it and logs to stderr at whisrsd's level, measured). `CODEX_HOME`
   and `CODEX_API_KEY` pass; the latter beats a ChatGPT sign-in, which the docs say.
 - **List:** the whole thread id, what `codex resume <id>` takes.
+
+### Copilot driver (verified on 1.0.103 against a local mock model)
+
+Tested with the npm-packed `@github/copilot-linux-x64` 1.0.103 in offline BYOK mode
+(`COPILOT_OFFLINE=true`, `COPILOT_PROVIDER_BASE_URL` = a scripted chat-completions server), through a
+wrapper that also isolated `COPILOT_HOME`/`HOME`, emptied every GitHub token and config dir, made the
+keyring unreachable and sent any other request to a refusing local proxy: no account, no GitHub
+request (the proxy logged none), `premiumRequests: 0` on every run. With a GitHub account each turn
+uses the user's Copilot premium requests (AI credits), per Copilot's own billing.
+
+- **Every turn:** `copilot --output-format json --session-id=<id> <permissions> [args…]` for a new
+  or pending session, `--resume=<id>` in its place once confirmed, the prompt on stdin: prompt mode
+  reads stdin when there is no `-p` (verbatim, a leading `--`, `$HOME` and quotes as typed,
+  measured), so the user's words are never in argv (`ps`). With `/dev/null` it exits 1 "No prompt
+  provided". `--resume` and `--session-id` take `=`, since `--resume [<value>]` has an optional value.
+- **Session id:** whisrs mints a version 4 UUID (`copilot::new_session_id`) and reports it at spawn,
+  pending (see the base). `--session-id=<id>` starts a session with an id Copilot does not have and
+  continues one it has (measured), so a pending session passes it again: a first turn stopped
+  before Copilot made the session starts it, one that failed after continues it. `--resume=<id>`
+  fails on a session Copilot does not have (stderr `No session, task, or name matched`, exit 1,
+  `stderr_failure` → "Copilot no longer has this agent's session ... `--new`"), which is why a
+  confirmed session uses it: never an empty session under the old id. Only a UUID is resumed
+  (`--resume` also matches prefixes and names). `result.sessionId` names the session too.
+  `--name` was not used: Copilot refuses it beside `--resume` and beside a `--session-id` it
+  already has, which a pending retry may be (measured); a session is named after its first words.
+  `--trust-folder` is refused beside either flag (measured), so it cannot be in `args`.
+- **On every turn:** the permission flags and `args`: an `--agent` of turn 1 is gone on a resumed
+  turn (contract 3.4), a `--model` stays the session's either way (measured), and permissions are
+  per run.
+- **Instruction:** `<data>/whisrs/copilot/<agent>/.github/instructions/whisrs-voice.instructions.md`
+  (front matter `applyTo: "**"`, shown to the model as it is; 1.0.103 loads the file without it as
+  well), written when it differs (`Copilot::write_instruction`, via a `.partial` rename), and its
+  directory appended to `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` after the daemon's own entries on every
+  turn (a path with a comma fails the turn). Measured: it lands in the system prompt, once per
+  request, on a first and on a resumed turn, never in a user message; a turn without the variable
+  has none; Copilot keeps only its system-prompt snapshot (`system.message` in its own
+  `events.jsonl`), nothing in the conversation, so the user's own `copilot --resume` runs without
+  it. An `AGENTS.md` or `copilot-instructions.md` in that directory is not loaded. Rejected:
+  `--agent whisrs` (needs a file in the user's `~/.copilot/agents/`), prefixing the first prompt
+  (shows as the user's words, summarized away by a compaction). A changed instruction applies from
+  the next turn. `--no-custom-instructions` in `args` turns it off.
+- **Permissions:** prompt mode never asks: a tool that needs an approval is denied (`code:
+  "denied"`, "no interactive user response was available") and the model goes on, exit 0. Measured
+  per mode with a shell call, a file create, a read in the dir and a read of `/etc/hostname`: no
+  flags = shell and create denied, the read allowed, outside denied; `ask` = `--deny-tool=shell
+  --deny-tool=write` = the same, by rule ("denied due to the following rules: `shell`"), and a deny
+  rule wins over `--allow-all-tools` (so over the user's own allows too); `auto` =
+  `--allow-all-tools` = shell and create run, outside still denied (URLs too); `bypass` = `--yolo` =
+  everything. `ask` matches OpenCode's and Codex's: reads, no commands, no changes.
+- **Events:** `assistant.message` (not a sub-agent's: `data.parentToolCallId`) → `Text {
+  data.messageId, data.content }` (an empty one too, so an empty last message is no reply), and,
+  when it has `toolRequests`, `Tool(<first request>)` right after it, so a text written with a tool
+  call is an interim at once; `tool.execution_start` → `Tool(data.toolName)` (MCP:
+  `mcp__<mcpServerName>__<mcpToolName>`), deduplicated by the base; `session.error` →
+  `Error(data.message)` (a `remediation: "sign_in"` error gets "Run `copilot login` in a terminal");
+  `abort` → `Error("it was interrupted before it replied")`, since an interrupted turn prints
+  `result` with `exitCode: 0` and exits 0; `result` → `Session(sessionId)`. Retries
+  (`model.call_failure`, `assistant.turn_retry`, `session.info`) say nothing; `session.error` is the
+  last word of a failed turn (exit 1). Errors measured: HTTP 400 (`"400 <provider message>"`), a
+  BYOK 401 ("Authentication failed with provider at ... Check your COPILOT_PROVIDER_API_KEY ..."),
+  a provider that is down ("Could not connect to local model provider at ..."), all kept as
+  Copilot's words. Not signed in (stderr "Error: No authentication information found.", exit 1)
+  was not run, since it needs Copilot without BYOK: the text is 1.0.103's `cli-main.js`;
+  `stderr_failure` turns it into "Copilot is not signed in to GitHub. Run `copilot login` ...".
+- **Activities:** Copilot's tools (`bash` and its `read_bash`/`write_bash`/`stop_bash`/`list_bash`,
+  `view`, `create`, `edit`, `grep`, `glob`, `web_fetch`, `task` and its `read_agent`/`write_agent`/
+  `list_agents`) are mapped in `activity_for_tool`; `sql` (its todo table and more) reads "Working".
+- **Stop:** SIGINT interrupts the turn (`abort`, `result`, exit 0) and Copilot ends the tool's shell.
+  The shell runs in a session of its own and survives a SIGKILL of Copilot's group (contract 3.6), which the
+  scope and the tree reach. Measured through whisrs: `--stop` during a shell `sleep` returned in
+  87 ms with no `copilot` or `sleep` process and no scope left; a SIGTERM or SIGKILL of the daemon
+  mid-turn left none either, the restarted daemon said "whisrs restarted during that turn, which
+  stopped it before Copilot replied", and the next turn continued the session (the model saw every
+  earlier turn).
+- **Environment:** besides the base's stripping, `COPILOT_ALLOW_ALL` (truthy approves every tool;
+  exactly `true` also trusts the folder and runs its hooks) and what a parent Copilot session sets in
+  its tool shells: `COPILOT_CLI`, `COPILOT_AGENT_SESSION_ID`, `COPILOT_CLI_BINARY_VERSION`,
+  `COPILOT_CLI_RESOLVED_DIST_DIR`, `COPILOT_LOADER_PID` (measured on 1.0.103; an inherited
+  `COPILOT_LOADER_PID` reached the tools unchanged). Its `GIT_*` (`GIT_ASKPASS`, `GIT_EDITOR`,
+  `GIT_TERMINAL_PROMPT`, `GIT_OPTIONAL_LOCKS`, `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`) pass: Copilot
+  sets them again for its tools (an inherited `GIT_CONFIG_COUNT` is appended to, measured), and a
+  user's own `GIT_CONFIG_*` would go with them. `COPILOT_HOME`, the tokens (`COPILOT_GITHUB_TOKEN` >
+  `GH_TOKEN` > `GITHUB_TOKEN` > the stored login), `COPILOT_OFFLINE`, `COPILOT_MODEL` and
+  `COPILOT_PROVIDER_*` pass. `RUST_LOG` changes nothing in Copilot's output (measured), so it passes.
+- **Not done:** `--no-auto-update` (it would run an older Copilot than the user's own; the JSON shape
+  can change with an update), `--no-ask-user` (prompt mode has no `ask_user` tool), `--acp` (the
+  route to voice approvals, "Later").
+- **List:** the whole session id, what `copilot --resume=<id>` takes.
 
 ## Later
 

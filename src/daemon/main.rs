@@ -328,9 +328,13 @@ async fn main() -> Result<()> {
 
     // Agent mode: the reply queue, the agent overlay's board, and the turns
     // a restart interrupted (watched again so their replies are still
-    // spoken). Only with agents.
+    // spoken). Only with agents. Without them, what an earlier daemon's
+    // turns left in their scopes is still stopped (it died mid-turn, then
+    // `[[agents]]` was emptied).
     if context.agents.is_enabled() {
         crate::agent::start_background(Arc::clone(&context), Arc::clone(&daemon_state)).await;
+    } else {
+        crate::agent::sweep_without_agents();
     }
 
     // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both remove the

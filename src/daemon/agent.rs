@@ -44,6 +44,7 @@ use tracing::{debug, error, info, warn};
 
 use whisrs::agent::claude::ClaudeDriver;
 use whisrs::agent::codex::Codex;
+use whisrs::agent::copilot::Copilot;
 use whisrs::agent::display::{AgentVisual, Board};
 use whisrs::agent::opencode::OpenCode;
 use whisrs::agent::process::{ProcessDriver, TurnScopes};
@@ -448,6 +449,13 @@ impl AgentRuntime {
         drivers.insert(
             Harness::Codex,
             Arc::new(ProcessDriver::new(Codex, Arc::clone(&scopes))),
+        );
+        drivers.insert(
+            Harness::Copilot,
+            Arc::new(ProcessDriver::new(
+                Copilot::beside_store(&store_path),
+                Arc::clone(&scopes),
+            )),
         );
         let (board_tx, board_rx) = mpsc::unbounded_channel();
         Self {
@@ -859,7 +867,7 @@ impl AgentRuntime {
         let record = inner.store.agents.get(&agent.name);
         // Short beside a bg id (what Claude Code's commands take); whole
         // otherwise, as the harness takes it (`opencode --session <id>`,
-        // `codex resume <id>`).
+        // `codex resume <id>`, `copilot --resume=<id>`).
         let session = record.and_then(|r| {
             let id = r.session_id.as_deref()?;
             Some(match r.bg_id {
@@ -1106,6 +1114,14 @@ fn record_mut<'a>(inner: &'a mut Inner, agent: &Agent) -> &'a mut AgentRecord {
 // Startup
 // ---------------------------------------------------------------------------
 
+/// What a daemon with no agents runs at startup: it still stops anything a
+/// previous daemon's turns left in their scopes (that daemon died mid-turn,
+/// and `[[agents]]` was emptied before this start), a background job
+/// included. One `systemctl --user list-units` call when nothing is left.
+pub(crate) fn sweep_without_agents() {
+    tokio::spawn(async { TurnScopes::new(&store::store_path()).sweep().await });
+}
+
 /// Start the reply queue and the agent overlay's board, and watch again the
 /// turns a restart interrupted. Called once, only with agents configured.
 pub(crate) async fn start_background(
@@ -1127,9 +1143,10 @@ pub(crate) async fn start_background(
         tokio::spawn(idle_loop(Arc::clone(&context)));
     }
 
-    // What a previous daemon's process-per-turn turns left in their scopes
-    // (a process that ignored the SIGINT its end sent), stopped before any
-    // turn of this daemon runs: every such turn waits for this.
+    // Anything a previous daemon's process-per-turn turns left in their
+    // scopes, a background job included (a process that ignored the SIGINT
+    // its end sent, or one a turn that ended normally left running), stopped
+    // before any turn of this daemon runs: every such turn waits for this.
     let scopes = Arc::clone(&context.agents.scopes);
     tokio::spawn(async move { scopes.sweep().await });
 
