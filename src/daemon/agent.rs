@@ -12,6 +12,18 @@
 //! running (a background command finished and the agent went on), is spoken
 //! the same way.
 //!
+//! While a turn runs, its driver reports what it does (an activity label
+//! for the agent overlay) and the messages a tool call followed: an
+//! acknowledgement or a progress update the agent wrote, spoken as the
+//! agent's `feedback` level allows ([`ProgressGate`]). They wait in the same
+//! FIFO under the same holds, but only for a while (they expire), never
+//! come back after a recording stopped them, and give way to the reply.
+//!
+//! The agent overlay's model ([`Board`]) is owned by one task
+//! ([`board_loop`]), fed by the turns, the reply queue and the agent the
+//! voice belongs to ([`crate::context::StateBus`]); it publishes the rows on
+//! `DaemonContext::agent_board`.
+//!
 //! The runtime is harness-neutral: it calls [`Driver`] and never names a
 //! harness outside [`AgentRuntime::new`].
 //!
@@ -29,6 +41,8 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use whisrs::agent::claude::ClaudeDriver;
+use whisrs::agent::display::{AgentVisual, Board};
+use whisrs::agent::progress::{InterimKind, ProgressGate};
 use whisrs::agent::spoken::same_reply;
 use whisrs::agent::store::{self, AgentRecord, AgentStore};
 use whisrs::agent::{
@@ -42,7 +56,7 @@ use whisrs::state::Action;
 use whisrs::{Config, Response, State};
 
 use crate::command_mode::{claim_session, collect_instruction_audio};
-use crate::context::{AgentRecordingContext, DaemonContext, DaemonState};
+use crate::context::{AgentRecordingContext, AgentVoice, DaemonContext, DaemonState};
 use crate::notify::{send_notification, send_notification_for, truncate_preview};
 use crate::pipeline::{
     format_api_error, format_no_microphone_error, transcribe_batch_audio, BatchOptions,
@@ -76,9 +90,30 @@ const WAITING_FOR_YOU: &str = "It's waiting for you.";
 /// `--reset`) is refused because the turn waits for you.
 const WAITING_HINT: &str = "A plain press answers it; to start fresh, stop it first:";
 
-/// The queue key of a needs-you notice spoken for a refused fresh-session
-/// press ([`Utterance::notice`]).
+/// The queue key of a needs-you notice ([`Utterance::notice`]), as announced
+/// and as spoken again for a refused fresh-session press: one at a time per
+/// agent, so a refusal while the announcement still waits (another agent's
+/// reply holds the queue) does not queue it twice.
 const WAITING_KEY: &str = "waiting-for-you";
+
+/// Now, on the runtime's clock: what interim expiries and the board's times
+/// are measured in. The same as `Instant::now()` outside a test that pauses
+/// the clock.
+fn now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+/// The `Instant` of a wall-clock time in the past (a turn's start read back
+/// from `agents.json` after a restart), on the runtime's clock. Now when it
+/// is not in the past.
+fn instant_at(at: chrono::DateTime<Utc>) -> Instant {
+    let now = now();
+    (Utc::now() - at)
+        .to_std()
+        .ok()
+        .and_then(|ago| now.checked_sub(ago))
+        .unwrap_or(now)
+}
 
 /// Whether an agent error was already notified where it happened: the
 /// busy refusals (a turn that waits for you included), and the refusal
@@ -154,6 +189,9 @@ struct RunningTurn {
     /// The newest session ids the turn reported, and its stop flag
     /// ([`TurnUpdates::stop`]).
     updates: TurnUpdates,
+    /// Which of the turn's interims are spoken, at the agent's `feedback`
+    /// level. Dies with the turn.
+    gate: ProgressGate,
 }
 
 /// What the runtime holds per agent at run time (the persisted part is the
@@ -215,6 +253,43 @@ struct Utterance {
     /// playing. `None` for replies and every other line, which are never
     /// deduplicated.
     notice: Option<&'static str>,
+    /// An acknowledgement or a progress update, and until when it is worth
+    /// saying. `None` for replies, errors and notices, which never expire.
+    interim: Option<Interim>,
+}
+
+/// What makes an utterance an interim ([`Utterance::interim`]): dropped
+/// once it expires, when its agent's reply arrives and on `whisrs cancel`,
+/// and never put back after a recording stopped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Interim {
+    kind: InterimKind,
+    expires: Instant,
+}
+
+/// What the runtime tells the agent overlay's board ([`board_loop`]). The
+/// voice comes from the state broadcast instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoardEvent {
+    /// A turn started at `since` (for one watched again after a restart,
+    /// when it first started).
+    TurnStarted { agent: String, since: Instant },
+    /// What the running turn does now.
+    Activity { agent: String, label: String },
+    /// The turn, or the session's own work, waits for a permission prompt.
+    NeedsYou { agent: String, at: Instant },
+    /// It runs again after a wait (or the wait ended with no turn running).
+    Working { agent: String },
+    /// The turn ended, with a reply (`ok`) or an error.
+    TurnEnded {
+        agent: String,
+        ok: bool,
+        at: Instant,
+    },
+    /// The agents with an utterance queued or playing.
+    Pending { agents: Vec<String>, at: Instant },
+    /// Forget what is shown for the agent (`--stop`, `--reset`).
+    Clear { agent: String },
 }
 
 /// Holds agent replies while it lives: a command-mode or `[[llm_commands]]`
@@ -255,6 +330,12 @@ pub(crate) struct AgentRuntime {
     /// `saved_seq`, so a write that lost the race to a newer one is skipped.
     save_seq: AtomicU64,
     saved_seq: Arc<std::sync::Mutex<u64>>,
+    /// Where the agent overlay's board is told what changed; its receiver
+    /// waits for the board task (`board_rx`). `None` without agents.
+    board_tx: Option<mpsc::UnboundedSender<BoardEvent>>,
+    board_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BoardEvent>>>,
+    /// The agents the board was last told have an utterance pending.
+    last_pending: std::sync::Mutex<Vec<String>>,
 }
 
 impl AgentRuntime {
@@ -309,6 +390,7 @@ impl AgentRuntime {
             Harness::Claude,
             Arc::new(ClaudeDriver::new(&whisrs, socket)),
         );
+        let (board_tx, board_rx) = mpsc::unbounded_channel();
         Self {
             agents: agents.into_iter().map(Arc::new).collect(),
             drivers,
@@ -327,6 +409,9 @@ impl AgentRuntime {
             daemon_state: OnceLock::new(),
             save_seq: AtomicU64::new(0),
             saved_seq: Arc::new(std::sync::Mutex::new(0)),
+            board_tx: Some(board_tx),
+            board_rx: std::sync::Mutex::new(Some(board_rx)),
+            last_pending: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -350,6 +435,9 @@ impl AgentRuntime {
             daemon_state: OnceLock::new(),
             save_seq: AtomicU64::new(0),
             saved_seq: Arc::new(std::sync::Mutex::new(0)),
+            board_tx: None,
+            board_rx: std::sync::Mutex::new(None),
+            last_pending: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -408,6 +496,22 @@ impl AgentRuntime {
             agent: agent.to_string(),
             text,
             notice: None,
+            interim: None,
+        });
+    }
+
+    /// Queue an interim line the agent's gate admitted as `kind` at `at`:
+    /// spoken under the same holds as a reply if it is still worth saying by
+    /// then ([`InterimKind::ttl`]). Never notified.
+    fn say_interim(&self, agent: &str, text: String, kind: InterimKind, at: Instant) {
+        self.enqueue(Utterance {
+            agent: agent.to_string(),
+            text,
+            notice: None,
+            interim: Some(Interim {
+                kind,
+                expires: at + kind.ttl(),
+            }),
         });
     }
 
@@ -426,6 +530,7 @@ impl AgentRuntime {
             agent: agent.to_string(),
             text: self.line_for(agent, text),
             notice: Some(key),
+            interim: None,
         });
     }
 
@@ -454,17 +559,71 @@ impl AgentRuntime {
             }
             queue.push_back(utterance);
         }
+        self.pending_changed();
         self.utterance_ready.notify_one();
     }
 
+    /// The next utterance to speak. An interim that expired while it waited
+    /// (a hold, a long reply before it) is dropped on the way.
     fn next_utterance(&self) -> Option<Utterance> {
-        self.utterances.lock().ok()?.pop_front()
+        let now = now();
+        let mut queue = self.utterances.lock().ok()?;
+        while let Some(utterance) = queue.pop_front() {
+            match utterance.interim {
+                Some(interim) if interim.expires <= now => info!(
+                    "agent '{}': {:?} expired before it could be spoken",
+                    utterance.agent, interim.kind
+                ),
+                _ => return Some(utterance),
+            }
+        }
+        None
     }
 
     fn requeue_front(&self, utterance: Utterance) {
         if let Ok(mut queue) = self.utterances.lock() {
             queue.push_front(utterance);
         }
+        self.pending_changed();
+    }
+
+    /// Tell the board ([`BoardEvent`]) when there is one.
+    fn board(&self, event: BoardEvent) {
+        if let Some(tx) = &self.board_tx {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// The board's receiver, for the one task that owns the board. `None`
+    /// without agents, or once taken.
+    fn take_board_events(&self) -> Option<mpsc::UnboundedReceiver<BoardEvent>> {
+        self.board_rx.lock().ok()?.take()
+    }
+
+    /// Tell the board which agents have an utterance queued or playing, when
+    /// that changed: a Done row holds while its agent's reply waits or
+    /// plays. Under `last_pending`, so two callers cannot send their views
+    /// out of order. Never called with the queue or `playing` locked.
+    fn pending_changed(&self) {
+        if self.board_tx.is_none() {
+            return;
+        }
+        let mut last = self.last_pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut agents: Vec<String> = self
+            .utterances
+            .lock()
+            .map(|q| q.iter().map(|u| u.agent.clone()).collect())
+            .unwrap_or_default();
+        if let Some(playing) = self.playing_agent() {
+            agents.push(playing);
+        }
+        agents.sort();
+        agents.dedup();
+        if *last == agents {
+            return;
+        }
+        *last = agents.clone();
+        self.board(BoardEvent::Pending { agents, at: now() });
     }
 
     /// Run `stop`, which stops an agent reply or notice being synthesized or
@@ -487,12 +646,21 @@ impl AgentRuntime {
         if !stop() {
             return false;
         }
-        if let Some(utterance) = playing {
-            info!(
-                "agent '{}': the reply plays again after the recording",
+        match playing {
+            // An acknowledgement or update is not worth saying after the
+            // recording: it is dropped.
+            Some(utterance) if utterance.interim.is_some() => info!(
+                "agent '{}': the recording cut off an interim; it is not said again",
                 utterance.agent
-            );
-            self.requeue_front(utterance);
+            ),
+            Some(utterance) => {
+                info!(
+                    "agent '{}': the reply plays again after the recording",
+                    utterance.agent
+                );
+                self.requeue_front(utterance);
+            }
+            None => {}
         }
         true
     }
@@ -509,6 +677,17 @@ impl AgentRuntime {
 
     fn set_playing(&self, utterance: Option<Utterance>) {
         *self.playing.lock().unwrap_or_else(|e| e.into_inner()) = utterance;
+        self.pending_changed();
+    }
+
+    /// The agent whose utterance is being spoken (`speak_text` records it
+    /// as the voice's owner).
+    pub(crate) fn playing_agent(&self) -> Option<String> {
+        self.playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|u| u.agent.clone())
     }
 
     /// Whether the utterance being spoken is `agent`'s (a reply or a notice).
@@ -539,7 +718,34 @@ impl AgentRuntime {
             .unwrap_or(0);
         if dropped > 0 {
             info!("agents: cancel dropped {dropped} queued reply(s)");
+            self.pending_changed();
         }
+    }
+
+    /// Drop every queued interim (`whisrs cancel`).
+    pub(crate) fn drop_interims(&self) {
+        let dropped = self.drop_interims_of(None);
+        if dropped > 0 {
+            info!("agents: cancel dropped {dropped} queued acknowledgement(s) or update(s)");
+        }
+    }
+
+    /// Drop the queued interims of `agent` (every agent's with `None`), and
+    /// return how many.
+    fn drop_interims_of(&self, agent: Option<&str>) -> usize {
+        let dropped = self
+            .utterances
+            .lock()
+            .map(|mut q| {
+                let before = q.len();
+                q.retain(|u| u.interim.is_none() || agent.is_some_and(|a| a != u.agent));
+                before - q.len()
+            })
+            .unwrap_or(0);
+        if dropped > 0 {
+            self.pending_changed();
+        }
+        dropped
     }
 
     /// The spoken line for a failed turn, naming the agent when there are
@@ -717,19 +923,25 @@ fn record_mut<'a>(inner: &'a mut Inner, agent: &Agent) -> &'a mut AgentRecord {
 // Startup
 // ---------------------------------------------------------------------------
 
-/// Start the reply queue and watch again the turns a restart interrupted.
-/// Called once, only with agents configured.
+/// Start the reply queue and the agent overlay's board, and watch again the
+/// turns a restart interrupted. Called once, only with agents configured.
 pub(crate) async fn start_background(
     context: Arc<DaemonContext>,
     daemon_state: Arc<Mutex<DaemonState>>,
-    state_rx: tokio::sync::watch::Receiver<State>,
 ) {
     let _ = context.agents.daemon_state.set(Arc::clone(&daemon_state));
     tokio::spawn(utterance_loop(
         Arc::clone(&context),
         Arc::clone(&daemon_state),
-        state_rx,
+        context.state_tx.subscribe_raw(),
     ));
+    if let Some(events) = context.agents.take_board_events() {
+        tokio::spawn(board_loop(
+            Arc::clone(&context),
+            events,
+            context.state_tx.subscribe_voice(),
+        ));
+    }
 
     let rt = &context.agents;
     let mut inner = rt.inner.lock().await;
@@ -905,12 +1117,18 @@ async fn utterance_loop(
             continue;
         }
         let Some(utterance) = context.agents.next_utterance() else {
+            // Only expired interims were left.
+            context.agents.pending_changed();
             continue;
         };
+        // Playing from here: the board sees it pending all along, and
+        // `speak_text` records whose voice it is.
+        context.agents.set_playing(Some(utterance.clone()));
         let backend = match tts_backend(&context) {
             Ok(b) => b,
             Err(e) => {
                 warn!("agent '{}': cannot speak the reply: {e}", utterance.agent);
+                context.agents.set_playing(None);
                 continue;
             }
         };
@@ -919,7 +1137,6 @@ async fn utterance_loop(
             utterance.agent,
             utterance.text.len()
         );
-        context.agents.set_playing(Some(utterance.clone()));
         match speak_text(
             Arc::clone(&daemon_state),
             Arc::clone(&context),
@@ -930,9 +1147,10 @@ async fn utterance_loop(
         .await
         {
             SpeakAttempt::NotIdle(_) => {
-                // Something started first, or a hold came in: wait again.
-                context.agents.set_playing(None);
+                // Something started first, or a hold came in: wait again
+                // (put back first, so the board sees it pending all along).
                 context.agents.requeue_front(utterance);
+                context.agents.set_playing(None);
                 if !wait_for_change(&context, &mut state_rx, &mut hold).await {
                     return;
                 }
@@ -953,6 +1171,71 @@ async fn utterance_loop(
                 }
             }
         }
+    }
+}
+
+/// Own the agent overlay's board: apply what the runtime reports and the
+/// agent the voice belongs to, and publish the rows on `DaemonContext::agent_board`
+/// whenever they changed, also when a fading row ends with time alone
+/// ([`Board::next_change`]). Ends when the runtime or the state broadcast
+/// is gone.
+async fn board_loop(
+    context: Arc<DaemonContext>,
+    mut events: mpsc::UnboundedReceiver<BoardEvent>,
+    mut voice_rx: tokio::sync::watch::Receiver<Option<AgentVoice>>,
+) {
+    let mut board = Board::new(context.agents.agents.iter().map(|a| a.name.clone()));
+    loop {
+        let at = now();
+        let entries = board.compose(at);
+        context.agent_board.send_if_modified(|shown| {
+            if *shown == entries {
+                return false;
+            }
+            debug!(
+                "agents: overlay shows {:?}",
+                entries
+                    .iter()
+                    .map(|e| (e.name.as_str(), e.visual.as_str()))
+                    .collect::<Vec<_>>()
+            );
+            *shown = entries;
+            true
+        });
+        let next_change = board.next_change(at);
+        let wake = next_change.map_or_else(
+            || tokio::time::Instant::now() + Duration::from_secs(86_400),
+            tokio::time::Instant::from_std,
+        );
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => apply_board_event(&mut board, event),
+                None => return,
+            },
+            changed = voice_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let voice = voice_rx.borrow_and_update().clone();
+                let voice = voice.as_ref().and_then(|v| {
+                    AgentVisual::from_state(v.state).map(|visual| (v.name.as_str(), visual))
+                });
+                board.set_voice(voice, now());
+            }
+            _ = tokio::time::sleep_until(wake), if next_change.is_some() => {}
+        }
+    }
+}
+
+fn apply_board_event(board: &mut Board, event: BoardEvent) {
+    match event {
+        BoardEvent::TurnStarted { agent, since } => board.turn_started(&agent, since),
+        BoardEvent::Activity { agent, label } => board.activity(&agent, &label),
+        BoardEvent::NeedsYou { agent, at } => board.needs_you(&agent, at),
+        BoardEvent::Working { agent } => board.working(&agent),
+        BoardEvent::TurnEnded { agent, ok, at } => board.turn_ended(&agent, ok, at),
+        BoardEvent::Pending { agents, at } => board.set_pending(&agents, at),
+        BoardEvent::Clear { agent } => board.clear(&agent),
     }
 }
 
@@ -1093,6 +1376,10 @@ pub(crate) async fn handle_agent_event(context: &DaemonContext, payload: serde_j
                         let slot = inner.slots.entry(agent.name.clone()).or_default();
                         if slot.turn.is_none() {
                             slot.wait_for_you(&notice);
+                            rt.board(BoardEvent::NeedsYou {
+                                agent: agent.name.clone(),
+                                at: now(),
+                            });
                         }
                     }
                     info!(
@@ -1143,6 +1430,9 @@ async fn own_reply(context: &DaemonContext, agent: &Agent, raw: String) {
         }
         if slot.turn.is_none() && slot.phase == AgentPhase::NeedsYou {
             slot.phase = AgentPhase::Idle;
+            context.agents.board(BoardEvent::Working {
+                agent: agent.name.clone(),
+            });
         }
     }
     info!("agent '{}': the session replied on its own", agent.name);
@@ -1150,7 +1440,7 @@ async fn own_reply(context: &DaemonContext, agent: &Agent, raw: String) {
 }
 
 /// Speak and notify a needs-you notice ("Waiting for your approval to use
-/// Bash.").
+/// Bash."), under [`WAITING_KEY`]: one at a time per agent.
 fn announce_needs_you(context: &DaemonContext, agent: &Agent, notice: String) {
     info!("agent '{}': needs you: {notice}", agent.name);
     if context.notify {
@@ -1160,11 +1450,12 @@ fn announce_needs_you(context: &DaemonContext, agent: &Agent, notice: String) {
             REPLY_NOTIFICATION_MS,
         );
     }
-    let rt = &context.agents;
-    rt.say(&agent.name, rt.line_for(&agent.name, notice));
+    context.agents.say_keyed(&agent.name, WAITING_KEY, notice);
 }
 
-/// Speak and show an agent's reply (raw final message).
+/// Speak and show an agent's reply (raw final message). Its acknowledgement
+/// or update still queued is dropped: the reply says more. One playing goes
+/// on, and the reply follows it.
 fn deliver_reply(context: &DaemonContext, agent: &Agent, raw: &str) {
     let text = spoken::spoken_reply(raw);
     info!(
@@ -1173,6 +1464,13 @@ fn deliver_reply(context: &DaemonContext, agent: &Agent, raw: &str) {
         raw.chars().count(),
         text.chars().count()
     );
+    let dropped = context.agents.drop_interims_of(Some(&agent.name));
+    if dropped > 0 {
+        info!(
+            "agent '{}': the reply replaces {dropped} queued acknowledgement(s) or update(s)",
+            agent.name
+        );
+    }
     if context.notify {
         send_notification_for(
             "whisrs",
@@ -1300,6 +1598,12 @@ fn spawn_turn(
         updates: updates.clone(),
     };
     let text = request.text.clone();
+    // The card's timer counts from the turn's start: for one watched again
+    // after a restart, when it first started.
+    context.agents.board(BoardEvent::TurnStarted {
+        agent: agent.name.clone(),
+        since: instant_at(request.started_at),
+    });
     let task = tokio::spawn(async move {
         run_turn_task(
             ctx, task_agent, generation, session, request, io, updates_rx, rewatch,
@@ -1315,6 +1619,7 @@ fn spawn_turn(
         text,
         hooks: hooks_tx,
         updates,
+        gate: ProgressGate::new(agent.feedback),
     });
 }
 
@@ -1438,17 +1743,62 @@ async fn apply_update(context: &DaemonContext, agent: &Agent, generation: u64, u
             if let Some(slot) = inner.slots.get_mut(&agent.name) {
                 slot.wait_for_you(&notice);
             }
+            rt.board(BoardEvent::NeedsYou {
+                agent: agent.name.clone(),
+                at: now(),
+            });
             drop(inner);
             announce_needs_you(context, agent, notice);
         }
-        TurnUpdate::Working => set_phase(&mut inner, AgentPhase::Working),
+        TurnUpdate::Working => {
+            set_phase(&mut inner, AgentPhase::Working);
+            rt.board(BoardEvent::Working {
+                agent: agent.name.clone(),
+            });
+        }
         TurnUpdate::SessionReply(raw) => {
             drop(inner);
             own_reply(context, agent, raw).await;
         }
-        // Not wired yet: the daemon lane feeds these to the agent overlay
-        // and the interim queue.
-        TurnUpdate::Activity(_) | TurnUpdate::Interim(_) => {}
+        // The overlay's activity line only.
+        TurnUpdate::Activity(label) => {
+            debug!("agent '{}': activity: {label}", agent.name);
+            rt.board(BoardEvent::Activity {
+                agent: agent.name.clone(),
+                label,
+            });
+        }
+        TurnUpdate::Interim(raw) => {
+            let Some(line) = spoken::interim_line(&raw) else {
+                debug!(
+                    "agent '{}': a message before a tool call has nothing to say",
+                    agent.name
+                );
+                return;
+            };
+            let at = now();
+            let kind = inner
+                .slots
+                .get_mut(&agent.name)
+                .and_then(|s| s.turn.as_mut())
+                .and_then(|t| t.gate.admit(&line, at));
+            drop(inner);
+            match kind {
+                Some(kind) => {
+                    info!(
+                        "agent '{}': {kind:?} ({} chars) at feedback {}",
+                        agent.name,
+                        line.chars().count(),
+                        agent.feedback
+                    );
+                    rt.say_interim(&agent.name, line, kind, at);
+                }
+                None => debug!(
+                    "agent '{}': an interim is not spoken at feedback {}",
+                    agent.name, agent.feedback
+                ),
+            }
+        }
     }
 }
 
@@ -1488,6 +1838,13 @@ async fn finish_turn(
         record.turn_started_at = None;
         record.updated_at = Utc::now();
         rt.save(&inner);
+        // Under the lock a next turn starts under, so the board sees this
+        // end before that start.
+        rt.board(BoardEvent::TurnEnded {
+            agent: agent.name.clone(),
+            ok: matches!(outcome, TurnOutcome::Reply(_) | TurnOutcome::PolledReply(_)),
+            at: now(),
+        });
         text
     };
     match outcome {
@@ -1500,11 +1857,13 @@ async fn finish_turn(
         }
         TurnOutcome::Failed(message) => {
             // Driver messages name the agent already. Spoken too, so the
-            // error is heard with notifications off.
+            // error is heard with notifications off; it replaces the turn's
+            // acknowledgement or update still queued, like a reply.
             error!("{message}");
             if context.notify_error() {
                 send_notification_for("whisrs", &message, REPLY_NOTIFICATION_MS);
             }
+            rt.drop_interims_of(Some(&agent.name));
             rt.say(&agent.name, rt.error_line(agent, &message));
         }
     }
@@ -1531,6 +1890,9 @@ async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
         return Err(reset_refusal(agent, slot.waiting()));
     }
     let record = record_mut(&mut inner, agent);
+    // The driver forgets it too (what it remembered to resume it); it keeps
+    // running in the harness.
+    rt.driver(agent.harness).forget(&record.session());
     if let Some(old) = record.session_id.take() {
         info!(
             "agent '{}': forgot session {old}; the next turn starts a new one (the old session \
@@ -1541,6 +1903,9 @@ async fn reset(context: &DaemonContext, agent: &Agent) -> Result<(), String> {
     record.clear_session();
     record.updated_at = Utc::now();
     rt.save(&inner);
+    rt.board(BoardEvent::Clear {
+        agent: agent.name.clone(),
+    });
     Ok(())
 }
 
@@ -1572,6 +1937,9 @@ async fn stop_turn(context: &DaemonContext, agent: &Agent) -> Result<(), String>
         record.updated_at = Utc::now();
         let session = record.session();
         rt.save(&inner);
+        rt.board(BoardEvent::Clear {
+            agent: agent.name.clone(),
+        });
         session
     };
     info!("agent '{}': turn stopped", agent.name);
@@ -1614,6 +1982,9 @@ async fn stop_idle_session(
             if let Some(slot) = inner.slots.get_mut(&agent.name) {
                 if slot.turn.is_none() {
                     slot.phase = AgentPhase::Idle;
+                    context.agents.board(BoardEvent::Clear {
+                        agent: agent.name.clone(),
+                    });
                 }
             }
             Ok(())
@@ -1863,13 +2234,13 @@ async fn start_recording(
             name: agent.name.clone(),
             new_session,
         });
-        let _ = context.state_tx.send(ds.state_machine.state());
+        context.state_tx.publish(&ds);
         audio_rx
     };
 
     let fresh = if new_session { " in a new session" } else { "" };
     info!("agent '{}': recording a voice turn{fresh}", agent.name);
-    if context.notify_state() {
+    if context.notify_agent_state() {
         send_notification(
             "whisrs",
             &format!("Speak to '{}'{fresh}... (press again to stop)", agent.name),
@@ -1905,10 +2276,12 @@ async fn voice_turn_background(
         let mut guard = daemon_state.lock().await;
         let ds = &mut *guard;
         let claimed = claim_session(&mut ds.state_machine, &mut ds.agent_recording);
-        if claimed.is_some() {
+        if let Some(claimed) = &claimed {
             ds.audio_capture.take();
             ds.recording_started_at.take();
-            let _ = context.state_tx.send(ds.state_machine.state());
+            // Transcribing for this agent: its voice, not the pill's.
+            ds.agent_transcribing = Some(claimed.name.clone());
+            context.state_tx.publish(ds);
         }
         claimed
     };
@@ -1932,7 +2305,8 @@ async fn voice_turn_background(
     {
         let mut ds = daemon_state.lock().await;
         let _ = ds.state_machine.transition(Action::TranscriptionDone);
-        let _ = context.state_tx.send(ds.state_machine.state());
+        ds.agent_transcribing = None;
+        context.state_tx.publish(&ds);
         if let Some(level_tx) = &context.overlay_level_tx {
             let _ = level_tx.send(0.0);
         }
@@ -2071,12 +2445,14 @@ mod tests {
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(UnreachableBackend),
             notify: false,
-            state_tx: tokio::sync::watch::channel(State::Idle).0,
+            state_tx: crate::context::StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
             #[cfg(feature = "recording")]
             recording: crate::recording::RecordingRuntime::new().0,
             agents: rt,
+            agent_board: tokio::sync::watch::channel(Vec::new()).0,
+            agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2092,6 +2468,12 @@ mod tests {
             text: text.to_string(),
             hooks: mpsc::unbounded_channel().0,
             updates: TurnUpdates::channel().0,
+            gate: ProgressGate::new(
+                context
+                    .agents
+                    .agent(name)
+                    .map_or_else(whisrs::agent::progress::Feedback::default, |a| a.feedback),
+            ),
         });
     }
 
@@ -2336,6 +2718,7 @@ mod tests {
             agent: "jarvis".into(),
             text: text.into(),
             notice: None,
+            interim: None,
         }
     }
 
@@ -2500,6 +2883,8 @@ mod tests {
         async fn stop(&self, _agent: &Agent, _session: &SessionRef) -> Result<(), String> {
             Ok(())
         }
+
+        fn forget(&self, _session: &SessionRef) {}
 
         fn hook_matches(&self, payload: &serde_json::Value, _session: &SessionRef) -> bool {
             payload["session_id"] == "sid-1"
@@ -2687,6 +3072,7 @@ mod tests {
             agent: "a".into(),
             text: format!("a: {STILL_WORKING}"),
             notice: Some(STILL_WORKING),
+            interim: None,
         }));
         rt.say_notice("a", STILL_WORKING);
         assert!(!rt.has_utterances());
@@ -2767,6 +3153,7 @@ mod tests {
             agent: "jarvis".into(),
             text: STILL_WORKING.into(),
             notice: Some(STILL_WORKING),
+            interim: None,
         }));
         let response = voice_toggle(
             Arc::clone(&ds),
@@ -2918,6 +3305,7 @@ mod tests {
             agent: "friday".into(),
             text: text.into(),
             notice: None,
+            interim: None,
         };
         for new_session in [false, true] {
             let ds = Arc::new(Mutex::new(DaemonState::new()));
@@ -3035,6 +3423,8 @@ mod tests {
         async fn stop(&self, _agent: &Agent, _session: &SessionRef) -> Result<(), String> {
             Ok(())
         }
+
+        fn forget(&self, _session: &SessionRef) {}
 
         fn hook_matches(&self, _payload: &serde_json::Value, _session: &SessionRef) -> bool {
             false
@@ -3162,6 +3552,523 @@ mod tests {
         assert_eq!(queued(&context.agents), [STILL_WORKING]);
         let inner = context.agents.inner.lock().await;
         assert_eq!(inner.store.agents["jarvis"].session(), stored);
+    }
+
+    // -----------------------------------------------------------------------
+    // Interims and the agent overlay's board
+    // -----------------------------------------------------------------------
+
+    use whisrs::agent::display::{AgentOverlayEntry, DONE_FADE, DONE_HOLD};
+    use whisrs::agent::progress::{Feedback, ACK_TTL, PROGRESS_MIN_GAP, PROGRESS_TTL};
+
+    /// [`test_context`] whose agents have `feedback`.
+    fn feedback_context(names: &[&str], dir: &Path, feedback: Feedback) -> Arc<DaemonContext> {
+        let mut context = test_context(names, dir);
+        Arc::get_mut(&mut context).unwrap().agents.agents = names
+            .iter()
+            .map(|n| {
+                Arc::new(Agent {
+                    feedback,
+                    ..test_agent(n)
+                })
+            })
+            .collect();
+        context
+    }
+
+    /// Give a test runtime the board channel `AgentRuntime::new` makes.
+    fn with_board(context: &mut Arc<DaemonContext>) {
+        let rt = &mut Arc::get_mut(context).unwrap().agents;
+        let (tx, rx) = mpsc::unbounded_channel();
+        rt.board_tx = Some(tx);
+        rt.board_rx = std::sync::Mutex::new(Some(rx));
+    }
+
+    /// Every queued utterance, in order: its text and, for an interim, its
+    /// kind.
+    fn queued_kinds(rt: &AgentRuntime) -> Vec<(String, Option<InterimKind>)> {
+        std::iter::from_fn(|| rt.next_utterance())
+            .map(|u| (u.text, u.interim.map(|i| i.kind)))
+            .collect()
+    }
+
+    fn line(text: &str, kind: Option<InterimKind>) -> (String, Option<InterimKind>) {
+        (text.to_string(), kind)
+    }
+
+    async fn interim(context: &DaemonContext, agent: &Agent, generation: u64, raw: &str) {
+        apply_update(
+            context,
+            agent,
+            generation,
+            TurnUpdate::Interim(raw.to_string()),
+        )
+        .await;
+    }
+
+    /// The gate speaks what the agent's level allows, whatever the model
+    /// writes: summary nothing; brief the first line, as the
+    /// acknowledgement; conversational that, then updates at least
+    /// PROGRESS_MIN_GAP apart and never one said already. A message with
+    /// nothing speakable says nothing. Interims are never notified (the
+    /// test context notifies nothing, and nothing here asks it to).
+    #[tokio::test(start_paused = true)]
+    async fn interims_are_spoken_as_the_feedback_level_allows() {
+        use InterimKind::{Ack, Progress};
+        let dir = tempfile::tempdir().unwrap();
+        for (feedback, first, later) in [
+            (Feedback::Summary, vec![], vec![]),
+            (Feedback::Brief, vec![line("On it.", Some(Ack))], vec![]),
+            (
+                Feedback::Conversational,
+                vec![line("On it.", Some(Ack))],
+                vec![line("Found the cause.", Some(Progress))],
+            ),
+        ] {
+            let context = feedback_context(&["jarvis"], dir.path(), feedback);
+            let rt = &context.agents;
+            let agent = Arc::clone(&rt.agents[0]);
+            install_turn(&context, "jarvis", 1, "fix the build").await;
+            interim(&context, &agent, 1, "<spoken>On it.</spoken> Looking now.").await;
+            // Too soon after the first, and nothing to say.
+            interim(&context, &agent, 1, "<spoken>Still on it.</spoken>").await;
+            interim(&context, &agent, 1, "Notes, no tags.").await;
+            interim(&context, &agent, 1, "<spoken>https://x.io</spoken>").await;
+            assert_eq!(queued_kinds(rt), first, "{feedback}");
+
+            tokio::time::advance(PROGRESS_MIN_GAP + Duration::from_secs(1)).await;
+            // Said already, then a new one.
+            interim(&context, &agent, 1, "<spoken>On it.</spoken>").await;
+            interim(&context, &agent, 1, "<spoken>Found the cause.</spoken>").await;
+            interim(&context, &agent, 1, "<spoken>And another.</spoken>").await;
+            assert_eq!(queued_kinds(rt), later, "{feedback}");
+
+            // A turn that is not running (replaced, or ended) says nothing.
+            interim(&context, &agent, 2, "<spoken>On it.</spoken>").await;
+            assert!(queued_kinds(rt).is_empty(), "{feedback}");
+        }
+    }
+
+    /// The reply drops its agent's acknowledgement or update still queued
+    /// (another agent's stays, and so do notices), and is never dropped or
+    /// deduplicated away for one, even when they say the same. A failed
+    /// turn's error drops them too.
+    #[tokio::test]
+    async fn a_reply_drops_its_agents_queued_interims() {
+        use InterimKind::Ack;
+        let dir = tempfile::tempdir().unwrap();
+        let context = feedback_context(&["jarvis", "friday"], dir.path(), Feedback::Brief);
+        let rt = &context.agents;
+        let jarvis = Arc::clone(&rt.agents[0]);
+        let friday = Arc::clone(&rt.agents[1]);
+        install_turn(&context, "jarvis", 1, "check it").await;
+        install_turn(&context, "friday", 2, "build it").await;
+        interim(&context, &jarvis, 1, "<spoken>All set.</spoken>").await;
+        interim(&context, &friday, 2, "<spoken>Building.</spoken>").await;
+        rt.say_notice("jarvis", BACKGROUND_TASK);
+        finish_turn(
+            &context,
+            &jarvis,
+            1,
+            TurnOutcome::Reply("Checked. <spoken>All set.</spoken>".into()),
+        )
+        .await;
+        assert_eq!(
+            queued_kinds(rt),
+            [
+                line("Building.", Some(Ack)),
+                line(&format!("jarvis: {BACKGROUND_TASK}"), None),
+                line("All set.", None),
+            ]
+        );
+
+        // An error replaces them as well.
+        install_turn(&context, "friday", 3, "build it again").await;
+        interim(&context, &friday, 3, "<spoken>Building.</spoken>").await;
+        finish_turn(
+            &context,
+            &friday,
+            3,
+            TurnOutcome::Failed("Agent 'friday': the session ended before replying.".into()),
+        )
+        .await;
+        assert_eq!(
+            queued_kinds(rt),
+            [line("friday: The session ended before replying.", None)]
+        );
+    }
+
+    /// An interim waits in the queue only while it is worth saying: an
+    /// acknowledgement ACK_TTL, an update PROGRESS_TTL, measured from when
+    /// it was admitted. Replies never expire.
+    #[tokio::test(start_paused = true)]
+    async fn interims_expire_while_they_wait() {
+        let mut rt = AgentRuntime::disabled();
+        rt.speak = true;
+        let t0 = now();
+        rt.say_interim("jarvis", "On it.".into(), InterimKind::Ack, t0);
+        rt.say("jarvis", "A reply.".into());
+        rt.say_interim("jarvis", "Halfway.".into(), InterimKind::Progress, t0);
+        // Fresh until its time is up.
+        tokio::time::advance(ACK_TTL - Duration::from_millis(10)).await;
+        let ack = rt.next_utterance().unwrap();
+        assert_eq!(ack.text, "On it.");
+        rt.requeue_front(ack);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        // The acknowledgement expired: dropped on the way to the reply. The
+        // update lives longer.
+        assert_eq!(rt.next_utterance().unwrap().text, "A reply.");
+        let update = rt.next_utterance().unwrap();
+        assert_eq!(update.text, "Halfway.");
+        rt.requeue_front(update);
+        tokio::time::advance(PROGRESS_TTL - ACK_TTL).await;
+        assert!(
+            rt.next_utterance().is_none(),
+            "the update outlived its time"
+        );
+        // A reply waits however long.
+        rt.say("jarvis", "A late reply.".into());
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(rt.next_utterance().unwrap().text, "A late reply.");
+    }
+
+    /// `whisrs cancel` drops the queued interims; replies stay unless an
+    /// agent reply is playing (then everything queued goes, as before).
+    #[tokio::test]
+    async fn cancel_drops_queued_interims() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        let rt = &context.agents;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        rt.say_interim("jarvis", "On it.".into(), InterimKind::Ack, now());
+        rt.say("jarvis", "A reply.".into());
+        crate::dictation::handle_cancel(Arc::clone(&ds), Arc::clone(&context)).await;
+        assert_eq!(queued(rt), ["A reply."]);
+
+        start_speaking(&ds, SpeakOrigin::Agent).await;
+        rt.say_interim("jarvis", "On it.".into(), InterimKind::Ack, now());
+        rt.say("jarvis", "A reply.".into());
+        crate::dictation::handle_cancel(Arc::clone(&ds), Arc::clone(&context)).await;
+        assert!(queued(rt).is_empty());
+    }
+
+    /// A recording that stops an interim playing does not put it back: it
+    /// is not worth saying after the recording. A reply it stops is.
+    #[cfg(feature = "recording")]
+    #[tokio::test]
+    async fn an_interim_a_recording_stopped_is_not_said_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis"], dir.path());
+        let rt = &context.agents;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        rt.daemon_state.set(Arc::clone(&ds)).ok().unwrap();
+        let stop = start_speaking(&ds, SpeakOrigin::Agent).await;
+        rt.set_playing(Some(Utterance {
+            interim: Some(Interim {
+                kind: InterimKind::Ack,
+                expires: now() + ACK_TTL,
+            }),
+            ..utterance("On it.")
+        }));
+        rt.say("jarvis", "A reply.".into());
+        let hold = hold_for_recording(&context);
+        assert!(stop.load(Ordering::Acquire), "playback was not stopped");
+        drop(hold);
+        assert_eq!(queued(rt), ["A reply."]);
+        rt.set_playing(None);
+    }
+
+    /// Holds apply to interims as to replies: one waits while a hold
+    /// lives, and one that expired meanwhile is dropped, never spoken. One
+    /// still worth saying is spoken once the hold is gone, as its agent's
+    /// voice (the ui view stays Idle).
+    #[tokio::test]
+    async fn holds_apply_to_interims_and_a_held_one_expires() {
+        // A TTS server that takes the request and never answers: a spoken
+        // utterance stays Synthesizing until it is stopped.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context(&["jarvis"], dir.path());
+        Arc::get_mut(&mut context).unwrap().config = toml::from_str(&format!(
+            "[general]\naudio_feedback = false\n[tts]\nenabled = true\nbackend = \
+             \"tts-sidecar\"\nurl = \"http://{}/v1/audio/speech\"\n",
+            server.local_addr().unwrap()
+        ))
+        .unwrap();
+        let rt = &context.agents;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        let settle = || async {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let interim_for = |text: &str, ttl: Duration| Utterance {
+            interim: Some(Interim {
+                kind: InterimKind::Ack,
+                expires: now() + ttl,
+            }),
+            ..utterance(text)
+        };
+        let hold = rt.hold_replies();
+        tokio::spawn(utterance_loop(
+            Arc::clone(&context),
+            Arc::clone(&ds),
+            context.state_tx.subscribe_raw(),
+        ));
+        rt.enqueue(interim_for("Soon stale.", Duration::from_millis(100)));
+        settle().await;
+        assert!(rt.has_utterances(), "spoken while a hold lived");
+        drop(hold);
+        settle().await;
+        assert!(!rt.has_utterances());
+        assert_eq!(ds.lock().await.state_machine.state(), State::Idle);
+        assert_eq!(rt.playing_agent(), None, "an expired interim was spoken");
+
+        let hold = rt.hold_replies();
+        rt.enqueue(interim_for("On it.", ACK_TTL));
+        settle().await;
+        assert!(rt.has_utterances());
+        drop(hold);
+        settle().await;
+        assert!(!rt.has_utterances());
+        assert_eq!(ds.lock().await.state_machine.state(), State::Synthesizing);
+        assert_eq!(rt.playing_agent().as_deref(), Some("jarvis"));
+        assert_eq!(*context.state_tx.subscribe_ui().borrow(), State::Idle);
+        assert_eq!(
+            context.state_tx.subscribe_voice().borrow().clone(),
+            Some(AgentVoice {
+                name: "jarvis".into(),
+                state: State::Synthesizing
+            })
+        );
+        stop_read_aloud(&mut *ds.lock().await, &context);
+        drop(server);
+    }
+
+    /// A needs-you notice is announced under the key its refusal speaks it
+    /// again under: a fresh-session press while the announcement still
+    /// waits (another agent's reply holds the queue) does not queue it
+    /// twice.
+    #[tokio::test]
+    async fn a_needs_you_notice_is_queued_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = test_context(&["jarvis", "friday"], dir.path());
+        let rt = &context.agents;
+        let agent = Arc::clone(&rt.agents[0]);
+        install_turn(&context, "jarvis", 1, "the running one").await;
+        rt.set_playing(Some(Utterance {
+            agent: "friday".into(),
+            ..utterance("friday: The build is green.")
+        }));
+        apply_update(
+            &context,
+            &agent,
+            1,
+            TurnUpdate::NeedsYou("Waiting for your approval to use Bash.".into()),
+        )
+        .await;
+        let ds = Arc::new(Mutex::new(DaemonState::new()));
+        let response = voice_toggle(ds, Arc::clone(&context), agent, true).await;
+        assert!(matches!(response, Response::Error { .. }), "{response:?}");
+        assert_eq!(
+            queued(rt),
+            ["jarvis: Waiting for your approval to use Bash."]
+        );
+        rt.set_playing(None);
+    }
+
+    /// The agent's progress toasts follow `[general] notify` unless an agent
+    /// overlay shows (the pill no longer shows agent mode).
+    #[test]
+    fn agent_toasts_give_way_only_to_an_agent_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context(&["jarvis"], dir.path());
+        let ctx = Arc::get_mut(&mut context).unwrap();
+        ctx.overlay_enabled = true;
+        assert!(!ctx.notify_agent_state(), "notify is off");
+        ctx.notify = true;
+        assert!(!ctx.notify_state(), "the pill stands in for dictation's");
+        assert!(ctx.notify_agent_state());
+        ctx.agent_overlay_shown.store(true, Ordering::Relaxed);
+        assert!(!ctx.notify_agent_state());
+    }
+
+    /// The rows of `context`'s board once `done` accepts them.
+    async fn board_until(
+        context: &DaemonContext,
+        what: &str,
+        done: impl Fn(&[AgentOverlayEntry]) -> bool,
+    ) -> Vec<AgentOverlayEntry> {
+        let mut rx = context.agent_board.subscribe();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let rows = rx.borrow_and_update().clone();
+                if done(&rows) {
+                    return rows;
+                }
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the board never showed {what}"))
+    }
+
+    /// The rows of `context`'s board once they are `want` (name and
+    /// visual, in order).
+    async fn board_shows(
+        context: &DaemonContext,
+        want: &[(&str, AgentVisual)],
+    ) -> Vec<AgentOverlayEntry> {
+        board_until(context, &format!("{want:?}"), |rows| {
+            rows.iter()
+                .map(|e| (e.name.as_str(), e.visual))
+                .eq(want.iter().copied())
+        })
+        .await
+    }
+
+    /// Publish `ds` as the dictation state.
+    fn publish(context: &DaemonContext, ds: &DaemonState) {
+        context.state_tx.publish(ds);
+    }
+
+    /// The board task, end to end: a turn's row works, ends Done and holds
+    /// while its reply waits (however long); the voice shows while it
+    /// plays; once it played the row holds DONE_HOLD, fades over DONE_FADE
+    /// and is gone at that time on its own.
+    #[tokio::test(start_paused = true)]
+    async fn done_holds_while_the_reply_is_pending_and_fades_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Arc::new(SessionLoggingDriver::default());
+        let mut context = test_context(&["jarvis"], dir.path());
+        Arc::get_mut(&mut context)
+            .unwrap()
+            .agents
+            .drivers
+            .insert(Harness::Claude, Arc::clone(&driver) as Arc<dyn Driver>);
+        with_board(&mut context);
+        let rt = &context.agents;
+        tokio::spawn(board_loop(
+            Arc::clone(&context),
+            rt.take_board_events().unwrap(),
+            context.state_tx.subscribe_voice(),
+        ));
+        let agent = Arc::clone(&rt.agents[0]);
+        start_turn(&context, &agent, "run the tests".into())
+            .await
+            .unwrap();
+        let rows = board_shows(&context, &[("jarvis", AgentVisual::Done)]).await;
+        assert_eq!(rows[0].fading_from, None, "faded while its reply waits");
+        assert_eq!(rows[0].activity.as_deref(), Some("Finished in 0:00"));
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(context.agent_board.borrow()[0].fading_from, None);
+
+        // The reply plays.
+        let reply = rt.next_utterance().unwrap();
+        assert_eq!(reply.text, "Done.");
+        rt.set_playing(Some(reply));
+        let mut ds = DaemonState::new();
+        ds.state_machine.transition(Action::SpeakStart).unwrap();
+        ds.tts_stop = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        ds.tts_origin = Some(SpeakOrigin::Agent);
+        ds.tts_agent = rt.playing_agent();
+        publish(&context, &ds);
+        board_shows(&context, &[("jarvis", AgentVisual::Speaking)]).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        // It played.
+        ds.state_machine.transition(Action::SpeakDone).unwrap();
+        ds.tts_stop = None;
+        publish(&context, &ds);
+        let played = now();
+        rt.set_playing(None);
+        let rows = board_shows(&context, &[("jarvis", AgentVisual::Done)]).await;
+        let from = rows[0].fading_from.expect("a played reply's row fades");
+        assert!(from >= played + DONE_HOLD, "fades before the hold ended");
+        assert_eq!(rows[0].alpha(from), 1.0);
+        // Gone at the fade's end, with no other event.
+        board_shows(&context, &[]).await;
+        assert!(now() >= from + DONE_FADE, "gone before the fade ended");
+    }
+
+    /// The board follows the turn: working with its activity line, waiting
+    /// for you, working again, an error; `--stop` and `--reset` clear it.
+    #[tokio::test]
+    async fn the_board_follows_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = test_context(&["jarvis"], dir.path());
+        with_board(&mut context);
+        let rt = &context.agents;
+        tokio::spawn(board_loop(
+            Arc::clone(&context),
+            rt.take_board_events().unwrap(),
+            context.state_tx.subscribe_voice(),
+        ));
+        let agent = Arc::clone(&rt.agents[0]);
+        install_turn(&context, "jarvis", 1, "check it").await;
+        rt.board(BoardEvent::TurnStarted {
+            agent: "jarvis".into(),
+            since: now(),
+        });
+        apply_update(
+            &context,
+            &agent,
+            1,
+            TurnUpdate::Activity("Running a command".into()),
+        )
+        .await;
+        board_until(&context, "the activity", |rows| {
+            rows.len() == 1
+                && rows[0].visual == AgentVisual::Working
+                && rows[0].activity.as_deref() == Some("Running a command")
+        })
+        .await;
+        apply_update(
+            &context,
+            &agent,
+            1,
+            TurnUpdate::NeedsYou("Waiting for your approval to use Bash.".into()),
+        )
+        .await;
+        board_shows(&context, &[("jarvis", AgentVisual::NeedsYou)]).await;
+        apply_update(&context, &agent, 1, TurnUpdate::Working).await;
+        board_shows(&context, &[("jarvis", AgentVisual::Working)]).await;
+        finish_turn(
+            &context,
+            &agent,
+            1,
+            TurnOutcome::Failed("Agent 'jarvis': the session failed.".into()),
+        )
+        .await;
+        board_shows(&context, &[("jarvis", AgentVisual::Error)]).await;
+        reset(&context, &agent).await.unwrap();
+        board_shows(&context, &[]).await;
+
+        // `--stop`.
+        install_turn(&context, "jarvis", 2, "again").await;
+        rt.board(BoardEvent::TurnStarted {
+            agent: "jarvis".into(),
+            since: now(),
+        });
+        board_shows(&context, &[("jarvis", AgentVisual::Working)]).await;
+        let _ = stop_turn(&context, &agent).await;
+        board_shows(&context, &[]).await;
+    }
+
+    /// No agents: no board channel for a task to own, and nothing is ever
+    /// sent to one.
+    #[test]
+    fn no_agents_starts_no_board() {
+        let config: Config = toml::from_str("").unwrap();
+        let rt = AgentRuntime::new(&config, Path::new("/nonexistent.sock"));
+        assert!(rt.take_board_events().is_none());
+        assert!(rt.board_tx.is_none());
+        rt.board(BoardEvent::Clear {
+            agent: "jarvis".into(),
+        });
+        rt.pending_changed();
+        assert!(rt.last_pending.lock().unwrap().is_empty());
     }
 
     #[test]

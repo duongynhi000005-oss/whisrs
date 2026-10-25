@@ -2853,11 +2853,13 @@ mod tests {
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: backend,
             notify: false,
-            state_tx: watch::channel(State::Idle).0,
+            state_tx: crate::context::StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
             recording,
             agents: crate::agent::AgentRuntime::disabled(),
+            agent_board: watch::channel(Vec::new()).0,
+            agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
         };
         (Arc::new(context), queue_rx)
     }

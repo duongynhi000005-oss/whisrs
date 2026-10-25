@@ -384,7 +384,7 @@ async fn command_mode_background(
     // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
-    let _ = context.state_tx.send(ds.state_machine.state());
+    context.state_tx.publish(&ds);
     if let Some(level_tx) = &context.overlay_level_tx {
         let _ = level_tx.send(0.0);
     }
@@ -892,7 +892,7 @@ async fn llm_command_background(
     // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
-    let _ = context.state_tx.send(ds.state_machine.state());
+    context.state_tx.publish(&ds);
     if let Some(level_tx) = &context.overlay_level_tx {
         let _ = level_tx.send(0.0);
     }

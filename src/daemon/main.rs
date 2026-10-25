@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 use whisrs::history;
 use whisrs::window::{self, WindowTracker};
-use whisrs::{encode_message, read_message, socket_path, Command, Response, State};
+use whisrs::{encode_message, read_message, socket_path, Command, Response};
 
 mod agent;
 mod command_mode;
@@ -122,8 +122,10 @@ async fn main() -> Result<()> {
         std::any::type_name_of_val(&*window_tracker)
     );
 
-    // State broadcast channel — consumed by system tray and overlay.
-    let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
+    // State broadcast: hooks and the agent reply queue read the state as it
+    // is; the tray and the pill overlay read it without agent mode, which
+    // shows on its own overlay (`StateBus`).
+    let state_tx = crate::context::StateBus::new();
     let (overlay_level_tx, overlay_level_rx) = tokio::sync::watch::channel(0.0_f32);
     // Recording status has its own channel, read by the tray only: a recording
     // must not animate the overlay or fire the dictation hooks.
@@ -135,17 +137,28 @@ async fn main() -> Result<()> {
     let overlay_config = config.overlay.clone().unwrap_or_default();
     // Inert (no file, no task, no process) without [[agents]].
     let agents = crate::agent::AgentRuntime::new(&config, &socket_path());
+    // The agent overlay exists only with agents; it follows `[general]
+    // overlay` unless `[agent_overlay] enabled` says otherwise. Either
+    // overlay gets the mic and TTS levels.
+    let agent_overlay_enabled = agents.is_enabled()
+        && config
+            .agent_overlay
+            .clone()
+            .unwrap_or_default()
+            .enabled(overlay_enabled);
     let context = Arc::new(DaemonContext {
         config,
         window_tracker,
         transcription_backend: backend,
         notify,
         state_tx,
-        overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
+        overlay_level_tx: (overlay_enabled || agent_overlay_enabled).then_some(overlay_level_tx),
         overlay_enabled,
         #[cfg(feature = "recording")]
         recording: recording_runtime,
         agents,
+        agent_board: tokio::sync::watch::channel(Vec::new()).0,
+        agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
     });
 
     let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
@@ -203,8 +216,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 // Broadcast state for tray.
-                let current = dispatch_state.lock().await.state_machine.state();
-                let _ = dispatch_ctx.state_tx.send(current);
+                dispatch_ctx.state_tx.publish(&*dispatch_state.lock().await);
             }
         });
     }
@@ -219,7 +231,7 @@ async fn main() -> Result<()> {
             .notify_error()
             .then_some(send_notification as whisrs::tray::NotifyFn);
         tokio::spawn(whisrs::tray::spawn_tray(
-            state_rx.clone(),
+            context.state_tx.subscribe_ui(),
             #[cfg(feature = "recording")]
             recording_rx,
             cmd_tx.clone(),
@@ -228,22 +240,21 @@ async fn main() -> Result<()> {
     }
 
     // Recording-lifecycle hooks (MPRIS pause + shell commands). Watches the
-    // same state broadcast as the tray/overlay; detached, so failures never
-    // delay recording.
+    // raw state broadcast, so an agent's voice turn pauses media too;
+    // detached, so failures never delay recording.
     #[cfg(feature = "hooks")]
     if let Some(hooks) = context.config.hooks.clone() {
-        tokio::spawn(crate::hooks::hook_dispatch_loop(state_rx.clone(), hooks));
+        tokio::spawn(crate::hooks::hook_dispatch_loop(
+            context.state_tx.subscribe_raw(),
+            hooks,
+        ));
     }
-
-    // Agent mode watches the same state broadcast to speak replies when the
-    // daemon is Idle.
-    let agent_state_rx = state_rx.clone();
 
     // Start bottom recording overlay if enabled.
     // Spawned as a background task so desktop integration failures do not stop the daemon.
     if overlay_enabled {
         tokio::spawn(whisrs::overlay::spawn_overlay(
-            state_rx,
+            context.state_tx.subscribe_ui(),
             overlay_level_rx,
             overlay_config,
         ));
@@ -286,17 +297,11 @@ async fn main() -> Result<()> {
         tokio::spawn(crate::recording::run_network_retries(Arc::clone(&context)));
     }
 
-    // Agent mode: the reply queue, and the turns a restart interrupted
-    // (watched again so their replies are still spoken). Only with agents.
+    // Agent mode: the reply queue, the agent overlay's board, and the turns
+    // a restart interrupted (watched again so their replies are still
+    // spoken). Only with agents.
     if context.agents.is_enabled() {
-        crate::agent::start_background(
-            Arc::clone(&context),
-            Arc::clone(&daemon_state),
-            agent_state_rx,
-        )
-        .await;
-    } else {
-        drop(agent_state_rx);
+        crate::agent::start_background(Arc::clone(&context), Arc::clone(&daemon_state)).await;
     }
 
     // SIGTERM (systemd stop/restart, tray Quit) and SIGINT both remove the
@@ -363,8 +368,7 @@ async fn handle_connection(
     let response = handle_command(cmd, Arc::clone(&daemon_state), Arc::clone(&context)).await;
 
     // Broadcast state for tray updates.
-    let current = daemon_state.lock().await.state_machine.state();
-    let _ = context.state_tx.send(current);
+    context.state_tx.publish(&*daemon_state.lock().await);
 
     let encoded = encode_message(&response)?;
     writer.write_all(&encoded).await?;
@@ -509,6 +513,7 @@ mod tests {
     #[tokio::test]
     async fn recording_commands_are_refused_without_the_feature() {
         use whisrs::recording::RecordingAction;
+        use whisrs::State;
 
         let context = Arc::new(DaemonContext {
             config: toml::from_str("").expect("empty config uses defaults"),
@@ -518,10 +523,12 @@ mod tests {
                 String::new(),
             )),
             notify: false,
-            state_tx: tokio::sync::watch::channel(State::Idle).0,
+            state_tx: crate::context::StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
             agents: crate::agent::AgentRuntime::disabled(),
+            agent_board: tokio::sync::watch::channel(Vec::new()).0,
+            agent_overlay_shown: std::sync::atomic::AtomicBool::new(false),
         });
         let daemon_state = Arc::new(Mutex::new(DaemonState::new()));
         for action in [

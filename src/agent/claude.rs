@@ -86,6 +86,11 @@ const EXIT_POLL: Duration = Duration::from_millis(50);
 /// settle the session (logged within milliseconds of the exit, measured).
 const SETTLE_GRACE: Duration = Duration::from_millis(250);
 
+/// How long a copy a resume just started may take to show in `claude
+/// agents`, listed every [`STOP_POLL`]: until it does, its process is not
+/// known, and a wait would take the unlisted copy for removed.
+const COPY_LIST_WAIT: Duration = Duration::from_secs(5);
+
 /// Resumes tried before a turn that only ever starts copies is given up.
 const RESUME_ATTEMPTS: u32 = 2;
 
@@ -142,7 +147,13 @@ impl ClaudeDriver {
             hook_command: hook_command(whisrs_bin, socket),
             poll_interval: POLL_INTERVAL,
             done_grace: DONE_GRACE,
-            exits: Exits::new(STOP_POLL, STOP_WAIT, EXIT_POLL, SETTLE_GRACE),
+            exits: Exits::new(
+                STOP_POLL,
+                STOP_WAIT,
+                EXIT_POLL,
+                SETTLE_GRACE,
+                COPY_LIST_WAIT,
+            ),
             use_scope: in_service_unit(),
         }
     }
@@ -976,6 +987,9 @@ struct Exits {
     exit_poll: Duration,
     /// The grace after it exited, for Claude Code to settle the session.
     settle_grace: Duration,
+    /// How long a just-started copy may take to be listed
+    /// ([`COPY_LIST_WAIT`]).
+    copy_list_wait: Duration,
 }
 
 impl Exits {
@@ -984,6 +998,7 @@ impl Exits {
         stop_wait: Duration,
         exit_poll: Duration,
         settle_grace: Duration,
+        copy_list_wait: Duration,
     ) -> Self {
         Self {
             seen: Arc::default(),
@@ -991,6 +1006,7 @@ impl Exits {
             stop_wait,
             exit_poll,
             settle_grace,
+            copy_list_wait,
         }
     }
 
@@ -1063,12 +1079,19 @@ impl Exits {
     /// Wait until `claude agents` lists `bg_id` with no pid and every
     /// process remembered for it (listed before, or meanwhile) has exited,
     /// plus the settle grace, for at most `stop_wait`. A failed listing
-    /// counts as still running.
+    /// counts as still running, and so does one that does not list `bg_id`
+    /// while a process remembered for it runs (a copy just started and not
+    /// listed yet, or a session removed while its process exits): only with
+    /// none running is it gone.
     async fn wait_for_exit(&self, agent: &Agent, bg_id: &str) -> Result<Stopped, String> {
         let started = Instant::now();
         loop {
             match list_sessions_within(agent, LIST_TIMEOUT).await {
                 Ok(list) => match find_session(&list, bg_id) {
+                    None if self.runs(bg_id) => debug!(
+                        "agent '{}': bg {bg_id} is not listed, but its process still runs",
+                        agent.name
+                    ),
                     None => {
                         self.forget(bg_id);
                         return Ok(Stopped::Gone);
@@ -1128,13 +1151,45 @@ impl Exits {
         Ok(())
     }
 
+    /// List until `claude agents` shows `bg_id`, every `stop_poll` for at
+    /// most `copy_list_wait`, and remember the process it shows. `false`
+    /// when it never showed.
+    async fn note_when_listed(&self, agent: &Agent, bg_id: &str) -> bool {
+        let started = Instant::now();
+        loop {
+            match list_sessions_within(agent, LIST_TIMEOUT).await {
+                Ok(list) => {
+                    if let Some(listed) = find_session(&list, bg_id) {
+                        self.note(bg_id, &listed);
+                        return true;
+                    }
+                }
+                Err(e) => debug!("agent '{}': {e}", agent.name),
+            }
+            if started.elapsed() >= self.copy_list_wait {
+                return false;
+            }
+            tokio::time::sleep(self.stop_poll).await;
+        }
+    }
+
     /// Stop and remove a copy a resume started ([`copy_id`]: never the
     /// session's own bg id). Its bg id came from our own launch's output, so
-    /// it is ours; nothing else is ever removed. `claude rm` waits for the
-    /// copy's process to exit, since it still runs right after `claude
-    /// stop`. The error names the copy left behind.
+    /// it is ours; nothing else is ever removed. A copy just started may not
+    /// be listed yet: it is listed first (a short retry, like a first
+    /// launch's lookup), so its process is remembered and the wait does not
+    /// take it for removed. `claude rm` waits for the copy's process to
+    /// exit, since it still runs right after `claude stop`. Nothing of the
+    /// copy is remembered afterwards, whatever happened. The error names the
+    /// copy left behind.
     async fn discard_copy(&self, agent: &Agent, bg_id: &str) -> Result<(), String> {
-        if let Err(e) = self.stop_noting(agent, bg_id).await {
+        if !self.note_when_listed(agent, bg_id).await {
+            debug!(
+                "agent '{}': the copy {bg_id} is not listed; stopping it anyway",
+                agent.name
+            );
+        }
+        if let Err(e) = stop_bg(agent, bg_id).await {
             debug!("agent '{}': {e}", agent.name);
         }
         if self.wait_for_exit(agent, bg_id).await.is_err() {
@@ -1144,9 +1199,9 @@ impl Exits {
             );
         }
         let args = ["rm".to_string(), bg_id.to_string()];
-        let out = run_claude(agent, &args, QUICK_TIMEOUT)
-            .await
-            .map_err(|e| format!("cannot remove the copy {bg_id}: {e}"))?;
+        let removed = run_claude(agent, &args, QUICK_TIMEOUT).await;
+        self.forget(bg_id);
+        let out = removed.map_err(|e| format!("cannot remove the copy {bg_id}: {e}"))?;
         if out.success {
             info!("agent '{}': removed the copy {bg_id}", agent.name);
             Ok(())
@@ -1167,6 +1222,12 @@ enum Launched {
     /// A resume started a copy (its bg id), already stopped and removed and
     /// never reported.
     Copy(String),
+    /// A resume printed the session's own bg id with a note that it started
+    /// a copy as that id: whether it continued in place is unclear. Not
+    /// reported, and never removed (that would remove the session itself):
+    /// the caller stops it, waits for it and resumes once more, like after a
+    /// copy.
+    UnclearCopy,
 }
 
 /// A launch that runs on a task of its own, so stopping the turn cannot cut
@@ -1210,9 +1271,10 @@ async fn launch_reported(
             if copy_note.is_some() {
                 warn!(
                     "agent '{}': the resume's copy note names the session itself (bg {bg_id}); \
-                     taken as continued in place",
+                     stopping it to resume once more",
                     agent.name
                 );
+                return Ok(Launched::UnclearCopy);
             }
         }
         let mut session = base;
@@ -1266,7 +1328,9 @@ impl ClaudeDriver {
         let (bg_id, mut session) = match launched {
             Launched::Running(bg_id, session) => (bg_id, session),
             // Only a resume is checked for a copy.
-            Launched::Copy(_) => return Err(TurnOutcome::Failed(cannot_continue(agent))),
+            Launched::Copy(_) | Launched::UnclearCopy => {
+                return Err(TurnOutcome::Failed(cannot_continue(agent)))
+            }
         };
         match learn_session(agent, &bg_id).await {
             Ok(listed) => {
@@ -1392,6 +1456,10 @@ impl ClaudeDriver {
             let copy = match launched {
                 Launched::Running(_, resumed) => return Ok((resumed, launched_at)),
                 Launched::Copy(copy) => copy,
+                Launched::UnclearCopy => format!(
+                    "{}, by its note",
+                    session.bg_id.as_deref().unwrap_or("the session itself")
+                ),
             };
             if attempt >= RESUME_ATTEMPTS {
                 warn!(
@@ -1553,7 +1621,9 @@ impl ClaudeDriver {
                     }
                     match poll_state(listed.as_ref()) {
                         PollState::Gone => {
-                            // Forget it: the next turn starts a new session.
+                            // Forget it: the next turn starts a new session,
+                            // and nothing of it is waited for again.
+                            self.exits.forget(&bg_id);
                             updates.send(TurnUpdate::Session(SessionRef::default()));
                             return TurnOutcome::Failed(format!(
                                 "Agent '{}': the session ended, Claude Code no longer lists it. \
@@ -1682,6 +1752,14 @@ impl Driver for ClaudeDriver {
         match &session.bg_id {
             Some(bg_id) => self.exits.stop_noting(agent, bg_id).await,
             None => Ok(()),
+        }
+    }
+
+    /// Forget the processes remembered for the session: it is never resumed
+    /// again, and a live one would stay remembered for good.
+    fn forget(&self, session: &SessionRef) {
+        if let Some(bg_id) = &session.bg_id {
+            self.exits.forget(bg_id);
         }
     }
 
@@ -2231,18 +2309,22 @@ not json
     // `watch` against a fake `claude`
     // -----------------------------------------------------------------------
 
-    /// The fake `claude`: logs every call to `calls.log`; `agents` prints
-    /// `list.json`, or after a `stop` (when `list-stopped.json` exists)
-    /// `list.json` for as many more calls as `alive-after-stop` says, then
-    /// `list-stopped.json`; `rm` fails while `rm-fails` exists; the n-th
-    /// `--bg` prints `bg-<n>.out` (and `bg-<n>.err` on stderr) when present,
-    /// else a launch of `abc12345`.
+    /// The fake `claude`: logs every call to `calls.log`; the n-th `agents`
+    /// prints `agents-<n>.json` when present, else `list.json`, or after a
+    /// `stop` (when `list-stopped.json` exists) `list.json` for as many more
+    /// calls as `alive-after-stop` says, then `list-stopped.json`; `rm`
+    /// fails while `rm-fails` exists; the n-th `--bg` prints `bg-<n>.out`
+    /// (and `bg-<n>.err` on stderr) when present, else a launch of
+    /// `abc12345`.
     const FAKE_CLAUDE: &str = r#"#!/bin/sh
 d=$(dirname "$0")
 echo "$*" >> "$d/calls.log"
 case "$1" in
   agents)
-    if [ -f "$d/stopped" ] && [ -f "$d/list-stopped.json" ]; then
+    a=$(cat "$d/agents.count" 2>/dev/null || echo 0); a=$((a + 1)); echo $a > "$d/agents.count"
+    if [ -f "$d/agents-$a.json" ]; then
+      cat "$d/agents-$a.json"
+    elif [ -f "$d/stopped" ] && [ -f "$d/list-stopped.json" ]; then
       n=$(cat "$d/stopped")
       if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$d/stopped"; cat "$d/list.json"
       else cat "$d/list-stopped.json"; fi
@@ -2337,6 +2419,7 @@ esac
             Duration::from_secs(5),
             Duration::from_millis(5),
             Duration::from_millis(1),
+            Duration::from_millis(50),
         )
     }
 
@@ -2954,19 +3037,22 @@ esac
         )
     }
 
+    /// The note of a resume that says it started a copy as the session
+    /// itself (and prints its bg id).
+    const SELF_COPY_NOTE: &str = "note: session abc12345 is already running in the background, \
+         so this started a copy as abc12345.\n";
+
     /// A resume whose copy note names the session itself (and prints its bg
-    /// id): nothing is stopped or removed for it, and the session is not
-    /// taken for a copy of itself.
+    /// id) may or may not have continued in place: the session is stopped
+    /// and waited for, never removed (that would remove the session
+    /// itself), and resumed once more. A second such note fails the turn
+    /// like a second copy.
     #[tokio::test]
-    async fn a_copy_note_naming_the_session_never_discards_it() {
+    async fn a_copy_note_naming_the_session_stops_it_and_resumes_again() {
         let fake = FakeClaude::new(&entry(None, "done"));
-        fake.file(
-            "bg-1.err",
-            "note: session abc12345 is already running in the background, so this started a \
-             copy as abc12345.\n",
-        );
+        fake.file("bg-1.err", SELF_COPY_NOTE);
         let driver = fast_driver(POLL_INTERVAL, DONE_GRACE);
-        let (updates, _rx) = TurnUpdates::channel();
+        let (updates, mut rx) = TurnUpdates::channel();
         let (session, _) = driver
             .next_turn(&fake.agent(), &fake.session(), "next", &updates)
             .await
@@ -2974,15 +3060,150 @@ esac
         assert_eq!(session, fake.session());
         let calls = fake.calls();
         assert!(!calls.contains("rm "), "{calls}");
-        assert!(!calls.contains("stop "), "{calls}");
+        let after_first = calls_after(&calls, "--bg --resume");
+        assert_eq!(
+            after_first,
+            [
+                "stop abc12345",
+                "agents --json --all",
+                "--bg --resume abc12345-1111 -- next",
+            ],
+            "{calls}"
+        );
+        // Only the second resume, which continued in place, was reported.
+        let reported: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(reported, [TurnUpdate::Session(fake.session())]);
+
+        // The note again on the second resume: the turn is not sent.
+        let fake = FakeClaude::new(&entry(None, "done"));
+        fake.file("bg-1.err", SELF_COPY_NOTE);
+        fake.file("bg-2.err", SELF_COPY_NOTE);
+        let (updates, _rx) = TurnUpdates::channel();
+        let result = driver
+            .next_turn(&fake.agent(), &fake.session(), "next", &updates)
+            .await;
+        assert_eq!(
+            result.unwrap_err(),
+            TurnOutcome::Failed(cannot_continue(&fake.agent()))
+        );
+        let calls = fake.calls();
+        assert!(!calls.contains("rm "), "{calls}");
         assert_eq!(
             calls
                 .lines()
                 .filter(|l| l.starts_with("--bg --resume"))
                 .count(),
-            1,
+            2,
             "{calls}"
         );
+    }
+
+    /// A copy just started may not be listed yet: it is listed again until
+    /// it shows, so its process is remembered and waited for, and removed
+    /// only once that process exited (not at once, taken for removed).
+    /// Nothing of it is remembered afterwards.
+    #[tokio::test]
+    async fn a_copy_not_listed_yet_is_waited_for_before_it_is_removed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.4")
+            .spawn()
+            .unwrap();
+        let fake = FakeClaude::new(&with_copy(&entry(None, "done"), Some(child.id())));
+        fake.file("agents-1.json", &entry(None, "done"));
+        fake.file("list-stopped.json", &with_copy(&entry(None, "done"), None));
+        let exits = fast_exits();
+        let started = Instant::now();
+        exits.discard_copy(&fake.agent(), "copy0001").await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "removed {} ms in, while the copy still ran",
+            started.elapsed().as_millis()
+        );
+        assert!(child.try_wait().unwrap().is_some());
+        let calls = fake.calls();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [
+                "agents --json --all",
+                "agents --json --all",
+                "stop copy0001",
+                "agents --json --all",
+                "rm copy0001"
+            ],
+            "{calls}"
+        );
+        assert!(!exits.remembers("copy0001"));
+    }
+
+    /// A session no listing shows while a process remembered for it still
+    /// runs is not gone yet: the wait goes by that process. Once it exited,
+    /// the session is gone.
+    #[tokio::test]
+    async fn an_unlisted_session_is_gone_only_once_its_process_exited() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.4")
+            .spawn()
+            .unwrap();
+        let fake = FakeClaude::new("[]");
+        let exits = fast_exits();
+        let listed = find_session(
+            &parse_agent_list(&entry(Some(child.id()), "working")).unwrap(),
+            "abc12345",
+        )
+        .unwrap();
+        exits.note("abc12345", &listed);
+        let started = Instant::now();
+        assert_eq!(
+            exits.wait_for_exit(&fake.agent(), "abc12345").await,
+            Ok(Stopped::Gone)
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "gone {} ms in, while its process still ran",
+            started.elapsed().as_millis()
+        );
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!exits.remembers("abc12345"));
+    }
+
+    /// What the driver remembers of a session goes when the runtime forgets
+    /// the session (`--new`, `--reset`), when a poll finds it removed, and
+    /// after a copy was discarded even when its wait ran out; a live
+    /// process would otherwise stay remembered for good.
+    #[tokio::test]
+    async fn remembered_processes_are_forgotten_with_their_session() {
+        let me = || ListedProcess::running_now(std::process::id()).unwrap();
+        let driver = fast_driver(Duration::from_millis(20), Duration::from_millis(5));
+        let fake = FakeClaude::new("[]");
+        driver.exits.seen().insert("abc12345".into(), vec![me()]);
+        driver.forget(&fake.session());
+        assert!(!driver.exits.remembers("abc12345"));
+        driver.forget(&SessionRef::default());
+
+        // A poll finds the session removed.
+        driver.exits.seen().insert("abc12345".into(), vec![me()]);
+        let (_hooks_tx, mut hooks) = mpsc::unbounded_channel();
+        let (updates, _rx) = TurnUpdates::channel();
+        let outcome = driver
+            .watch(
+                &fake.agent(),
+                fake.session(),
+                Utc::now(),
+                None,
+                &mut hooks,
+                &updates,
+            )
+            .await;
+        assert!(matches!(outcome, TurnOutcome::Failed(_)), "{outcome:?}");
+        assert!(!driver.exits.remembers("abc12345"));
+
+        // A copy whose process outlives the wait (this test process).
+        let fake = FakeClaude::new(&with_copy(&entry(None, "done"), Some(std::process::id())));
+        let mut exits = fast_exits();
+        exits.stop_wait = Duration::from_millis(50);
+        exits.discard_copy(&fake.agent(), "copy0001").await.unwrap();
+        assert!(fake.calls().contains("rm copy0001"), "{}", fake.calls());
+        assert!(!exits.remembers("copy0001"));
     }
 
     /// A copy is removed only once its process exited (`claude rm` right

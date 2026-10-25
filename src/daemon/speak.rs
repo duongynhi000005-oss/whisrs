@@ -168,7 +168,7 @@ pub(crate) fn stop_read_aloud(ds: &mut DaemonState, context: &DaemonContext) -> 
     }
     let _ = ds.state_machine.transition(Action::Cancel);
     let new_state = ds.state_machine.state();
-    let _ = context.state_tx.send(new_state);
+    context.state_tx.publish(ds);
     if let Some(level_tx) = &context.overlay_level_tx {
         let _ = level_tx.send(0.0);
     }
@@ -257,7 +257,14 @@ pub(crate) async fn speak_text(
         let _ = ds.state_machine.transition(Action::SpeakStart);
         ds.tts_stop = Some(Arc::clone(&stop));
         ds.tts_origin = Some(origin);
-        let _ = context.state_tx.send(ds.state_machine.state());
+        // Whose utterance it is: the reply queue marks it playing before it
+        // asks for the state, so the voice is that agent's (not the tray's
+        // or the pill's) from the first broadcast.
+        ds.tts_agent = match origin {
+            SpeakOrigin::Agent => context.agents.playing_agent(),
+            SpeakOrigin::Selection | SpeakOrigin::Text => None,
+        };
+        context.state_tx.publish(&ds);
     }
 
     info!("speak ({origin:?}): synthesizing {} chars", text.len());
@@ -379,7 +386,7 @@ async fn play(
         let mut ds = daemon_state.lock().await;
         if ds.state_machine.state() == State::Synthesizing && owns(&ds, &stop) {
             let _ = ds.state_machine.transition(Action::SpeakPlaying);
-            let _ = context.state_tx.send(ds.state_machine.state());
+            context.state_tx.publish(&ds);
         } else {
             // Cancelled in the window between first audio and this lock; the
             // canceller already set `stop`, so playback is winding down.
@@ -433,7 +440,7 @@ fn owns(ds: &DaemonState, stop: &Arc<AtomicBool>) -> bool {
 fn finish_session(ds: &mut DaemonState, context: &DaemonContext) {
     let _ = ds.state_machine.transition(Action::SpeakDone);
     ds.tts_stop = None;
-    let _ = context.state_tx.send(ds.state_machine.state());
+    context.state_tx.publish(ds);
     if let Some(level_tx) = &context.overlay_level_tx {
         let _ = level_tx.send(0.0);
     }

@@ -649,6 +649,12 @@ pub trait Driver: Send + Sync {
     /// task was aborted.
     async fn stop(&self, agent: &Agent, session: &SessionRef) -> Result<(), String>;
 
+    /// The runtime forgot `session` (`--new`, `--reset`): drop what the
+    /// driver remembers to continue it later. The session itself is left
+    /// alone; it keeps running in the harness. A process-per-turn driver
+    /// remembers nothing between turns.
+    fn forget(&self, session: &SessionRef);
+
     /// Whether a hook payload (`whisrs agent-hook`) belongs to `session`.
     /// Matched by stored ids only, never by name.
     fn hook_matches(&self, payload: &serde_json::Value, session: &SessionRef) -> bool;

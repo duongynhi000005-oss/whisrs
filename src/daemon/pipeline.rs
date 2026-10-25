@@ -23,7 +23,7 @@ use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 use xkb_type::ClipboardBackend;
 
-use crate::context::{DaemonContext, DaemonState};
+use crate::context::{DaemonContext, DaemonState, StateBus};
 use crate::factory::get_model_for_backend;
 use crate::injection::{
     deliver_streaming_delta, fold_line_breaks_at_terminal, inject_text, is_terminal_window,
@@ -54,7 +54,7 @@ pub(crate) struct StreamingPipelineParams {
     pub(crate) backend: Arc<dyn TranscriptionBackend>,
     pub(crate) daemon_state: Arc<Mutex<DaemonState>>,
     pub(crate) window_tracker: Arc<dyn WindowTracker>,
-    pub(crate) state_tx: tokio::sync::watch::Sender<State>,
+    pub(crate) state_tx: StateBus,
     pub(crate) cancel_flag: Arc<AtomicBool>,
 
     // Per-session values captured when recording started.
@@ -291,7 +291,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                 if let Err(e) = ds.state_machine.transition(Action::Toggle) {
                     warn!("auto-stop state transition failed: {e}");
                 } else {
-                    let _ = state_tx.send(ds.state_machine.state());
+                    state_tx.publish(&ds);
                 }
             }
             break;
@@ -432,7 +432,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         // Auto-stop ends the session without a stop-toggle — clear the
         // session language so it can't leak into the next recording.
         ds.session_language = None;
-        let _ = state_tx.send(ds.state_machine.state());
+        state_tx.publish(&ds);
         if audio_feedback && !cancelled {
             feedback::play_done(audio_feedback_volume);
         }
@@ -840,9 +840,14 @@ pub(crate) async fn transcribe_batch_audio(
     }
 
     // Progress toast for the command flows — after the gate, so a silent
-    // recording only surfaces the skip toast above.
+    // recording only surfaces the skip toast above. An agent's is left out
+    // only while an agent overlay shows (the pill never shows agent mode).
     if let Some(msg) = opts.origin.processing_message() {
-        if context.notify_state() {
+        let notify = match opts.origin {
+            BatchOrigin::Agent { .. } => context.notify_agent_state(),
+            _ => context.notify_state(),
+        };
+        if notify {
             send_notification("whisrs", &msg);
         }
     }
@@ -2077,12 +2082,14 @@ mod tests {
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(backend),
             notify: false,
-            state_tx: tokio::sync::watch::channel(State::Idle).0,
+            state_tx: StateBus::new(),
             overlay_level_tx: None,
             overlay_enabled: false,
             #[cfg(feature = "recording")]
             recording: crate::recording::RecordingRuntime::new().0,
             agents: crate::agent::AgentRuntime::disabled(),
+            agent_board: tokio::sync::watch::channel(Vec::new()).0,
+            agent_overlay_shown: AtomicBool::new(false),
         }
     }
 
