@@ -848,7 +848,8 @@ pub struct LocalWhisperConfig {
     #[serde(default = "default_local_whisper_segmentation")]
     pub segmentation: String,
     /// Milliseconds of continuous silence that ends a phrase in `"silence"`
-    /// segmentation mode.
+    /// segmentation mode. Recordings and batch calls past 28 s are cut with
+    /// it too, capped at 900 ms.
     #[serde(default = "default_phrase_silence_ms")]
     pub phrase_silence_ms: u64,
     /// Turn on whisper.cpp flash attention when the model loads. Off by

@@ -148,7 +148,8 @@ impl LocalWhisperBackend {
     ///
     /// `mode` is `"silence"` (default), `"window"` or `"none"`;
     /// `phrase_silence_ms` is how much continuous silence ends a phrase in
-    /// silence mode.
+    /// silence mode, and (capped at 900 ms) where recordings and batch calls
+    /// past 28 s are cut.
     pub fn with_segmentation(mut self, mode: &str, phrase_silence_ms: u64) -> Self {
         self.segmentation = SegmentationMode::parse(mode);
         self.phrase_silence_ms = phrase_silence_ms.max(1);
