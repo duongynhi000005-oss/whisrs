@@ -520,14 +520,14 @@ mod tests {
         let id = session_id_at(1_792_864_707_166, 1, [0; 14]);
         assert_eq!(id, "ses_e90ef9da1ffe00000000000000");
         let later = session_id_at(1_792_864_707_167, 1, [61; 14]);
-        assert!(later < id, "{later} sorts before {id}");
-        assert!(later.ends_with("zzzzzzzzzzzzzz"), "{later}");
+        assert!(later < id, "a later millisecond sorts first");
+        assert!(later.ends_with("zzzzzzzzzzzzzz"));
         // The counter keeps two ids of one millisecond apart, in order.
         assert!(session_id_at(5, 2, [0; 14]) < session_id_at(5, 1, [0; 14]));
         let (a, b) = (new_session_id(), new_session_id());
         assert_ne!(a, b);
-        assert!(a.starts_with("ses_") && a.len() == 30, "{a}");
-        assert!(a[4..].chars().all(|c| c.is_ascii_alphanumeric()), "{a}");
+        assert!(a.starts_with("ses_") && a.len() == 30);
+        assert!(a[4..].chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
     #[test]

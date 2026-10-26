@@ -582,10 +582,7 @@ mod tests {
                 &request("x"),
             )
             .unwrap_err();
-        assert!(
-            err.contains("is not a Codex thread id") && err.contains("whisrs agent cx --new"),
-            "{err}"
-        );
+        assert!(err.contains("is not a Codex thread id") && err.contains("whisrs agent cx --new"));
         assert!(!err.contains('\u{2014}'));
     }
 

@@ -632,7 +632,7 @@ mod tests {
                 )
                 .unwrap();
             let id = launch.session.clone().unwrap();
-            assert!(is_session_id(&id), "{id}");
+            assert!(is_session_id(&id));
             let mut want = strings(&["--output-format", "json"]);
             want.push(format!("--session-id={id}"));
             want.extend(strings(flags));
@@ -712,8 +712,7 @@ mod tests {
                 .unwrap_err();
             assert!(
                 err.contains("is not a Copilot session id")
-                    && err.contains("whisrs agent cp --new"),
-                "{err}"
+                    && err.contains("whisrs agent cp --new")
             );
             assert!(!err.contains('\u{2014}'));
         }
@@ -732,9 +731,9 @@ mod tests {
         let (a, b) = (new_session_id(), new_session_id());
         assert_ne!(a, b);
         for id in [&a, &b] {
-            assert!(is_session_id(id), "{id}");
-            assert_eq!(&id[14..15], "4", "{id}");
-            assert!("89ab".contains(&id[19..20]), "{id}");
+            assert!(is_session_id(id));
+            assert_eq!(&id[14..15], "4");
+            assert!("89ab".contains(&id[19..20]));
         }
     }
 
@@ -792,8 +791,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.starts_with("Agent 'cp': cannot write its voice instruction for Copilot to ")
-                && err.contains("whisrs-voice.instructions.md"),
-            "{err}"
+                && err.contains("whisrs-voice.instructions.md")
         );
     }
 

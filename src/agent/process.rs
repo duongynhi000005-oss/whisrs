@@ -2440,6 +2440,16 @@ mod tests {
     /// the parent is gone: the tree, with no scope.
     #[tokio::test]
     async fn a_stop_reaches_a_process_that_left_the_group() {
+        // `setsid` is util-linux, not in every build sandbox (the Nix one).
+        // Without it the script's child exits at once and proves nothing.
+        if std::process::Command::new("setsid")
+            .arg("true")
+            .status()
+            .is_err()
+        {
+            eprintln!("skipped: no setsid here");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let script = "setsid sleep 41 & echo $! > pid; sleep 30";
         let (took, leader, child) = stop_after_start(script, dir.path()).await;
