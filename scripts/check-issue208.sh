@@ -4,7 +4,8 @@
 # With [local-whisper] segmentation = "none", the daemon transcribes a whole
 # dictation after it stops. One whisper.cpp call over a long dictation let the
 # text decoded in one 30 s window carry into the next, and it looped. Past
-# 28 s the dictation is now decoded in windows of at most 28 s, cut at pauses.
+# 28 s the dictation is now decoded in windows of about 28 s at most, cut at
+# pauses.
 #
 # Generates the fixture (if missing) and transcribes it the way the daemon
 # does for "none" (examples/issue208_batch_check.rs), in English, with a real

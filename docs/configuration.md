@@ -41,10 +41,10 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # that discards it. `whisrs config` warns the same on save.
                             # Recordings (whisrs recording) never send the prompt,
                             # only the vocabulary (and with local-whisper, neither).
-                            # local-whisper sends it with every phrase or window it
-                            # decodes, so write it in the language you dictate in:
-                            # a prompt in another language pulls the transcript
-                            # toward that language.
+                            # local-whisper sends it with every dictation phrase or
+                            # window it decodes, so write it in the language you
+                            # dictate in: a prompt in another language pulls the
+                            # transcript toward that language.
 tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # on-screen dictation overlay (Hyprland/Sway, GNOME extension)
 

@@ -476,9 +476,9 @@ pub struct GeneralConfig {
     /// Free-form prompt prepended to the vocabulary list before being sent to
     /// the transcription backend. Use this for sentence-style context (style,
     /// register, language hints) that doesn't fit a single-term vocabulary.
-    /// Local whisper sends it with every phrase or window it decodes, so it
-    /// belongs in the language you dictate in: a prompt in another language
-    /// pulls the transcript toward that language.
+    /// Local whisper sends it with every dictation phrase or window it
+    /// decodes, so it belongs in the language you dictate in: a prompt in
+    /// another language pulls the transcript toward that language.
     #[serde(default)]
     pub prompt: Option<String>,
     /// Enable system tray icon.

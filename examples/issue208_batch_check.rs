@@ -175,7 +175,15 @@ async fn main() -> anyhow::Result<ExitCode> {
         .filter(|p| !p.is_empty());
     let min_coverage: Option<f64> = std::env::var("WHISRS_ISSUE208_MIN_COVERAGE")
         .ok()
-        .and_then(|v| v.parse().ok());
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            v.parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "WHISRS_ISSUE208_MIN_COVERAGE={v:?} is not a fraction such as \"0.9\": {e}"
+                )
+            })
+        })
+        .transpose()?;
     anyhow::ensure!(
         min_coverage.is_none() || truth_path.is_some(),
         "WHISRS_ISSUE208_MIN_COVERAGE needs a ground-truth file"
