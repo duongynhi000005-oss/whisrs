@@ -310,20 +310,22 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 #   text. Continuous speech is force-split at the first silent moment after
 #   20 s (hard ceiling 28 s) so it still emits.
 # - "window": legacy 8s/2s overlapping sliding window with text-based dedup.
-# - "none": no splitting, no streaming. Nothing is typed while you talk;
-#   when you stop, the whole dictation is transcribed in one pass and typed
-#   at once. Use it for long dictation you don't want split into phrases.
+# - "none": no streaming. Nothing is typed while you talk; when you stop,
+#   the whole dictation is transcribed and typed at once. Use it for long
+#   dictation you don't want split into phrases.
 #   The wait after stopping grows with the dictation (a few seconds per
 #   minute of speech with large-v3-turbo on a GPU, longer on CPU). It also
 #   makes [general] llm_post_process and [input] paste apply to dictation.
-#   A very long dictation is still a single decode, not reset per phrase
-#   like "silence". The recording feature (whisrs recording) ignores this
-#   setting and always decodes in phrases.
+#   Past 28 s the dictation is decoded in windows of at most 28 s, cut at
+#   pauses and each given the prompt, so a long dictation does not fall into
+#   whisper's repetition loop (issue #208). The recording feature (whisrs
+#   recording) ignores this setting and always decodes in phrases.
 # segmentation = "silence"
 # phrase_silence_ms: continuous silence (ms) that ends a phrase in "silence"
-# mode (ignored by "window" and "none" for dictation; the recording feature
-# always uses it, capped at 900 ms so every gap between the speech it sends ends
-# a phrase).
+# mode (ignored by "window"; "none" uses it only to find the pauses where a
+# dictation over 28 s is cut, and the recording feature always uses it, both
+# capped at 900 ms so every gap between the speech a recording sends ends a
+# phrase).
 # Lower = snappier output, higher = fewer mid-sentence splits.
 # phrase_silence_ms = 400
 # flash_attn: enable whisper.cpp flash attention (default false). It can cut

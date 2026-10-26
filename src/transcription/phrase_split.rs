@@ -32,7 +32,8 @@
 //!
 //! Local whisper recordings then group consecutive phrases into decode
 //! windows ([`decode_windows`]): one `full()` call per window instead of per
-//! phrase.
+//! phrase. A batch dictation longer than one window is grouped the same way
+//! ([`dictation_windows`]).
 
 use std::ops::Range;
 
@@ -108,8 +109,26 @@ pub fn decode_windows(
     phrases: &[Phrase],
     sample_rate: usize,
 ) -> Vec<DecodeWindow> {
-    let max_len = MAX_DECODE_WINDOW_SECS * sample_rate;
     let joins = zero_runs(samples, JOIN_ZERO_MS * sample_rate / 1000);
+    group_windows(phrases, sample_rate, &joins)
+}
+
+/// [`decode_windows`] for one continuous take, a dictation: it has no joins,
+/// so only the window length ends a window. A noise gate or a muted mic
+/// records its pauses as exact zeros, and ending a window at each of those
+/// would cost a whole encoder pass per phrase.
+pub fn dictation_windows(phrases: &[Phrase], sample_rate: usize) -> Vec<DecodeWindow> {
+    group_windows(phrases, sample_rate, &[])
+}
+
+/// The grouping behind [`decode_windows`] and [`dictation_windows`]: a
+/// window ends at the length cap or at any of `joins`.
+fn group_windows(
+    phrases: &[Phrase],
+    sample_rate: usize,
+    joins: &[Range<usize>],
+) -> Vec<DecodeWindow> {
+    let max_len = MAX_DECODE_WINDOW_SECS * sample_rate;
     let mut windows: Vec<DecodeWindow> = Vec::new();
     for phrase in phrases {
         let start = phrase.start_sample as usize;
@@ -964,5 +983,36 @@ mod tests {
         assert!(windows
             .iter()
             .all(|w| w.range.len() <= MAX_DECODE_WINDOW_SECS * RATE));
+    }
+
+    /// A noise gate or a muted mic records a dictation's pauses as exact
+    /// zeros. A recording ends a window at each of those (a join); a
+    /// dictation has no joins, so it packs phrases up to the cap across them.
+    #[test]
+    fn dictation_windows_pack_across_exact_zero_pauses() {
+        // 60 s: 24 turns of 1.5 s, each followed by a second of exact zeros.
+        let mut audio = Vec::new();
+        for _ in 0..24 {
+            audio.extend(voice(1.5));
+            audio.extend(std::iter::repeat_n(0i16, RATE));
+        }
+        let phrases = phrases_of(&audio);
+        assert_eq!(phrases.len(), 24);
+
+        let recording = decode_windows(&audio, &phrases, RATE);
+        assert_eq!(recording.len(), 24, "every join ends a recording window");
+        let dictation = dictation_windows(&phrases, RATE);
+        assert_eq!(dictation.len(), 3, "{dictation:?}");
+
+        for windows in [&recording, &dictation] {
+            assert_eq!(
+                windows.iter().map(|w| w.phrases).sum::<usize>(),
+                phrases.len()
+            );
+            assert!(windows
+                .iter()
+                .all(|w| w.range.len() <= MAX_DECODE_WINDOW_SECS * RATE));
+        }
+        assert!(dictation_windows(&[], RATE).is_empty());
     }
 }

@@ -838,7 +838,8 @@ pub struct LocalWhisperConfig {
     /// into phrases at natural pauses and decodes each exactly once;
     /// `"window"` is the legacy overlapping sliding window with text dedup;
     /// `"none"` turns streaming off, so nothing is typed until recording
-    /// stops and the whole recording is decoded at once.
+    /// stops and the whole recording is decoded then (past 28 s in windows
+    /// of at most 28 s, cut at pauses).
     #[serde(default = "default_local_whisper_segmentation")]
     pub segmentation: String,
     /// Milliseconds of continuous silence that ends a phrase in `"silence"`
