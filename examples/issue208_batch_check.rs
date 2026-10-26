@@ -4,7 +4,9 @@
 //! Transcribes a WAV file exactly the way the daemon does for "none":
 //! `LocalWhisperBackend` with that segmentation, one `transcribe` call on the
 //! whole recording as a WAV. Then it looks for a loop in the transcript and,
-//! given a ground truth, measures how much of it the transcript covers.
+//! given a ground truth, measures how much of it the transcript covers and
+//! fails a transcript with more than 1.2x its words (repeated or invented
+//! text that no back-to-back loop shows).
 //!
 //! Usage:
 //!   cargo run --release --example issue208_batch_check --features local-whisper -- \
@@ -22,8 +24,8 @@
 //!                                 that fraction of ground-truth words
 //!                                 appears in the transcript
 //!
-//! Exit code: 0 if the transcript has no loop (and coverage passes when
-//! required), 1 otherwise.
+//! Exit code: 0 if the transcript has no loop and not too many words (and
+//! coverage passes when required), 1 otherwise or on an error.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -35,8 +37,11 @@ use whisrs::transcription::{
 
 /// A phrase repeated back to back at least this many times is a loop.
 const LOOP_MIN_REPEATS: usize = 3;
-/// Phrase lengths, in words, the loop detector tries.
-const LOOP_PHRASE_WORDS: std::ops::RangeInclusive<usize> = 2..=12;
+/// Phrase lengths, in words, the loop detector tries: up to a long sentence.
+const LOOP_PHRASE_WORDS: std::ops::RangeInclusive<usize> = 2..=40;
+/// A transcript with more words than this times the ground truth's repeats
+/// or invents text, even when no phrase repeats back to back.
+const MAX_TRUTH_WORD_RATIO: f64 = 1.2;
 
 fn default_model_path() -> String {
     dirs::data_dir()
@@ -223,6 +228,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
 
     let mut coverage_failed = false;
+    let mut too_many_words = false;
     if let Some(p) = &truth_path {
         let truth = normalize_words(&std::fs::read_to_string(p)?);
         let coverage = truth_coverage(&words, &truth);
@@ -231,6 +237,14 @@ async fn main() -> anyhow::Result<ExitCode> {
             coverage * 100.0,
             truth.len()
         );
+        if words.len() as f64 > MAX_TRUTH_WORD_RATIO * truth.len() as f64 {
+            println!(
+                "WORD COUNT FAIL: {} words, more than {MAX_TRUTH_WORD_RATIO}x the {} truth words",
+                words.len(),
+                truth.len()
+            );
+            too_many_words = true;
+        }
         if let Some(min) = min_coverage {
             if coverage < min {
                 println!(
@@ -245,6 +259,9 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     if found.is_some() {
         println!("\nRESULT: FAIL, repetition loop (issue #208 reproduced)");
+        Ok(ExitCode::from(1))
+    } else if too_many_words {
+        println!("\nRESULT: FAIL, more words than the dictation (repeated or invented text)");
         Ok(ExitCode::from(1))
     } else if coverage_failed {
         println!("\nRESULT: FAIL, transcript does not cover the dictation");

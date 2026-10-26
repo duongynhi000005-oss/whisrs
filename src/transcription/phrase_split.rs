@@ -32,8 +32,8 @@
 //!
 //! Local whisper recordings then group consecutive phrases into decode
 //! windows ([`decode_windows`]): one `full()` call per window instead of per
-//! phrase. A batch dictation longer than one window is grouped the same way
-//! ([`dictation_windows`]).
+//! phrase. A batch dictation longer than one window is grouped much the same
+//! way, into windows of about even length ([`dictation_windows`]).
 
 use std::ops::Range;
 
@@ -110,25 +110,43 @@ pub fn decode_windows(
     sample_rate: usize,
 ) -> Vec<DecodeWindow> {
     let joins = zero_runs(samples, JOIN_ZERO_MS * sample_rate / 1000);
-    group_windows(phrases, sample_rate, &joins)
+    group_windows(phrases, sample_rate, &joins, false)
 }
 
-/// [`decode_windows`] for one continuous take, a dictation: it has no joins,
-/// so only the window length ends a window. A noise gate or a muted mic
-/// records its pauses as exact zeros, and ending a window at each of those
-/// would cost a whole encoder pass per phrase.
+/// [`decode_windows`] for one continuous take, a dictation, with the
+/// windows evened out: the span from a window's start to the last phrase's
+/// end is cut into as few windows as fit [`MAX_DECODE_WINDOW_SECS`], and the
+/// window closes once it reaches its even share of that span. Packing to the
+/// cap would leave a last window of a second or two, with little speech to
+/// anchor its decode, where trailing noise can come out as a standalone
+/// hallucination. The share is worked out again at each window's start, so
+/// the overshoot of windows that close past their share (on the phrase that
+/// reaches it) does not pile up onto the last one.
+///
+/// A dictation has no joins, so only the length ends a window: a noise gate
+/// or a muted mic records its pauses as exact zeros, and ending a window at
+/// each of those would cost a whole encoder pass per phrase.
 pub fn dictation_windows(phrases: &[Phrase], sample_rate: usize) -> Vec<DecodeWindow> {
-    group_windows(phrases, sample_rate, &[])
+    group_windows(phrases, sample_rate, &[], true)
 }
 
-/// The grouping behind [`decode_windows`] and [`dictation_windows`]: a
-/// window ends at the length cap or at any of `joins`.
+/// The grouping behind [`decode_windows`] and [`dictation_windows`]: the
+/// next phrase joins the current window while the window would still end
+/// within [`MAX_DECODE_WINDOW_SECS`] of its start, no join lies between
+/// them and, when `even`, the window is still shorter than its even share
+/// of the span left from its start.
 fn group_windows(
     phrases: &[Phrase],
     sample_rate: usize,
     joins: &[Range<usize>],
+    even: bool,
 ) -> Vec<DecodeWindow> {
     let max_len = MAX_DECODE_WINDOW_SECS * sample_rate;
+    let span_end = phrases
+        .last()
+        .map_or(0, |p| p.start_sample as usize + p.samples.len());
+    // Without `even`, a window packs phrases up to the cap.
+    let mut target = usize::MAX;
     let mut windows: Vec<DecodeWindow> = Vec::new();
     for phrase in phrases {
         let start = phrase.start_sample as usize;
@@ -140,11 +158,18 @@ fn group_windows(
             let joined = joins
                 .iter()
                 .any(|j| j.start < end && j.end > window.range.end);
-            if !joined && end.saturating_sub(window.range.start) <= max_len {
+            if !joined
+                && end.saturating_sub(window.range.start) <= max_len
+                && window.range.len() < target
+            {
                 window.range.end = window.range.end.max(end);
                 window.phrases += 1;
                 continue;
             }
+        }
+        if even {
+            let left = span_end.saturating_sub(start);
+            target = left / left.div_ceil(max_len).max(1);
         }
         windows.push(DecodeWindow {
             range: start..end,
@@ -1014,5 +1039,91 @@ mod tests {
                 .all(|w| w.range.len() <= MAX_DECODE_WINDOW_SECS * RATE));
         }
         assert!(dictation_windows(&[], RATE).is_empty());
+    }
+
+    /// Every phrase in exactly one window, in order, and no window past the
+    /// cap.
+    fn assert_whole_phrases_in_order(windows: &[DecodeWindow], phrases: &[Phrase]) {
+        assert_eq!(
+            windows.iter().map(|w| w.phrases).sum::<usize>(),
+            phrases.len()
+        );
+        let mut next = 0;
+        for (i, window) in windows.iter().enumerate() {
+            assert!(
+                window.range.len() <= MAX_DECODE_WINDOW_SECS * RATE,
+                "{window:?}"
+            );
+            if i > 0 {
+                assert!(windows[i - 1].range.end <= window.range.start);
+            }
+            for phrase in &phrases[next..next + window.phrases] {
+                let start = phrase.start_sample as usize;
+                assert!(window.range.start <= start);
+                assert!(start + phrase.samples.len() <= window.range.end);
+            }
+            next += window.phrases;
+        }
+    }
+
+    /// From the first phrase's start to the last one's end.
+    fn span_of(phrases: &[Phrase]) -> usize {
+        let last = phrases.last().expect("phrases");
+        last.start_sample as usize + last.samples.len() - phrases[0].start_sample as usize
+    }
+
+    /// A 30 s dictation of short turns: packed to the cap, its last window
+    /// would hold one turn; evened out, it is two windows of 16.6 s and
+    /// 11.7 s.
+    #[test]
+    fn dictation_windows_split_the_span_evenly() {
+        let mut audio = Vec::new();
+        for _ in 0..12 {
+            audio.extend(voice(1.5));
+            audio.extend(pause(1.0));
+        }
+        let phrases = phrases_of(&audio);
+        assert_eq!(phrases.len(), 12);
+        let span = span_of(&phrases);
+
+        let packed = decode_windows(&audio, &phrases, RATE);
+        assert_eq!(packed.len(), 2, "{packed:?}");
+        assert!(packed[1].range.len() < 3 * RATE, "{packed:?}");
+
+        let windows = dictation_windows(&phrases, RATE);
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert_whole_phrases_in_order(&windows, &phrases);
+        for window in &windows {
+            assert!(window.range.len() >= span / 3, "{windows:?}");
+        }
+    }
+
+    /// A long dictation of uneven turns and pauses: as few windows as fit
+    /// the cap, none past it or under half its share of the span, every
+    /// phrase in exactly one, in order.
+    #[test]
+    fn long_dictation_windows_stay_under_the_cap() {
+        let mut audio = Vec::new();
+        for i in 0..50 {
+            audio.extend(voice(1.0 + (i % 5) as f64 * 0.7));
+            audio.extend(pause(0.5 + (i % 3) as f64 * 0.5));
+        }
+        let phrases = phrases_of(&audio);
+        assert_eq!(phrases.len(), 50);
+        let span = span_of(&phrases);
+
+        let windows = dictation_windows(&phrases, RATE);
+        assert_eq!(
+            windows.len(),
+            span.div_ceil(MAX_DECODE_WINDOW_SECS * RATE),
+            "{windows:?}"
+        );
+        assert_whole_phrases_in_order(&windows, &phrases);
+        for window in &windows {
+            assert!(
+                window.range.len() >= span / windows.len() / 2,
+                "{windows:?}"
+            );
+        }
     }
 }

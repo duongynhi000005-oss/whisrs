@@ -14,7 +14,7 @@
 #   fixtures/issue208_long.wav   16 kHz mono s16 test audio (~273 s, pauses)
 #   fixtures/issue208_long.txt   ground-truth transcript (one line, 433 words)
 #
-# Requires: espeak-ng, ffmpeg
+# Requires: espeak-ng, ffmpeg, ffprobe
 #
 # Usage:
 #   ./scripts/gen-issue208-fixture.sh          # writes the fixture
@@ -45,7 +45,7 @@ for arg in "$@"; do
     esac
 done
 
-for tool in espeak-ng ffmpeg; do
+for tool in espeak-ng ffmpeg ffprobe; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         error "Missing required tool: $tool"
         exit 1

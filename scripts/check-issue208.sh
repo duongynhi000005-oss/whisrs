@@ -9,13 +9,16 @@
 # Generates the fixture (if missing) and transcribes it the way the daemon
 # does for "none" (examples/issue208_batch_check.rs), in English, with a real
 # user's prompt that made the unfixed code loop 33 times on it. Passes when the
-# transcript has no loop (a 2 to 12 word phrase repeated 3 or more times back
-# to back) and covers at least 90% of the ground-truth words.
+# transcript has no loop (a 2 to 40 word phrase repeated 3 or more times back
+# to back), has at most 1.2x the ground truth's words, and covers at least 90%
+# of them.
 #
 # Needs large-v3-turbo: base.en and small.en never looped on this fixture.
 # Takes a few minutes on CPU.
 #
-# Exit code: 0 = pass, 1 = loop or low coverage, 2 = model not found.
+# Exit code: 0 = pass, 1 = loop, too many words, low coverage or a harness
+# error (bad WAV, failed decode), 2 = model not found. A failed build exits
+# with cargo's code.
 #
 # Usage:
 #   ./scripts/check-issue208.sh                 # uses ~/.local/share/whisrs/models/ggml-large-v3-turbo-q5_0.bin
