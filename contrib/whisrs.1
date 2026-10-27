@@ -103,13 +103,71 @@ new instruction text, then run this \(em it is saved to
 and applied live. Pairs with an entry's
 .BR set_hotkey .
 .TP
-.B speak
+\fBspeak\fR [\fB\-\-text\fR \fITEXT\fR]
 Read the current text selection aloud via text-to-speech. A second
 .B speak
 or a
 .B cancel
 stops playback. Alias:
 .BR read .
+With
+.BR \-\-text ,
+speak
+.I TEXT
+instead of the selection
+.RB ( "\-\-text \-"
+reads it from standard input); a read-aloud in progress is stopped first.
+.TP
+\fBagent\fR [\fINAME\fR] [\fB\-\-text\fR \fITEXT\fR] [\fB\-\-new\fR] [\fB\-\-reset\fR] [\fB\-\-stop\fR]
+Talk to a coding agent configured in
+.B [[agents]]
+(Claude Code, OpenCode, Codex or GitHub Copilot CLI). Without
+.IR NAME ,
+list the agents with their harness, state
+.RB ( idle ,
+.BR working ,
+or
+.BR needs\-you )
+and the session's id (Claude Code's background id, which
+.B claude attach
+takes; OpenCode's session id, which
+.B opencode \-\-session
+takes; Codex's thread id, which
+.B codex resume
+takes; Copilot's session id, which
+.B copilot \-\-resume=
+takes). With
+.IR NAME ,
+record a voice instruction for that agent (the same as its hotkey; run again
+to stop) and send it to the agent's session; the reply is spoken through
+.B [tts]
+when the turn ends, and the next turn continues the same session. A run
+while that agent's turn is still working is refused with a short spoken
+notice; when that agent's own reply or notice is playing, it only stops it,
+and another agent's reply keeps playing.
+.B \-\-text
+sends
+.I TEXT
+instead of recording
+.RB ( "\-\-text \-"
+reads standard input).
+.B \-\-new
+records a voice instruction that starts a fresh session instead (the same as
+the agent's
+.BR new_session_hotkey ;
+run it again, or press either hotkey, to stop and send); with
+.BR \-\-text ,
+it sends
+.I TEXT
+to a fresh session.
+.B \-\-reset
+forgets the session and sends nothing; the next turn starts a new one. Both
+are refused while a turn of that agent runs (one that waits for you is named
+by what it waits for, since a plain run answers it).
+.B \-\-stop
+stops the running turn and keeps the session. With no turn running it stops
+work the session does on its own, such as a background task it started, which
+refuses new turns until it ends. whisrs only ever touches sessions it started.
 .TP
 .B status
 Query the dictation state (for a recording, see
@@ -419,6 +477,13 @@ override with
 .B [recording] dir
 in
 .IR config.toml ).
+.TP
+.I $XDG_DATA_HOME/whisrs/agents.json
+The session of each
+.B [[agents]]
+entry (mode 0600; defaults to
+.IR ~/.local/share/whisrs/agents.json ).
+Written only when agents are configured.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -455,6 +520,12 @@ Check daemon state:
 .PP
 .RS
 .B whisrs status
+.RE
+.PP
+Send a typed turn to the agent named jarvis:
+.PP
+.RS
+.B whisrs agent jarvis \-\-text "run the tests and tell me what failed"
 .RE
 .SH SEE ALSO
 .BR whisrsd (1)

@@ -16,7 +16,9 @@ use dialoguer::{Confirm, Editor, Input, Select};
 
 use crate::config::{setup, vocabulary};
 use crate::service::ServiceManager;
-use crate::{Config, HotkeyConfig, RestartOutcome};
+use crate::{
+    AgentOverlayConfig, AgentOverlayCorner, AgentOverlayStyle, Config, HotkeyConfig, RestartOutcome,
+};
 #[cfg(feature = "recording")]
 use crate::{DiarizationMode, RecordingConfig};
 
@@ -189,6 +191,8 @@ fn default_config() -> Config {
         hooks: None,
         overlay: None,
         llm_commands: Vec::new(),
+        agents: Vec::new(),
+        agent_overlay: None,
         replacements: Default::default(),
         recording: None,
     }
@@ -1026,7 +1030,82 @@ fn edit_tray_overlay(config: &mut Config) -> Result<()> {
             "  {DIM}Note: position, width/height and custom colors can be set by hand in config.toml.{RESET}"
         );
     }
+
+    // The agent overlay draws only with [[agents]] entries.
+    if !config.agents.is_empty() {
+        edit_agent_overlay(config);
+    }
     Ok(())
+}
+
+/// The agent overlay's styles, as the editor offers them.
+const AGENT_OVERLAY_STYLES: [(AgentOverlayStyle, &str); 2] = [
+    (
+        AgentOverlayStyle::Orb,
+        "Orb   (rings and arcs in the state's color)",
+    ),
+    (
+        AgentOverlayStyle::Face,
+        "Face  (a small face whose eyes and mouth show the state)",
+    ),
+];
+
+/// The agent overlay's corners, as the editor offers them.
+const AGENT_OVERLAY_CORNERS: [(AgentOverlayCorner, &str); 4] = [
+    (AgentOverlayCorner::BottomRight, "Bottom right"),
+    (AgentOverlayCorner::BottomLeft, "Bottom left"),
+    (AgentOverlayCorner::TopRight, "Top right"),
+    (AgentOverlayCorner::TopLeft, "Top left"),
+];
+
+/// `[agent_overlay]` style and corner, while it is shown (it follows the
+/// recording overlay unless `enabled` is set). Left out of the file while
+/// it holds only the defaults.
+fn edit_agent_overlay(config: &mut Config) {
+    let mut agent_overlay = config.agent_overlay.clone().unwrap_or_default();
+    if !agent_overlay.enabled(config.general.overlay) {
+        println!(
+            "  {DIM}Note: the agent overlay is off. `[agent_overlay] enabled = true` in config.toml shows it.{RESET}"
+        );
+        return;
+    }
+    println!(
+        "
+  {BOLD}Agent overlay{RESET}"
+    );
+    println!(
+        "  {DIM}A row per agent at work, in a screen corner: what it does and for how long.{RESET}"
+    );
+    let style = pick_option(
+        "Agent overlay style",
+        &AGENT_OVERLAY_STYLES,
+        agent_overlay.style(),
+    );
+    let corner = pick_option(
+        "Agent overlay corner",
+        &AGENT_OVERLAY_CORNERS,
+        agent_overlay.corner(),
+    );
+    agent_overlay.style = style.as_str().to_string();
+    agent_overlay.corner = corner.as_str().to_string();
+    config.agent_overlay =
+        (agent_overlay != AgentOverlayConfig::default()).then_some(agent_overlay);
+}
+
+/// Pick one of `options` (value, label), starting at `current`.
+fn pick_option<T: Copy + PartialEq>(prompt: &str, options: &[(T, &str)], current: T) -> T {
+    let default = options
+        .iter()
+        .position(|(value, _)| *value == current)
+        .unwrap_or(0);
+    let labels: Vec<&str> = options.iter().map(|(_, label)| *label).collect();
+    let choice = Select::new()
+        .with_prompt(prompt)
+        .items(&labels)
+        .default(default)
+        .interact()
+        .unwrap_or(default);
+    options[choice].0
 }
 
 fn edit_llm(config: &mut Config) -> Result<()> {
@@ -1729,6 +1808,38 @@ mod tests {
             )),
             "the last row ({last}) must be Discard & exit"
         );
+    }
+
+    /// The agent overlay's questions are asked only with agents configured,
+    /// and offer every style and corner there is.
+    #[test]
+    fn agent_overlay_questions_need_agents() {
+        let source = include_str!("edit.rs");
+        let body = source
+            .split("fn edit_tray_overlay(")
+            .nth(1)
+            .expect("edit.rs defines edit_tray_overlay")
+            .split("\nfn ")
+            .next()
+            .expect("edit_tray_overlay has a body");
+        let gate = body
+            .find("if !config.agents.is_empty() {")
+            .expect("the agent overlay is not gated on agents");
+        let asked = body
+            .find("edit_agent_overlay(config)")
+            .expect("edit_tray_overlay never asks about the agent overlay");
+        assert!(gate < asked);
+
+        for style in [AgentOverlayStyle::Orb, AgentOverlayStyle::Face] {
+            assert!(AGENT_OVERLAY_STYLES.iter().any(|(s, _)| *s == style));
+        }
+        for corner in ["bottom-right", "bottom-left", "top-right", "top-left"] {
+            let corner = AgentOverlayCorner::parse(corner).unwrap();
+            assert!(AGENT_OVERLAY_CORNERS.iter().any(|(c, _)| *c == corner));
+        }
+        // The default is the first offered, so a fresh config starts on it.
+        assert_eq!(AGENT_OVERLAY_STYLES[0].0, AgentOverlayStyle::default());
+        assert_eq!(AGENT_OVERLAY_CORNERS[0].0, AgentOverlayCorner::default());
     }
 
     /// The editor rewrites the whole `[hotkeys]` table from the struct, so a

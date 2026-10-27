@@ -15,7 +15,7 @@
 
 **Voice for the Linux desktop, written in Rust: dictation, read-aloud, and voice-driven LLM commands.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record your mic and the system audio too: both become one timestamped Markdown transcript, kept in its own folder.
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor, in any app, any window manager, any desktop environment. Select text and whisrs reads it aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar). Or say what you want and an LLM writes it at your cursor, or talk to a coding agent: Claude Code, OpenCode, Codex or GitHub Copilot works on it and answers out loud. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. Record your mic and the system audio too: both become one timestamped Markdown transcript, kept in its own folder.
 
 ![whisrs demo: dictation, read aloud, and command mode](assets/demo.gif)
 
@@ -237,6 +237,8 @@ whisrs command   # Command mode: select text + speak instruction → LLM rewrite
 whisrs llm-command <name>      # Toggle a named [[llm_commands]] entry (see config.toml)
 whisrs llm-command-set <name>  # Reprogram a named LLM command from the current selection
 whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
+whisrs speak --text "Hi"       # Speak the given text (--text - reads stdin)
+whisrs agent jarvis            # Talk to a coding agent (see [[agents]]); --text, --new, --reset, --stop; no name lists them
 whisrs recording start -t "Standup"   # Record mic + system audio; stop | toggle | cancel | status
 whisrs recording show last            # Print the latest recording's transcript (list | path | copy | retry)
 whisrs recording summarize last       # Summarize a transcript with the [llm] (or [recording] summary = true for each)
@@ -266,6 +268,23 @@ Three ways to put an LLM between your voice and the cursor, all sharing the one 
 `llm_post_process` works with **batch backends only** (`deepgram`, `groq`, `openai`, `asr-sidecar`). Streaming backends (including `local-whisper`) type text as it arrives, so no whole transcript ever exists to post-process and the flag is a silent no-op; `whisrsd` warns at startup if you pair them. Use an `[[llm_commands]]` hotkey instead, which works whatever the backend.
 
 If the LLM call fails, times out, or returns nothing, the raw transcript is typed instead, so a dictation is never lost to post-processing. Post-processed entries show up in `whisrs log` tagged `<backend>+llm`. Full reference: [docs/configuration.md](docs/configuration.md).
+
+### Voice + coding agent
+
+An `[[agents]]` entry gives a coding agent its own hotkey. Press it, say what you want, press again: whisrs sends it to a Claude Code background session (or, with `harness = "opencode"`, an OpenCode session; with `harness = "codex"`, a Codex CLI session; with `harness = "copilot"`, a GitHub Copilot CLI session, where each turn uses your Copilot plan's usage (AI credits, or premium requests on the legacy billing platform); Codex and Copilot were tested against a local mock model only) in the agent's directory and goes back to dictation. When the turn ends, you hear a short spoken reply (through `[tts]`), and the next press continues the same session, so answering the agent's question is one press. Press it while a reply plays to cut in; while that agent is still working, a press only silences its own reply.
+
+```toml
+[[agents]]
+name = "jarvis"
+hotkey = "Super+Shift+J"
+dir = "~/Projects/whisrs"
+permissions = "auto"   # auto | bypass | ask
+feedback = "brief"     # summary | brief | conversational
+```
+
+While it works, a small overlay in a screen corner (`[agent_overlay]`, an orb or a face) shows each agent listening, working, waiting for your approval or speaking, with what it does ("Running a command") and for how long. `feedback` sets what you hear before the reply: nothing (`summary`), a short "On it." (`brief`, the default), or that and short updates at milestones (`conversational`).
+
+`whisrs agent` lists the agents and what they are doing; `whisrs agent jarvis --text "..."` sends a typed turn, and `whisrs agent jarvis --new` (or an optional `new_session_hotkey`) records one that starts a fresh session. Sessions are named `whisrs-<name>` (in `claude agents`, or OpenCode's session list; Codex's and Copilot's are known by their id, which `whisrs agent` shows), and whisrs never touches a session it did not start. Setup and details: [Agent mode](docs/configuration.md#agent-mode).
 
 ---
 

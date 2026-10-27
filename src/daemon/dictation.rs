@@ -26,6 +26,9 @@ pub(crate) async fn handle_toggle(
     language: Option<String>,
 ) -> Response {
     let mut ds = daemon_state.lock().await;
+    // An agent reply playing does not block dictation: it is stopped and
+    // the toggle goes ahead (a selection read-aloud still refuses it).
+    crate::speak::stop_agent_playback(&mut ds, &context, "toggle");
     let current_state = ds.state_machine.state();
 
     match current_state {
@@ -155,7 +158,7 @@ pub(crate) async fn handle_toggle(
                 Ok(new_state) => {
                     info!("started recording");
                     // Broadcast recording state for tray.
-                    let _ = context.state_tx.send(new_state);
+                    context.state_tx.publish(&ds);
                     if context.config.general.audio_feedback {
                         feedback::play_start(context.config.general.audio_feedback_volume);
                     }
@@ -181,8 +184,22 @@ pub(crate) async fn handle_toggle(
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(_) => {
                     info!("stopped recording, transitioning to transcribing");
+                    // A plain toggle-stop on a command-mode / llm-command
+                    // recording takes the session over as plain dictation: the
+                    // audio is transcribed below, and the command context is
+                    // discarded here, under the lock this arm already holds.
+                    // The clear must happen on this press — the command
+                    // background task's claim bails on state != Recording
+                    // WITHOUT consuming its slot (`claim_session`'s bail is
+                    // deliberately mutation-free), so a slot left `Some` here
+                    // would satisfy the second-press command gates in
+                    // command_mode.rs during a later unrelated dictation and
+                    // silently steal its capture. Before the broadcast: an
+                    // agent's voice turn taken over shows on the tray and
+                    // pill as the dictation it now is.
+                    discard_command_sessions(&mut ds, "toggle-stop");
                     // Broadcast transcribing state for tray.
-                    let _ = context.state_tx.send(State::Transcribing);
+                    context.state_tx.publish(&ds);
                     if let Some(level_tx) = &context.overlay_level_tx {
                         let _ = level_tx.send(0.0);
                     }
@@ -207,18 +224,6 @@ pub(crate) async fn handle_toggle(
                     // it, and so does the await below if the pipeline exited
                     // early (error or panic) without reaching that tail.
                     let recording_started_at = ds.recording_started_at.take();
-                    // A plain toggle-stop on a command-mode / llm-command
-                    // recording takes the session over as plain dictation: the
-                    // audio is transcribed below, and the command context is
-                    // discarded here, under the lock this arm already holds.
-                    // The clear must happen on this press — the command
-                    // background task's claim bails on state != Recording
-                    // WITHOUT consuming its slot (`claim_session`'s bail is
-                    // deliberately mutation-free), so a slot left `Some` here
-                    // would satisfy the second-press command gates in
-                    // command_mode.rs during a later unrelated dictation and
-                    // silently steal its capture.
-                    discard_command_sessions(&mut ds, "toggle-stop");
                     // The language this session was started with. Consuming it
                     // here ends the language session.
                     let session_language =
@@ -279,7 +284,7 @@ pub(crate) async fn handle_toggle(
                     match ds.state_machine.transition(Action::TranscriptionDone) {
                         Ok(new_state) => {
                             // Broadcast idle state for tray.
-                            let _ = context.state_tx.send(new_state);
+                            context.state_tx.publish(&ds);
                             if let Some(level_tx) = &context.overlay_level_tx {
                                 let _ = level_tx.send(0.0);
                             }
@@ -332,7 +337,7 @@ pub(crate) async fn handle_toggle(
                         // (history, done-tone, toast). Report success without
                         // double-saving or double-notifying.
                         Err(_) if ds.state_machine.state() == State::Idle => {
-                            let _ = context.state_tx.send(State::Idle);
+                            context.state_tx.publish(&ds);
                             if let Some(level_tx) = &context.overlay_level_tx {
                                 let _ = level_tx.send(0.0);
                             }
@@ -380,6 +385,15 @@ pub(crate) async fn handle_cancel(
     context: Arc<DaemonContext>,
 ) -> Response {
     let mut ds = daemon_state.lock().await;
+
+    // Cancelling an agent reply also drops the replies queued after it.
+    // Any cancel drops the queued acknowledgements and progress updates:
+    // they are only worth saying while they are new.
+    if crate::speak::agent_playback(&ds) {
+        context.agents.drop_queued();
+    } else {
+        context.agents.drop_interims();
+    }
 
     // Stop any in-progress TTS playback regardless of recording state.
     let stopped_tts = if let Some(stop) = ds.tts_stop.take() {
@@ -466,7 +480,8 @@ fn discard_recording_session(ds: &mut DaemonState) {
     ds.session_language = None;
 }
 
-/// Take both command-session context slots (command mode and llm-command),
+/// Take every command-session context slot (command mode, llm-command and
+/// an agent's voice turn),
 /// logging any session actually discarded. `reason` names the trigger in the
 /// log line ("cancel", "toggle-stop").
 ///
@@ -483,6 +498,12 @@ pub(crate) fn discard_command_sessions(ds: &mut DaemonState, reason: &str) {
     if let Some(cmd) = ds.llm_command.take() {
         info!("{reason}: discarded llm-command '{}' session", cmd.name);
     }
+    if let Some(agent) = ds.agent_recording.take() {
+        info!("{reason}: discarded agent '{}' voice turn", agent.name);
+    }
+    // Only set while an agent's voice turn is transcribed, which neither
+    // exit from Recording reaches; cleared all the same.
+    ds.agent_transcribing = None;
 }
 
 /// Resolve the effective session language: the per-toggle `override_lang` when

@@ -60,10 +60,21 @@ pub struct Config {
     /// Overlay appearance config (theme, dimensions, optional custom colors).
     #[serde(default)]
     pub overlay: Option<OverlayConfig>,
+    /// The agent overlay (`[agent_overlay]`): one row per active
+    /// `[[agents]]` entry, apart from the recording pill.
+    #[serde(default)]
+    pub agent_overlay: Option<AgentOverlayConfig>,
     /// Named custom LLM commands, each with its own hotkey (see
     /// [`llm::LlmCommandConfig`]). Empty by default.
     #[serde(default)]
     pub llm_commands: Vec<llm::LlmCommandConfig>,
+    /// Coding agents driven by voice (see [`crate::agent::AgentConfig`]).
+    /// Empty by default: with none, agent mode writes nothing and runs
+    /// only one `systemctl --user list-units` at startup (the scope sweep).
+    /// Left out of the file when empty: an `agents = []` there would make a
+    /// pasted `[[agents]]` block invalid TOML.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<crate::agent::AgentConfig>,
     /// Word/phrase replacements applied to every dictation before it is
     /// typed, and to every line of a recording's transcript:
     /// `"package build" = "PKGBUILD"`. Matching rules are in
@@ -408,6 +419,130 @@ impl OverlayConfig {
     /// Parsed [`Self::position`]; unknown values fall back to the default.
     pub fn position(&self) -> OverlayPosition {
         OverlayPosition::parse(&self.position).unwrap_or_default()
+    }
+}
+
+/// The agent overlay (`[agent_overlay]`): a row per active agent (its
+/// state, what it does, how long), in a screen corner of its own. Only
+/// drawn when `[[agents]]` has an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentOverlayConfig {
+    /// Show it. Unset: follow `[general] overlay`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// `"orb"` (default) or `"face"`. Unknown values fall back to `"orb"`;
+    /// [`Config::validate`] warns.
+    #[serde(default = "default_agent_overlay_style")]
+    pub style: String,
+    /// `"bottom-right"` (default), `"bottom-left"`, `"top-right"` or
+    /// `"top-left"`. Unknown values (a `-center` one too) fall back to
+    /// `"bottom-right"`; [`Config::validate`] warns.
+    #[serde(default = "default_agent_overlay_corner")]
+    pub corner: String,
+}
+
+fn default_agent_overlay_style() -> String {
+    AgentOverlayStyle::default().as_str().to_string()
+}
+fn default_agent_overlay_corner() -> String {
+    AgentOverlayCorner::default().as_str().to_string()
+}
+
+impl Default for AgentOverlayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            style: default_agent_overlay_style(),
+            corner: default_agent_overlay_corner(),
+        }
+    }
+}
+
+impl AgentOverlayConfig {
+    /// Whether it is shown, given `[general] overlay`.
+    pub fn enabled(&self, general_overlay: bool) -> bool {
+        self.enabled.unwrap_or(general_overlay)
+    }
+    /// Parsed [`Self::style`]; unknown values fall back to the default.
+    pub fn style(&self) -> AgentOverlayStyle {
+        AgentOverlayStyle::parse(&self.style).unwrap_or_default()
+    }
+    /// Parsed [`Self::corner`]; unknown values fall back to the default.
+    pub fn corner(&self) -> AgentOverlayCorner {
+        AgentOverlayCorner::parse(&self.corner).unwrap_or_default()
+    }
+}
+
+/// How the agent overlay draws an agent. See [`AgentOverlayConfig::style`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentOverlayStyle {
+    /// Rings and arcs in the state's color.
+    #[default]
+    Orb,
+    /// A small face whose eyes and mouth show the state.
+    Face,
+}
+
+impl AgentOverlayStyle {
+    /// Parse a config string (trimmed, case-insensitive). `None` if unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "orb" => Self::Orb,
+            "face" => Self::Face,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Orb => "orb",
+            Self::Face => "face",
+        }
+    }
+}
+
+/// The screen corner of the agent overlay. See
+/// [`AgentOverlayConfig::corner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentOverlayCorner {
+    #[default]
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
+}
+
+impl AgentOverlayCorner {
+    /// Parse a config string (trimmed, case-insensitive). `None` if unknown;
+    /// an edge center is not a corner.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "bottom-right" => Self::BottomRight,
+            "bottom-left" => Self::BottomLeft,
+            "top-right" => Self::TopRight,
+            "top-left" => Self::TopLeft,
+            _ => return None,
+        })
+    }
+
+    /// Canonical config spelling, also sent to the GNOME extension.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BottomRight => "bottom-right",
+            Self::BottomLeft => "bottom-left",
+            Self::TopRight => "top-right",
+            Self::TopLeft => "top-left",
+        }
+    }
+
+    /// Whether it sits at the top edge (rows stack down from it).
+    pub fn is_top(self) -> bool {
+        matches!(self, Self::TopRight | Self::TopLeft)
+    }
+
+    /// Whether it sits at the right edge.
+    pub fn is_right(self) -> bool {
+        matches!(self, Self::BottomRight | Self::TopRight)
     }
 }
 
@@ -1947,6 +2082,29 @@ impl Config {
             }
         }
 
+        if let Some(agent_overlay) = &self.agent_overlay {
+            if AgentOverlayStyle::parse(&agent_overlay.style).is_none() {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[agent_overlay] style = {:?} is not a known style, using \"{}\". Use \
+                         orb or face.",
+                        agent_overlay.style,
+                        AgentOverlayStyle::default().as_str()
+                    ),
+                });
+            }
+            if AgentOverlayCorner::parse(&agent_overlay.corner).is_none() {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "[agent_overlay] corner = {:?} is not a screen corner, using \"{}\". \
+                         Use one of: bottom-right, bottom-left, top-right, top-left.",
+                        agent_overlay.corner,
+                        AgentOverlayCorner::default().as_str()
+                    ),
+                });
+            }
+        }
+
         if self.general.silence_timeout_ms == 0 {
             warnings.push(ConfigWarning {
                 message: "silence_timeout_ms is 0 — auto-stop is effectively disabled".to_string(),
@@ -2145,7 +2303,35 @@ impl Config {
 
         warnings.extend(self.validate_recording()?);
 
-        // Duplicate-binding detection across [hotkeys] and llm_commands. The
+        // [[agents]]: the same resolution the daemon runs, so a warned-about
+        // entry is exactly one the daemon skips.
+        let (agents, agent_warnings) = crate::agent::resolve_agents(&self.agents);
+        warnings.extend(
+            agent_warnings
+                .into_iter()
+                .map(|message| ConfigWarning { message }),
+        );
+        if !agents.is_empty() {
+            let tts_on = self.tts.as_ref().is_some_and(|t| t.enabled);
+            if !tts_on {
+                warnings.push(ConfigWarning {
+                    message: if self.general.notify {
+                        "[[agents]] are configured but [tts] is not enabled, so agent \
+                         replies arrive as notifications only. Set [tts] enabled = true to \
+                         hear them."
+                            .to_string()
+                    } else {
+                        "[[agents]] are configured but [tts] is not enabled and [general] \
+                         notify = false, so agent replies are neither spoken nor shown. Set \
+                         [tts] enabled = true to hear them."
+                            .to_string()
+                    },
+                });
+            }
+        }
+
+        // Duplicate-binding detection across [hotkeys], llm_commands and
+        // agents. The
         // listener dispatches every action whose binding matches, with no
         // early exit, so a shared combo silently fires multiple commands and
         // the loser's error is never seen. Compare parsed bindings (sorted
@@ -2183,6 +2369,16 @@ impl Config {
                         format!("llm_commands '{}' set_hotkey", entry.name),
                         set_hotkey.as_str(),
                     ));
+                }
+            }
+        }
+        for agent in &agents {
+            for (key, spec) in [
+                ("hotkey", &agent.hotkey),
+                ("new_session_hotkey", &agent.new_session_hotkey),
+            ] {
+                if let Some(spec) = spec {
+                    binding_sources.push((format!("agents '{}' {key}", agent.name), spec.as_str()));
                 }
             }
         }
@@ -3913,6 +4109,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4030,6 +4228,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4063,6 +4263,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4099,6 +4301,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4143,6 +4347,8 @@ mod tests {
                 hotkeys: None,
                 hooks: None,
                 llm_commands: Vec::new(),
+                agents: Vec::new(),
+                agent_overlay: None,
                 replacements: BTreeMap::new(),
                 recording: None,
                 overlay: None,
@@ -4223,6 +4429,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4448,6 +4656,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4712,6 +4922,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4770,6 +4982,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4806,6 +5020,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4843,6 +5059,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4880,6 +5098,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4917,6 +5137,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -4951,6 +5173,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5027,6 +5251,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5069,6 +5295,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5113,6 +5341,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5182,6 +5412,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5239,6 +5471,8 @@ mod tests {
             hotkeys: None,
             hooks: None,
             llm_commands: Vec::new(),
+            agents: Vec::new(),
+            agent_overlay: None,
             replacements: BTreeMap::new(),
             recording: None,
             overlay: None,
@@ -5342,6 +5576,305 @@ mod tests {
             "the warning must name both fields: {}",
             warning.message
         );
+    }
+
+    /// An `[[agents]]` entry in a dir that exists (the crate root).
+    fn agent_entry(name: &str, hotkey: Option<&str>) -> crate::agent::AgentConfig {
+        crate::agent::AgentConfig {
+            name: name.to_string(),
+            hotkey: hotkey.map(str::to_string),
+            new_session_hotkey: None,
+            harness: "claude".to_string(),
+            dir: env!("CARGO_MANIFEST_DIR").to_string(),
+            permissions: "auto".to_string(),
+            command: None,
+            args: Vec::new(),
+            reply_instruction: None,
+            feedback: "brief".to_string(),
+        }
+    }
+
+    #[test]
+    fn config_validate_warns_agent_hotkey_clashes() {
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+Shift+J".to_string()),
+            ..Default::default()
+        });
+        config.agents = vec![agent_entry("jarvis", Some("shift+super+j"))];
+        let warnings = config.validate().unwrap();
+        let warning = warnings
+            .iter()
+            .find(|w| w.message.contains("duplicate hotkey binding"))
+            .unwrap_or_else(|| panic!("expected a clash warning, got: {warnings:?}"));
+        assert!(
+            warning.message.contains("[hotkeys] toggle")
+                && warning.message.contains("agents 'jarvis' hotkey"),
+            "{}",
+            warning.message
+        );
+    }
+
+    /// `new_session_hotkey` takes part in the clash check: against another
+    /// binding, and against the agent's own `hotkey`.
+    #[test]
+    fn config_validate_warns_agent_new_session_hotkey_clashes() {
+        let clashes = |config: &Config| -> Vec<String> {
+            config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .map(|w| w.message)
+                .filter(|m| m.contains("duplicate hotkey binding"))
+                .collect()
+        };
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            speak: Some("Super+Shift+N".to_string()),
+            ..Default::default()
+        });
+        let mut jarvis = agent_entry("jarvis", Some("Super+Shift+J"));
+        jarvis.new_session_hotkey = Some("shift+super+n".to_string());
+        config.agents = vec![jarvis.clone()];
+        let found = clashes(&config);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("[hotkeys] speak")
+                && found[0].contains("agents 'jarvis' new_session_hotkey"),
+            "{}",
+            found[0]
+        );
+
+        config.hotkeys = None;
+        jarvis.new_session_hotkey = Some("Super+Shift+J".to_string());
+        config.agents = vec![jarvis.clone()];
+        let found = clashes(&config);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("agents 'jarvis' hotkey")
+                && found[0].contains("agents 'jarvis' new_session_hotkey"),
+            "{}",
+            found[0]
+        );
+
+        jarvis.new_session_hotkey = Some("Super+Shift+N".to_string());
+        config.agents = vec![jarvis];
+        assert!(clashes(&config).is_empty());
+    }
+
+    #[test]
+    fn config_validate_reports_skipped_agents_and_their_hotkeys_bind_nothing() {
+        let mut config = validatable_config("groq");
+        config.hotkeys = Some(HotkeyConfig {
+            toggle: Some("Super+Shift+J".to_string()),
+            ..Default::default()
+        });
+        let mut missing_dir = agent_entry("ghost", Some("Super+Shift+J"));
+        missing_dir.dir = "/definitely/not/here".to_string();
+        config.agents = vec![missing_dir];
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.contains("'ghost' is skipped")),
+            "{warnings:?}"
+        );
+        // A skipped entry's hotkey is never bound, so it clashes with nothing.
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.message.contains("duplicate hotkey binding")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_warns_once_when_agents_cannot_speak() {
+        let mut config = validatable_config("groq");
+        config.agents = vec![agent_entry("jarvis", None), agent_entry("friday", None)];
+        let tts_warnings = |config: &Config| {
+            config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .filter(|w| w.message.contains("[[agents]] are configured but [tts]"))
+                .collect::<Vec<_>>()
+        };
+        let warnings = tts_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("notifications only"));
+
+        config.general.notify = false;
+        let warnings = tts_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("neither spoken nor shown"));
+
+        config.tts = Some(toml::from_str("enabled = true\nbackend = \"groq\"").unwrap());
+        assert!(tts_warnings(&config).is_empty());
+
+        // No agents, no warning.
+        config.tts = None;
+        config.agents.clear();
+        assert!(tts_warnings(&config).is_empty());
+    }
+
+    /// `[[agents]]` keys are known keys: no unknown-key warning.
+    #[test]
+    fn agent_keys_are_not_unknown() {
+        let unknown = unknown_config_keys(
+            "[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+Shift+J\"\nharness = \"claude\"\n\
+             new_session_hotkey = \"Super+Shift+N\"\n\
+             dir = \"~/Projects/whisrs\"\npermissions = \"ask\"\ncommand = \"claude\"\n\
+             args = [\"--remote-control\", \"jarvis\"]\nreply_instruction = \"Be brief.\"\n",
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
+        let unknown = unknown_config_keys("[[agents]]\nname = \"jarvis\"\nbogus = 1\n");
+        assert_eq!(unknown, vec!["agents[0].bogus".to_string()]);
+    }
+
+    /// Every config write (`whisrs setup`, a `whisrs config` save, the
+    /// daemon's `[[llm_commands]]` hotkey write) serializes the struct. An
+    /// empty `agents` written as `agents = []` made the `[[agents]]` block
+    /// pasted from the docs afterwards invalid TOML (a static array cannot be
+    /// extended by an array of tables), so the daemon fell back to the
+    /// defaults and lost every key and hotkey. Same for `[agent_overlay]`.
+    #[test]
+    fn agent_sections_can_be_appended_to_a_written_config() {
+        const AGENT: &str = "\n[[agents]]\nname = \"jarvis\"\nhotkey = \"Super+Shift+J\"\n\
+                             dir = \"~/Projects/whisrs\"\n";
+        const OVERLAY: &str = "\n[agent_overlay]\nstyle = \"face\"\n";
+        let written = toml::to_string_pretty(&validatable_config("groq")).unwrap();
+        let pasted = format!("{written}{AGENT}{OVERLAY}");
+        let config: Config = toml::from_str(&pasted).unwrap_or_else(|e| panic!("{e}\n{pasted}"));
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(
+            config.agent_overlay.unwrap().style(),
+            AgentOverlayStyle::Face
+        );
+
+        // An entry's unset keys (`args` included) are left out as well.
+        let jarvis = agent_entry("jarvis", Some("Super+Shift+J"));
+        let entry = toml::to_string(&jarvis).unwrap();
+        for unset in ["args", "command", "reply_instruction", "new_session_hotkey"] {
+            assert!(!entry.contains(unset), "{unset}: {entry}");
+        }
+        let overlay = toml::to_string(&AgentOverlayConfig::default()).unwrap();
+        assert!(!overlay.contains("enabled"), "{overlay}");
+
+        // A config with an agent reads back the same, and a second pasted
+        // entry extends it.
+        let mut config = validatable_config("groq");
+        config.agents = vec![jarvis];
+        config.agent_overlay = Some(AgentOverlayConfig::default());
+        let written = toml::to_string_pretty(&config).unwrap();
+        let reread: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reread.agents, config.agents);
+        assert_eq!(reread.agent_overlay, config.agent_overlay);
+        let pasted = format!("{written}\n[[agents]]\nname = \"friday\"\ndir = \"/proj\"\n");
+        let reread: Config = toml::from_str(&pasted).unwrap_or_else(|e| panic!("{e}\n{pasted}"));
+        assert_eq!(reread.agents.len(), 2);
+    }
+
+    /// `[agent_overlay]` and `[[agents]] feedback` are known keys.
+    #[test]
+    fn agent_overlay_and_feedback_keys_are_not_unknown() {
+        let toml = "[agent_overlay]\nenabled = true\nstyle = \"face\"\ncorner = \"top-left\"\n\
+                    [[agents]]\nname = \"jarvis\"\ndir = \"/proj\"\nfeedback = \"conversational\"\n";
+        assert!(unknown_config_keys(toml).is_empty(), "{toml}");
+        assert!(unknown_config_keys("[agent_overlay]\n").is_empty());
+        let unknown = unknown_config_keys("[agent_overlay]\nstyle = \"orb\"\nbogus = 1\n");
+        assert_eq!(unknown, vec!["agent_overlay.bogus".to_string()]);
+        let config: Config = toml::from_str(toml).unwrap();
+        let overlay = config.agent_overlay.unwrap();
+        assert_eq!(overlay.enabled, Some(true));
+        assert_eq!(overlay.style(), AgentOverlayStyle::Face);
+        assert_eq!(overlay.corner(), AgentOverlayCorner::TopLeft);
+        assert_eq!(config.agents[0].feedback, "conversational");
+    }
+
+    #[test]
+    fn agent_overlay_defaults_follow_the_overlay_switch() {
+        let config: Config = toml::from_str("[agent_overlay]\n").unwrap();
+        let overlay = config.agent_overlay.unwrap();
+        assert_eq!(overlay, AgentOverlayConfig::default());
+        assert_eq!(overlay.style(), AgentOverlayStyle::Orb);
+        assert_eq!(overlay.corner(), AgentOverlayCorner::BottomRight);
+        assert!(!overlay.enabled(false) && overlay.enabled(true));
+        let off = AgentOverlayConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!off.enabled(true));
+        // Without the section, and for an entry without `feedback`.
+        let config: Config =
+            toml::from_str("[[agents]]\nname = \"jarvis\"\ndir = \"/proj\"\n").unwrap();
+        assert!(config.agent_overlay.is_none());
+        assert_eq!(config.agents[0].feedback, "brief");
+        for corner in ["bottom-right", "bottom-left", "top-right", "top-left"] {
+            assert_eq!(
+                AgentOverlayCorner::parse(corner).map(AgentOverlayCorner::as_str),
+                Some(corner)
+            );
+        }
+        assert_eq!(
+            AgentOverlayCorner::parse(" Top-Right "),
+            Some(AgentOverlayCorner::TopRight)
+        );
+        assert_eq!(
+            AgentOverlayStyle::parse("FACE"),
+            Some(AgentOverlayStyle::Face)
+        );
+    }
+
+    /// An unknown style or corner (a center one too) and an unknown agent
+    /// feedback level each warn once and use the default.
+    #[test]
+    fn config_validate_warns_unknown_agent_overlay_values_and_feedback() {
+        let mut config = validatable_config("groq");
+        let matching = |config: &Config, needle: &str| -> Vec<String> {
+            config
+                .validate()
+                .unwrap()
+                .into_iter()
+                .map(|w| w.message)
+                .filter(|m| m.contains(needle))
+                .collect()
+        };
+        config.agent_overlay = Some(AgentOverlayConfig {
+            enabled: None,
+            style: "blob".to_string(),
+            corner: "bottom-center".to_string(),
+        });
+        let style = matching(&config, "[agent_overlay] style");
+        assert_eq!(style.len(), 1, "{style:?}");
+        assert!(style[0].contains("\"blob\"") && style[0].contains("using \"orb\""));
+        let corner = matching(&config, "[agent_overlay] corner");
+        assert_eq!(corner.len(), 1, "{corner:?}");
+        assert!(
+            corner[0].contains("\"bottom-center\"") && corner[0].contains("using \"bottom-right\""),
+            "{}",
+            corner[0]
+        );
+        let overlay = config.agent_overlay.clone().unwrap();
+        assert_eq!(overlay.style(), AgentOverlayStyle::Orb);
+        assert_eq!(overlay.corner(), AgentOverlayCorner::BottomRight);
+        for (style, corner) in [("orb", "bottom-right"), ("Face", "top-left")] {
+            config.agent_overlay = Some(AgentOverlayConfig {
+                enabled: Some(true),
+                style: style.to_string(),
+                corner: corner.to_string(),
+            });
+            assert!(matching(&config, "[agent_overlay]").is_empty());
+        }
+
+        let mut jarvis = agent_entry("jarvis", None);
+        jarvis.feedback = "chatty".to_string();
+        config.agents = vec![jarvis];
+        let feedback = matching(&config, "unknown feedback value");
+        assert_eq!(feedback.len(), 1, "{feedback:?}");
+        assert!(feedback[0].contains("'chatty'") && feedback[0].contains("uses brief"));
+        // The entry is kept: no "skipped" warning.
+        assert!(matching(&config, "is skipped").is_empty());
     }
 
     /// The recording checks, in a build with the feature.

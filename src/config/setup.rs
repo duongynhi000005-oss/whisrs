@@ -379,6 +379,8 @@ pub fn run_setup() -> Result<()> {
         hooks: None,
         overlay: if overlay { overlay_config } else { None },
         llm_commands: Vec::new(),
+        agents: Vec::new(),
+        agent_overlay: None,
         replacements: Default::default(),
         recording: None,
     };
@@ -3426,6 +3428,33 @@ model = "whisper-large-v3-turbo"
         let reparsed: Config = toml::from_str(&out).unwrap();
         assert_eq!(reparsed.general.backend, "openai");
         assert_eq!(reparsed.llm_commands[0].instruction, "Translate to French.");
+    }
+
+    /// A `whisrs config` save keeps the user's `[[agents]]` entries and their
+    /// comments (defaults are filled in, as in every other section).
+    #[test]
+    fn agents_survive_a_write_untouched() {
+        const WITH_AGENTS: &str = r#"[general]
+backend = "groq"
+
+# my coding agent
+[[agents]]
+name = "jarvis" # says hi
+dir = "~/Projects/whisrs"
+args = ["--model", "haiku"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, WITH_AGENTS).unwrap();
+        let mut config = parse_config(WITH_AGENTS);
+        config.general.backend = "openai".to_string();
+        write_config_to(&config, &path).unwrap();
+        let out = fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# my coding agent"), "{out}");
+        assert!(out.contains(r#"name = "jarvis" # says hi"#), "{out}");
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(reparsed.agents, config.agents);
+        assert_eq!(reparsed.agents[0].args, ["--model", "haiku"]);
     }
 
     #[test]

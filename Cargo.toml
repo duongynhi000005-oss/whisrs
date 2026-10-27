@@ -42,11 +42,15 @@ required-features = ["local-whisper"]
 name = "issue208_batch_check"
 required-features = ["local-whisper"]
 
+[[example]]
+name = "agent_overlay_frames"
+required-features = ["overlay"]
+
 [features]
 default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]
 local-whisper = ["dep:whisper-rs"]
 tray = ["dep:ksni", "dep:png"]
-overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia", "dep:zbus"]
+overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia", "dep:fontdue", "dep:zbus"]
 hooks = ["dep:zbus"]
 # The recording feature: mic + system audio recordings transcribed after the
 # stop, with speakers, names and summaries (`whisrs recording`, its tray items,
@@ -135,6 +139,14 @@ optional = true
 default-features = false
 features = ["std", "simd"]
 
+# The agent overlay's text (feature `overlay`). Pure Rust; default features
+# off so it uses std's HashMap instead of a second hashbrown.
+[dependencies.fontdue]
+version = "0.9.5"
+optional = true
+default-features = false
+features = ["std", "simd"]
+
 [dependencies.whisper-rs]
 version = "0.16"
 optional = true
@@ -159,3 +171,6 @@ claxon = "0.4"
 tempfile = "3"
 # start_paused tests need tokio's paused clock ("test-util" is not in "full").
 tokio = { version = "1", features = ["test-util"] }
+# PNG output for examples/agent_overlay_frames.rs. Dev only, so the binaries
+# keep tiny-skia without its PNG encoder.
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd", "png-format"] }

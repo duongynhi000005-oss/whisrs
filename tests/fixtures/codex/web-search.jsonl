@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a17400-56f6-7972-b7be-c9e5db6192c0"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `mock-1` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"web_search","id":"ws_resp_1792947541804_0","query":"whisrs","action":{"type":"search","query":"whisrs"}}}
+{"type":"item.completed","item":{"id":"item_1","type":"web_search","id":"ws_resp_1792947541804_0","query":"whisrs","action":{"type":"search","query":"whisrs"}}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Searched. <spoken>I looked it up.</spoken>"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}

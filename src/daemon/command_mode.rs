@@ -80,13 +80,45 @@ fn refused_multi_line_message(label: Option<&str>, history: bool) -> String {
 /// gone → bail, machine stays Idle) or the background wins (machine moves to
 /// Transcribing, from which `Cancel` is an invalid transition, so the
 /// pipeline owns the state until its finalizer's `TranscriptionDone`).
-fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Option<T>) -> Option<T> {
+pub(crate) fn claim_session<T>(state_machine: &mut StateMachine, ctx: &mut Option<T>) -> Option<T> {
     if ctx.is_none() || state_machine.state() != State::Recording {
         return None;
     }
     // From Recording, Toggle → Transcribing cannot fail.
     let _ = state_machine.transition(Action::Toggle);
     ctx.take()
+}
+
+/// Collect a recorded instruction until the silence auto-stop fires or the
+/// audio channel closes (a manual stop, a cancel, or a vanished device). On
+/// auto-stop the capture is stopped here. `label` names the flow in the log.
+///
+/// Shared by command mode, `[[llm_commands]]` and agent voice turns, which
+/// all record a whole instruction before transcribing it.
+pub(crate) async fn collect_instruction_audio(
+    audio_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>>,
+    daemon_state: &Mutex<DaemonState>,
+    context: &DaemonContext,
+    label: &str,
+) -> Vec<i16> {
+    let silence_timeout = context.config.general.silence_timeout_ms;
+    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
+    let mut all_samples: Vec<i16> = Vec::new();
+    if let Some(mut rx) = audio_rx {
+        while let Some(chunk) = rx.recv().await {
+            all_samples.extend_from_slice(&chunk);
+            if auto_stop.feed(&chunk) {
+                info!("{label}: silence auto-stop");
+                let mut ds = daemon_state.lock().await;
+                if let Some(mut capture) = ds.audio_capture.take() {
+                    capture.stop();
+                    tokio::task::spawn_blocking(move || drop(capture));
+                }
+                break;
+            }
+        }
+    }
+    all_samples
 }
 
 /// The claim block of [`command_mode_background`]: claim the session via
@@ -138,9 +170,19 @@ pub(crate) async fn handle_command_mode(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) -> Response {
-    let current_state = {
-        let ds = daemon_state.lock().await;
-        ds.state_machine.state()
+    let (current_state, _hold) = {
+        let mut ds = daemon_state.lock().await;
+        // An agent reply playing is stopped, not a reason to refuse.
+        crate::speak::stop_agent_playback(&mut ds, &context, "command mode");
+        let state = ds.state_machine.state();
+        // A first press releases the lock to capture the selection: agent
+        // replies are held until it has started recording (or gave up), or
+        // the next queued one would take the Idle state from it. Taken
+        // under the lock, so a reply cannot slip in before it.
+        (
+            state,
+            (state == State::Idle).then(|| context.agents.hold_replies()),
+        )
     };
 
     match current_state {
@@ -174,7 +216,7 @@ pub(crate) async fn handle_command_mode(
             if let Some(refused) = refuse_while_recording(&context, DictationStart::CommandMode) {
                 return refused;
             }
-            command_mode_start(daemon_state, context).await
+            command_mode_start(daemon_state, Arc::clone(&context)).await
         }
         State::Transcribing => Response::Error {
             message: "cannot start command mode while transcribing".to_string(),
@@ -298,26 +340,9 @@ async fn command_mode_background(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) {
-    let silence_timeout = context.config.general.silence_timeout_ms;
-    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
-    let mut all_samples: Vec<i16> = Vec::new();
-
     // Collect audio until silence auto-stop or channel close (manual stop).
-    if let Some(mut rx) = audio_rx {
-        while let Some(chunk) = rx.recv().await {
-            all_samples.extend_from_slice(&chunk);
-            if auto_stop.feed(&chunk) {
-                info!("command mode: silence auto-stop");
-                // Stop capture.
-                let mut ds = daemon_state.lock().await;
-                if let Some(mut capture) = ds.audio_capture.take() {
-                    capture.stop();
-                    tokio::task::spawn_blocking(move || drop(capture));
-                }
-                break;
-            }
-        }
-    }
+    let all_samples =
+        collect_instruction_audio(audio_rx, &daemon_state, &context, "command mode").await;
 
     // Claim the session context and enter Transcribing. `handle_cancel`
     // takes the context under this same lock, so whoever locks first wins:
@@ -359,7 +384,7 @@ async fn command_mode_background(
     // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
-    let _ = context.state_tx.send(ds.state_machine.state());
+    context.state_tx.publish(&ds);
     if let Some(level_tx) = &context.overlay_level_tx {
         let _ = level_tx.send(0.0);
     }
@@ -556,9 +581,17 @@ pub(crate) async fn handle_llm_command(
     context: Arc<DaemonContext>,
     name: String,
 ) -> Response {
-    let current_state = {
-        let ds = daemon_state.lock().await;
-        ds.state_machine.state()
+    let (current_state, _hold) = {
+        let mut ds = daemon_state.lock().await;
+        // An agent reply playing is stopped, not a reason to refuse.
+        crate::speak::stop_agent_playback(&mut ds, &context, "llm-command");
+        let state = ds.state_machine.state();
+        // Held until the recording started or the press gave up, like
+        // command mode: the lock is released before the recording starts.
+        (
+            state,
+            (state == State::Idle).then(|| context.agents.hold_replies()),
+        )
     };
 
     match current_state {
@@ -603,7 +636,7 @@ pub(crate) async fn handle_llm_command(
                     {
                         return refused;
                     }
-                    llm_command_start(daemon_state, context, entry).await
+                    llm_command_start(daemon_state, Arc::clone(&context), entry).await
                 }
                 None => Response::Error {
                     message: format!("no llm_commands entry named '{name}' — check config.toml"),
@@ -809,24 +842,8 @@ async fn llm_command_background(
     daemon_state: Arc<Mutex<DaemonState>>,
     context: Arc<DaemonContext>,
 ) {
-    let silence_timeout = context.config.general.silence_timeout_ms;
-    let mut auto_stop = AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout, SAMPLE_RATE);
-    let mut all_samples: Vec<i16> = Vec::new();
-
-    if let Some(mut rx) = audio_rx {
-        while let Some(chunk) = rx.recv().await {
-            all_samples.extend_from_slice(&chunk);
-            if auto_stop.feed(&chunk) {
-                info!("llm-command: silence auto-stop");
-                let mut ds = daemon_state.lock().await;
-                if let Some(mut capture) = ds.audio_capture.take() {
-                    capture.stop();
-                    tokio::task::spawn_blocking(move || drop(capture));
-                }
-                break;
-            }
-        }
-    }
+    let all_samples =
+        collect_instruction_audio(audio_rx, &daemon_state, &context, "llm-command").await;
 
     // Claim the session context and enter Transcribing. `handle_cancel`
     // takes the context under this same lock, so whoever locks first wins:
@@ -875,7 +892,7 @@ async fn llm_command_background(
     // valid from there, so this TranscriptionDone cannot fail.
     let mut ds = daemon_state.lock().await;
     let _ = ds.state_machine.transition(Action::TranscriptionDone);
-    let _ = context.state_tx.send(ds.state_machine.state());
+    context.state_tx.publish(&ds);
     if let Some(level_tx) = &context.overlay_level_tx {
         let _ = level_tx.send(0.0);
     }

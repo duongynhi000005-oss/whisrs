@@ -33,6 +33,11 @@ systemctl --user enable --now whisrs.service
 whisrs toggle    # start/stop dictation
 whisrs cancel    # cancel and discard audio
 whisrs speak     # read the selected text aloud via TTS (alias: read; press again to stop)
+whisrs speak --text "..."   # speak the given text (--text - reads stdin); its own IPC command (speak-text)
+whisrs agent     # list [[agents]]; `whisrs agent <name>` records a voice turn for that coding agent
+                 # (same as its hotkey), --text "..." sends a typed one, --new records one (or sends
+                 # --text) in a fresh session (same as new_session_hotkey), --reset forgets the session,
+                 # --stop stops the running turn. The reply is spoken via [tts] when the turn ends
 whisrs status    # query daemon state
 whisrs restart   # restart the daemon (wraps systemctl --user when present)
 whisrs command   # record a voice instruction, rewrite the selection via LLM
@@ -66,11 +71,29 @@ src/
 │                           #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ├── history.rs              # Dictation history (whisrs log)
 ├── llm.rs                  # LLM calls for command mode
+├── agent/                  # Agent mode ([[agents]]): voice turns to a coding agent, spoken replies
+│   ├── mod.rs              #   AgentConfig + resolve_agents (validation), IPC types, Driver trait,
+│   │                       #   SessionRef/TurnUpdate/TurnOutcome, the default voice instruction
+│   ├── spoken.rs           #   <spoken> extraction + sanitize + 400-char cap (pure)
+│   ├── claude.rs           #   Claude Code driver: claude --bg, stop + --bg --resume, hooks via --settings, poll
+│   ├── claude_tail.rs      #   Transcript tail while a turn runs: tool activity + interims (pure parse_line)
+│   ├── process.rs          #   Process-per-turn base: ProcessDriver<H: TurnHarness> (spawn in own pgid + own
+│   │                       #   systemd scope + PDEATHSIG, JSON lines -> StreamEvent -> TurnUpdates, SIGINT/TERM/KILL
+│   │                       #   stop of group + tree + scope, leftover-scope sweep at startup, outcome)
+│   ├── opencode.rs         #   OpenCode driver (TurnHarness): opencode run --standalone --format json --session <id>
+│   ├── codex.rs            #   Codex driver (TurnHarness): codex exec --json ... --skip-git-repo-check [resume <id>] -
+│   ├── copilot.rs          #   Copilot driver (TurnHarness): copilot --output-format json --session-id=|--resume=<id>, prompt on stdin
+│   ├── progress.rs         #   feedback levels + instruction deltas, activity labels, InterimTracker, ProgressGate
+│   ├── display.rs          #   Agent overlay model: Board (voice > needs-you > working > done/error), rows, timer
+│   └── store.rs            #   $XDG_DATA_HOME/whisrs/agents.json (0600, atomic), written only with agents
 ├── mcp.rs                  # whisrs mcp (feature mcp): read-only rmcp server, 4 tools over the recordings folder
 ├── replacements.rs         # [replacements]: whole-word fix-ups applied to dictated and recording text
 ├── cli/main.rs             # whisrs CLI (thin client, sends commands over socket)
 ├── daemon/main.rs          # whisrsd daemon (audio, transcription, typing, IPC server)
 ├── daemon/recording.rs     # Recording sessions, processing queue/worker, recovery, shutdown (feature recording)
+├── daemon/agent.rs         # Agent runtime: slots, turns, reply FIFO (spoken when Idle), IPC handlers,
+│                           #   hook events, the voice-turn recording sink
+├── daemon/speak.rs         # Read-aloud: selection, speak --text, agent replies (speak_text)
 ├── recording/              # Recording feature (mic + system audio, transcribed after the stop)
 │   ├── mod.rs              #   RecordingMeta (recording.json), segments, status types: every build (IPC wire);
 │   │                       #   the submodules below are feature `recording`
@@ -124,12 +147,21 @@ src/
 │   └── dbus.rs             # GNOME/KDE window tracking (zbus D-Bus)
 ├── hotkey/                 # Hotkey listener (raw evdev) + spec parsing
 ├── tray/                   # Tray icon (ksni, feature-gated)
-├── overlay/                # Recording overlay (feature-gated)
-│   ├── service.rs          #   Overlay service: picks and drives a backend
-│   ├── render.rs           #   Shared rendering: theme, animation state, frame drawing
-│   ├── wayland.rs          #   Wayland layer-shell backend
-│   ├── x11.rs              #   X11 override-redirect backend
-│   └── gnome.rs            #   GNOME overlay D-Bus broadcaster
+├── overlay/                # Recording pill + agent overlay (feature-gated), each on its own thread
+│   ├── service.rs          #   Overlay service: picks and drives a backend for each
+│   ├── render.rs           #   Pill rendering: theme, animation state, frame drawing
+│   ├── wayland.rs          #   Pill Wayland layer-shell backend
+│   ├── x11.rs              #   Pill X11 override-redirect backend (placement/shape helpers shared)
+│   ├── layer.rs            #   Shared layer-shell bits: create_layer, layer_action, ARGB copy
+│   ├── agent_host.rs       #   Agent overlay hosts' shared part: AgentFrames, ShownFlag, FRAME pacing
+│   ├── agent_wayland.rs    #   Agent overlay Wayland host: poll + wake socket, no commits while hidden
+│   ├── agent_x11.rs        #   Agent overlay X11 host: shaped click-through window, Xft.dpi scale
+│   ├── agent_render.rs     #   Agent overlay drawing (headless): AgentScene (stateful: entrance, crossfade), cards
+│   ├── agent_orb.rs        #   orb style shapes, one per state
+│   ├── agent_face.rs       #   face style shapes, one per state
+│   ├── text.rs             #   fontdue text: glyph cache, coverage blend
+│   ├── font/               #   Inter Regular + SemiBold ASCII subsets, OFL.txt, the pyftsubset command
+│   └── gnome.rs            #   GNOME overlay D-Bus broadcaster (pill state + AgentsChanged JSON)
 └── config/
     ├── types.rs            # Config structs, defaults, validation (config.toml)
     ├── setup.rs            # Interactive onboarding (whisrs setup)
@@ -192,7 +224,8 @@ docs" in an untracked file changes nothing for users and shows up in no PR. Chec
 - `default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]`
 - `local-whisper` — whisper-rs (whisper.cpp) for offline transcription. Requires a C++ toolchain and libclang.
 - `tray` — tray icon via `ksni`
-- `overlay` — recording overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`
+- `overlay`: recording pill and agent overlay via `smithay-client-toolkit` + `wayland-client` + `tiny-skia`,
+  and `fontdue` for the agent overlay's text (Inter subsets bundled in `src/overlay/font/`, OFL)
 - `hooks` — recording-lifecycle hooks + MPRIS media pause via `zbus` (no new system dep; `overlay` already pulls `zbus`)
 - `recording`: the recording feature (`src/recording/` submodules, `src/daemon/recording.rs`, the tray's
   recording items and icons, `whisrs recording`, the editor's Recording questions), with `flacenc`, `realfft` and
@@ -250,6 +283,14 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 {"cmd": "clear-history"}
 {"cmd": "command"}                   // command mode: selection → voice instruction → LLM rewrite
 {"cmd": "speak"}                     // alias: "read". Repeat or cancel stops playback.
+{"cmd": "speak-text", "text": "..."} // speak the text; its own variant so an older daemon errors
+                                     // instead of reading the selection
+{"cmd": "agent", "action": "list|toggle|send|reset|stop", "name": "jarvis", "text": "...", "new": true}
+                                     // all but action optional (name required but for list);
+                                     // "new" on toggle (--new) or send starts a fresh session,
+                                     // reset (--reset) only forgets it;
+                                     // list/send/reset/stop answer with an Agents response
+{"cmd": "agent-event", "payload": {...}}  // a harness hook's stdin JSON, from `whisrs agent-hook`
 {"cmd": "recording", "action": "start|stop|cancel|status|toggle|retry|copy|name|summarize", "title": "...", "id": "...",
  "language": "de", "mic_language": "de", "system_language": "auto", "others": "Video",
  "shared_mic": true, "num_speakers": 3, "participants": ["Sarah", "Omar"],
@@ -263,7 +304,8 @@ Commands (`Command` in `src/lib.rs`, tagged by `cmd`):
 ```
 
 Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": "..."}`,
-a `History` variant carrying log entries, and a `Recording` variant carrying the recording status.
+a `History` variant carrying log entries, a `Recording` variant carrying the recording status, and
+an `Agents` variant carrying agent rows (`{"status": "agents", "agents": [...]}`).
 
 Adding a command means a new `Command` variant plus a daemon handler. Never put logic in
 `src/cli/main.rs`: it is a thin socket client. One read-only exception: `whisrs recording
@@ -271,6 +313,8 @@ list/show/path` read the recordings folder directly, which keeps transcript bodi
 (as does the speaker list `whisrs recording name` prints after the daemon renamed one).
 `whisrs mcp` reads it too, but its logic is in the library (`src/mcp.rs`); the CLI only
 starts it with `store::configured_recordings_dir()`.
+`whisrs agent-hook` (hidden, run by the hooks whisrs puts in the Claude sessions it starts)
+only forwards its stdin to the daemon as `agent-event`, and always exits 0 within two seconds.
 
 ## Configuration
 
@@ -279,6 +323,92 @@ Path: `~/.config/whisrs/config.toml` (permissions: 0600)
 Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realtime`, `openai-compatible-realtime`, `openai`, `local-whisper`, `local-vosk`, `local-parakeet`, `asr-sidecar`
 
 TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
+
+Agent mode: `[[agents]]` entries (`name`, `hotkey`, `new_session_hotkey`, `harness` = `claude|opencode|codex|copilot`, `dir`, `permissions` =
+`auto|bypass|ask`, `command`, `args`, `reply_instruction`, `feedback` = `summary|brief|conversational`;
+`agent::resolve_agents` validates and skips bad entries, shared by `Config::validate` and the runtime),
+plus `[agent_overlay]` (`enabled` follows `[general] overlay`, `style` = `orb|face`, `corner`). With none, nothing runs
+except one `systemctl --user list-units` at startup (the scope sweep), and no file is written.
+A voice turn records like command mode's instruction (`BatchOrigin::Agent`), then the
+turn runs on its own task; replies queue in a FIFO spoken when the state is Idle and no recording
+captures (`may_speak`), errors too (`spoken::spoken_error`). A `ReplyHold` (a command or
+`[[llm_commands]]` press until it records, a recording start) also holds them, checked under the
+dictation lock in `speak_text`. A dictation toggle or command press stops an agent reply
+(`speak::stop_agent_playback`, by `DaemonState::tts_origin`), never a selection read-aloud; a
+recording start stops it too and requeues it at the front (`agent::hold_for_recording`). An agent
+press refused while its turn runs stops only that agent's own reply or notice and then queues no
+notice (`AgentRuntime::is_playing_for`); another agent's reply plays on, the notice after it. The Claude driver starts `claude --bg` sessions with `--settings` hooks (`Stop`,
+`Notification`) that run `whisrs agent-hook --socket <sock>`; under a systemd service the `--bg`
+launch runs in its own `systemd-run --user --scope` (Claude Code's background service must not
+live in the whisrs unit), with `--expand-environment=no` (systemd 254+ expands `$VAR` in a scope's
+command line; an older one refuses the option and is retried without it, `claude::expand_option_refused`). The next turn is refused while `claude agents` lists the session
+`working`, else `claude stop`, a wait until its listed pid has exited (`Exits::wait_for_exit`:
+`claude stop` returns, and the listing drops the pid, before Claude Code settles it; capped at 10 s,
+then the turn fails), then `claude --bg --resume <id> -- <text>` with no other flag (any flag, or a
+resume before the settle, starts a copy without the hooks or `--remote-control`). Every listed pid
+is remembered with its `/proc` start time until seen to exit, so a session already listed with no
+pid is waited for too (`Exits::settle`). A copy is never adopted: stopped, waited for and
+`claude rm`-ed on the launch task (never the session's own bg id, `claude::copy_id`), the resume
+tried once more, a second copy fails the turn (`claude::cannot_continue`); only a `Stop` received after that launch ends it (an earlier one is the old
+process's own reply, `TurnUpdate::SessionReply`). A `Stop` with no turn running is the session's own
+reply and is spoken, unless it repeats a turn that ended on a poll (`TurnOutcome::PolledReply`); a
+permission prompt with no turn running marks needs-you. A session working on its own refuses a turn
+(`TurnOutcome::Busy`, "It's still running a background task."). The child gets the daemon's env minus
+`claude::PARENT_SESSION_VARS` and `WHISRS_*`. Only stored ids are ever passed to `claude`.
+A process-per-turn harness (OpenCode, Codex, Copilot) implements `process::TurnHarness` only (`label`, `launch`
+-> `Launch` {args, stdin, env, session: an id it names up front}, `strips_env`, `events`: one stdout
+line -> `StreamEvent`s Session / Text {message} / Tool / Error / RecoverableError (fails the turn only
+when no text follows), `stderr_failure`: a failure it
+recognizes in stderr, else `None`); `process::ProcessDriver` does the rest: spawn from a thread that
+waits for the child (own process group, own transient scope `whisrs-agent-<instance>-<name>-<turn>.scope`
+via `systemd-run --user --scope` when it works, else direct; `<instance>` hashes the `agents.json`
+path, so two daemons never touch each other's scopes; `PWD` = dir, stdin the prompt then closed,
+`PR_SET_PDEATHSIG` = SIGINT so a turn dies with the daemon), registers it and, in one step with the
+runtime's stop, reports the launch's new session id (`SessionRef::pending` until a Text/Tool shows the
+agent working in it) or sees the stop (then stops the process itself, `stop_detached`); `StreamState`
+(`InterimTracker` on Text/Tool, the reply = the last message's text parts; output lines capped,
+`STDOUT_LINE_MAX`, `STDERR_LINE_MAX`), the outcome (an Error event fails, else the reply, else stderr),
+`--stop` (SIGINT, SIGTERM, SIGKILL to the group, every process of the tree seen (`Tree`, so a `setsid`
+child is reached) and the scope (`systemctl --user kill`), `STOP_GRACES`; a dropped turn is stopped
+too, `Registered`), `TurnScopes::sweep` (at startup, also with no agents, `agent::sweep_without_agents`,
+and awaited by every turn and rewatch: stops anything a previous daemon's turns left in their scopes, a
+background job included), `rewatch` = `process::cut_off` (the turn ended with the
+old daemon). No hooks, always Idle between turns. Agent dirs are absolute (`agent::absolute_dir`).
+OpenCode: whisrs mints the `ses_` id (`opencode::new_session_id`), a turn of a new or pending session
+passes `--title whisrs-<name>` + `args` and prefixes the voice instruction to the prompt, `bypass` =
+`--auto`, `ask` = shell/edit ask rules appended to `OPENCODE_CONFIG_CONTENT` (`opencode::ask_config`;
+OpenCode's saved "always" approvals still win over them).
+Codex (tested against a mock model only): the id is the `thread.started` UUID (only a UUID is ever
+resumed, `codex::is_thread_id`); every turn passes the permission flags (`auto` = `--approve-for-me`,
+`bypass` = `--dangerously-bypass-approvals-and-sandbox`, `ask` = `--sandbox read-only`),
+`-c analytics.enabled=false` (else the exit, and the reply, waits seconds for a metrics upload),
+`-c developer_instructions=<TOML string>` (survives compaction only when passed every turn) and `args`,
+then `--skip-git-repo-check` (it ends a many-valued `-i` of `args`), all before `resume <id>`;
+`item.started` of a tool -> Tool, `item.completed` agent_message -> Text (an empty one too: no reply),
+`turn.failed` -> Error (a 401 names `CODEX_API_KEY` when it is set); `RUST_LOG` and
+`codex::PARENT_SESSION_VARS` are stripped.
+Copilot (tested against a mock model only, offline BYOK; with a GitHub account every turn uses the
+user's Copilot plan usage: AI credits, or premium requests on the legacy billing platform): whisrs mints a UUID (`copilot::new_session_id`); a new or pending session
+passes `--session-id=<id>` (creates or continues), a confirmed one `--resume=<id>` (fails when Copilot
+lost it, `stderr_failure`); the prompt goes on stdin (no `-p`, nothing in `ps`); every turn passes the
+permission flags (`auto` = `--allow-all-tools`, `bypass` = `--yolo`, `ask` = `--deny-tool=shell
+--deny-tool=write`) and `args`; the voice instruction is a file under `<data>/whisrs/copilot/<name>/`
+(`.github/instructions/whisrs-voice.instructions.md`) whose dir is appended to
+`COPILOT_CUSTOM_INSTRUCTIONS_DIRS` every turn (lands in the system prompt, never in history);
+`assistant.message` -> Text (+ Tool of its first `toolRequests` entry: the interim at once; a sub-agent's
+skipped), `tool.execution_start` -> Tool, `session.error` -> Error (`hook` errors ignored, `model_call` ones
+RecoverableError), a `policy_blocked`/`compaction_static_context_blocked` warning and `abort` -> Error
+(an interrupt exits 0), every sub-agent event skipped (`agentId`, then `data.agentId`, then the
+deprecated `parentToolCallId`), `result` -> Session; `copilot::PARENT_SESSION_VARS` (with
+`COPILOT_ALLOW_ALL` and `COPILOT_PROMPT_TURN_DELIMITER`) are stripped.
+`DaemonContext::state_tx` is a `StateBus` (`context.rs`), sent only by `publish(&ds)`: `raw` (the state
+machine: hooks, the reply queue), `ui` (Idle while the voice is an agent's, `DaemonState::agent_voice`:
+tray, pill, GNOME pill) and `voice` (which agent, for the board). The runtime's board channel
+(`BoardEvent`) and `voice` feed `board_loop`, which owns the `Board` and publishes rows on
+`DaemonContext::agent_board` for the agent overlay; a session working or waiting on its own shows
+there until a `Stop` or `idle_loop`'s listing ends it (one `session_phases` per harness, 10 s
+backing off to 120 s, reset by a turn start or a row change). `TranscriptTail` (`claude_tail.rs`) sends
+`Activity` and `Interim` updates; `ProgressGate` admits interims per `feedback`.
 
 Word replacements: the top-level `[replacements]` table (`"package build" = "PKGBUILD"`) rewrites every dictation on both paths, and every recording transcript segment, after filler removal (`src/replacements.rs`).
 
