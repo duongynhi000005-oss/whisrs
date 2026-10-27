@@ -26,6 +26,12 @@
 //! you talk, and the batch-only dictation features (`[general]
 //! llm_post_process`, `[input] paste`) apply.
 //!
+//! Every [`transcribe`] call longer than one decode window (28 s) is cut at
+//! pauses (or at 28 s in continuous speech) and decoded a window at a time,
+//! so no window's text can set off a loop in the next (issue #208). That is
+//! dictation in `"none"`, and command mode and `[[llm_commands]]` whatever
+//! `segmentation` says, since they always take the batch path.
+//!
 //! Both streaming modes create one decoder state per stream and reuse it
 //! across decodes; see [`create_state`].
 //!
@@ -36,10 +42,13 @@ use std::sync::Arc;
 
 use asr_dedup::TextDedup;
 use async_trait::async_trait;
+use prompt_echo::is_prompt_echo;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::phrase_split::{decode_windows, DecodeWindow, PhraseSplitter};
+use super::phrase_split::{
+    decode_windows, dictation_windows, DecodeWindow, PhraseSplitter, MAX_DECODE_WINDOW_SECS,
+};
 use super::verbose_json::is_no_speech;
 use super::{
     decode_wav_samples, samples_to_ms, Segment, StreamText, Transcript, TranscriptionBackend,
@@ -73,8 +82,8 @@ pub enum SegmentationMode {
     Silence,
     /// Legacy overlapping sliding window with text-based dedup.
     Window,
-    /// No segmentation, no streaming: decode the whole recording once,
-    /// after it stops (config value `"none"`).
+    /// No streaming: decode the whole recording after it stops, in one call
+    /// up to 28 s and a window at a time past that (config value `"none"`).
     Unsegmented,
 }
 
@@ -139,7 +148,8 @@ impl LocalWhisperBackend {
     ///
     /// `mode` is `"silence"` (default), `"window"` or `"none"`;
     /// `phrase_silence_ms` is how much continuous silence ends a phrase in
-    /// silence mode.
+    /// silence mode, and (capped at 900 ms) where recordings and batch calls
+    /// past 28 s are cut.
     pub fn with_segmentation(mut self, mode: &str, phrase_silence_ms: u64) -> Self {
         self.segmentation = SegmentationMode::parse(mode);
         self.phrase_silence_ms = phrase_silence_ms.max(1);
@@ -329,14 +339,17 @@ impl LocalWhisperBackend {
         Ok(())
     }
 
-    /// Unsegmented mode over a stream: buffer everything, decode once at
-    /// the end.
+    /// Unsegmented mode over a stream: buffer everything, decode it at the
+    /// end in one call or a window at a time as
+    /// [`TranscriptionBackend::transcribe`] does, and send the text once. Up
+    /// to 28 s the call is [`decode_phrase`], which only logs a failed decode
+    /// where `transcribe` returns the error.
     ///
     /// The daemon never gets here, since this mode reports
     /// `supports_streaming() == false` and dictation takes the batch path
     /// instead. It exists so a direct `transcribe_stream` caller still gets
-    /// batch semantics (one decode, one send) rather than a silent fallback
-    /// to phrase streaming.
+    /// batch semantics (one send) rather than a silent fallback to phrase
+    /// streaming.
     async fn stream_unsegmented(
         &self,
         ctx: &Arc<whisper_rs::WhisperContext>,
@@ -353,7 +366,30 @@ impl LocalWhisperBackend {
             return Ok(());
         }
 
-        decode_phrase(ctx, create_state(ctx)?, buffer, false, config, &text_tx).await?;
+        if fits_one_decode_window(buffer.len()) {
+            decode_phrase(ctx, create_state(ctx)?, buffer, false, config, &text_tx).await?;
+            return Ok(());
+        }
+
+        let ctx = Arc::clone(ctx);
+        let language = config.language.clone();
+        let prompt = config.prompt.clone().filter(|p| !p.is_empty());
+        let phrase_silence_ms = self.phrase_silence_ms;
+        let text = tokio::task::spawn_blocking(move || {
+            let windows = batch_windows(&buffer, phrase_silence_ms);
+            let mut state = create_state(&ctx)?;
+            decode_batch_windows(
+                &mut state,
+                &i16_to_f32(&buffer),
+                &windows,
+                &language,
+                prompt.as_deref(),
+            )
+        })
+        .await??;
+        if !text.is_empty() {
+            text_tx.send(text).await.ok();
+        }
         Ok(())
     }
 
@@ -365,17 +401,67 @@ impl LocalWhisperBackend {
     /// `full()` call, where it carries text across its 30 s windows even with
     /// `no_context(true)`: the repetition loop of #55. `phrase_silence_ms` is
     /// capped ([`super::recording_phrase_silence_ms`]), so every join between
-    /// the chunk's speech regions ends a phrase.
+    /// the chunk's speech regions ends a phrase. A long batch dictation is cut
+    /// the same way ([`batch_windows`]).
     fn recording_phrases(&self, samples: &[i16]) -> Vec<super::phrase_split::Phrase> {
-        let mut splitter = PhraseSplitter::new(
-            SAMPLE_RATE,
-            SILENCE_THRESHOLD,
-            super::recording_phrase_silence_ms(self.phrase_silence_ms),
-        );
-        let mut phrases = splitter.feed(samples);
-        phrases.extend(splitter.flush());
-        phrases
+        capped_phrases(samples, self.phrase_silence_ms, None)
     }
+}
+
+/// The splitter behind [`LocalWhisperBackend::recording_phrases`] and
+/// [`batch_windows`], for the configured `phrase_silence_ms` (capped by
+/// [`super::recording_phrase_silence_ms`]), fed the whole buffer in one call
+/// or, with `feed_len`, that many samples at a time. Both give the same
+/// phrases. A free function, so a blocking task can run it.
+fn capped_phrases(
+    samples: &[i16],
+    phrase_silence_ms: u64,
+    feed_len: Option<usize>,
+) -> Vec<super::phrase_split::Phrase> {
+    let mut splitter = PhraseSplitter::new(
+        SAMPLE_RATE,
+        SILENCE_THRESHOLD,
+        super::recording_phrase_silence_ms(phrase_silence_ms),
+    );
+    let mut phrases = match feed_len {
+        None => splitter.feed(samples),
+        Some(len) => samples
+            .chunks(len)
+            .flat_map(|chunk| splitter.feed(chunk))
+            .collect(),
+    };
+    phrases.extend(splitter.flush());
+    phrases
+}
+
+/// Whether a batch dictation of `samples` samples fits one decode window
+/// ([`MAX_DECODE_WINDOW_SECS`]) and so decodes in a single `full()` call
+/// over the whole buffer. A longer one is cut into windows
+/// ([`batch_windows`]).
+fn fits_one_decode_window(samples: usize) -> bool {
+    samples <= MAX_DECODE_WINDOW_SECS * SAMPLE_RATE
+}
+
+/// The windows a batch dictation past one decode window is cut into at
+/// pauses (or at 28 s in continuous speech), about
+/// [`MAX_DECODE_WINDOW_SECS`] at most ([`dictation_windows`]), one `full()`
+/// call each ([`decode_batch_windows`]).
+///
+/// The splitter is fed a second at a time: fed the whole buffer in one call,
+/// it costs time with the square of its length, since each frame it drops
+/// moves the rest of the buffer. It still runs in the blocking task with
+/// the decode, not on the async thread.
+fn batch_windows(samples: &[i16], phrase_silence_ms: u64) -> Vec<DecodeWindow> {
+    let phrases = capped_phrases(samples, phrase_silence_ms, Some(SAMPLE_RATE));
+    let windows = dictation_windows(&phrases, SAMPLE_RATE);
+    debug!(
+        "local whisper: {} phrase(s) in {} decode window(s) (whisper full() calls) \
+         for a {:.1}s dictation",
+        phrases.len(),
+        windows.len(),
+        samples.len() as f64 / SAMPLE_RATE as f64
+    );
+    windows
 }
 
 /// Convert i16 PCM samples to f32 in the range [-1.0, 1.0].
@@ -657,6 +743,105 @@ fn place_window_segments(raw: Vec<RawSegment>, window: &DecodeWindow) -> Vec<Seg
     out
 }
 
+/// Decode a long batch dictation window by window on one reused state, one
+/// `full()` call per [`DecodeWindow`], with dictation's parameters (the
+/// static prompt included), and join the windows' text
+/// ([`join_window_texts`]).
+///
+/// One `full()` call over the whole buffer conditions each 30 s mel window
+/// on the text decoded in the one before (`no_context` clears it only when
+/// the call starts), and on long dictations that text loops (issue #208).
+/// A window fits one mel window; a second pass over its tail can still take
+/// the first pass's text, since `n_max_text_ctx` 0 would drop the prompt too
+/// (see [`run_whisper_segments`]).
+/// Any window failing fails the whole call, so the daemon keeps the audio
+/// rather than typing a transcript with a hole in it.
+fn decode_batch_windows(
+    state: &mut whisper_rs::WhisperState,
+    samples: &[f32],
+    windows: &[DecodeWindow],
+    language: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<String> {
+    decode_each_window(samples, windows, prompt, |buf| {
+        run_whisper_inference(state, buf, language, prompt)
+    })
+}
+
+/// The loop of [`decode_batch_windows`], with the decode passed in so a test
+/// can stand in for whisper: each window's samples, padded to
+/// [`MIN_DECODE_SAMPLES`], go to `decode` in order, the first error ends the
+/// call, and the texts are joined ([`join_window_texts`]).
+fn decode_each_window(
+    samples: &[f32],
+    windows: &[DecodeWindow],
+    prompt: Option<&str>,
+    mut decode: impl FnMut(&[f32]) -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    let mut texts: Vec<String> = Vec::with_capacity(windows.len());
+    for window in windows {
+        let mut buf = samples[window.range.clone()].to_vec();
+        // whisper.cpp silently produces nothing for <1 s buffers; pad with silence.
+        if buf.len() < MIN_DECODE_SAMPLES {
+            buf.resize(MIN_DECODE_SAMPLES, 0.0);
+        }
+        let text = decode(&buf)?;
+        debug!(
+            "batch window at {:.2}s ({:.1}s): {text:?}",
+            window.range.start as f64 / SAMPLE_RATE as f64,
+            window.range.len() as f64 / SAMPLE_RATE as f64
+        );
+        texts.push(text);
+    }
+    Ok(join_window_texts(windows, texts, prompt))
+}
+
+/// Fewest words a window needs before [`join_window_texts`] drops it as a
+/// prompt echo: the word-run threshold of `prompt_echo::is_prompt_echo`
+/// (6), whose substring check also flags shorter text. A short window the
+/// prompt contains, such as a closing "Claude Code." after a vocabulary
+/// prompt, is more likely real speech; dropping it here would lose it
+/// silently, where the daemon's check keeps it inside the joined text.
+/// Words are counted as that crate counts them: runs of alphanumeric
+/// characters.
+const MIN_ECHO_WINDOW_WORDS: usize = 6;
+
+/// Join a batch dictation's window texts, in order, with one space. A blank
+/// window adds nothing, a window starting at a forced cut is lowercased
+/// ([`decapitalize_first`]), since it continues a sentence, and a window of
+/// at least [`MIN_ECHO_WINDOW_WORDS`] words that echoes the prompt is
+/// dropped: the daemon's own echo check sees only the joined text, where
+/// one window's echo would pass.
+fn join_window_texts(windows: &[DecodeWindow], texts: Vec<String>, prompt: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(texts.len());
+    for (window, text) in windows.iter().zip(texts) {
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let words = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .count();
+        if words >= MIN_ECHO_WINDOW_WORDS
+            && prompt.is_some_and(|prompt| is_prompt_echo(text, prompt))
+        {
+            warn!(
+                "discarding likely prompt-echo window at {:.2}s ({} chars)",
+                window.range.start as f64 / SAMPLE_RATE as f64,
+                text.len()
+            );
+            continue;
+        }
+        parts.push(if window.continuation {
+            decapitalize_first(text)
+        } else {
+            text.to_string()
+        });
+    }
+    parts.join(" ")
+}
+
 /// Decode a recording chunk window by window on one reused state, one
 /// `full()` call per [`DecodeWindow`].
 ///
@@ -728,9 +913,29 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let language = config.language.clone();
         let prompt = config.prompt.clone();
 
+        // Up to one decode window, a single `full()` call over the whole
+        // buffer.
+        if fits_one_decode_window(samples_i16.len()) {
+            return tokio::task::spawn_blocking(move || {
+                let mut state = create_state(&ctx)?;
+                run_whisper_inference(&mut state, &samples_f32, &language, prompt.as_deref())
+            })
+            .await?;
+        }
+
+        // Longer, cut into windows that each fit one 30 s mel window
+        // (issue #208), in the blocking task: see `batch_windows`.
+        let phrase_silence_ms = self.phrase_silence_ms;
         tokio::task::spawn_blocking(move || {
+            let windows = batch_windows(&samples_i16, phrase_silence_ms);
             let mut state = create_state(&ctx)?;
-            run_whisper_inference(&mut state, &samples_f32, &language, prompt.as_deref())
+            decode_batch_windows(
+                &mut state,
+                &samples_f32,
+                &windows,
+                &language,
+                prompt.as_deref(),
+            )
         })
         .await?
     }
@@ -1014,6 +1219,210 @@ mod tests {
             super::super::RECORDING_PHRASE_SILENCE_MAX_MS < (join * 1000 / SAMPLE_RATE) as u64,
             "the cap must stay under the join"
         );
+    }
+
+    /// A batch dictation that fits one decode window keeps the single
+    /// `full()` call; past that it is cut into windows of at most 28 s,
+    /// every phrase in exactly one, in order (issue #208).
+    #[test]
+    fn long_batch_dictations_decode_a_window_at_a_time() {
+        // 2.5 s turns of speech, each followed by 1.5 s of room noise.
+        let mut audio: Vec<i16> = Vec::new();
+        while audio.len() < 70 * SAMPLE_RATE {
+            audio.extend((0..5 * SAMPLE_RATE / 2).map(|i| if i % 8 < 4 { 8000 } else { -8000 }));
+            audio.extend((0..3 * SAMPLE_RATE / 2).map(|i| [3, -2, 1, -3][i % 4]));
+        }
+        let cap = MAX_DECODE_WINDOW_SECS * SAMPLE_RATE;
+        assert!(fits_one_decode_window(10 * SAMPLE_RATE));
+        assert!(fits_one_decode_window(cap));
+        assert!(!fits_one_decode_window(cap + 1));
+        assert!(!batch_windows(&audio[..cap + 1], 400).is_empty());
+
+        let windows = batch_windows(&audio, 400);
+        let phrases = capped_phrases(&audio, 400, Some(SAMPLE_RATE));
+        assert!(windows.len() >= 3, "{windows:?}");
+        assert_eq!(
+            windows.iter().map(|w| w.phrases).sum::<usize>(),
+            phrases.len()
+        );
+        let mut next = 0;
+        for window in &windows {
+            assert!(window.range.len() <= cap, "{window:?}");
+            for phrase in &phrases[next..next + window.phrases] {
+                let start = phrase.start_sample as usize;
+                assert!(window.range.start <= start);
+                assert!(start + phrase.samples.len() <= window.range.end);
+            }
+            next += window.phrases;
+        }
+    }
+
+    /// `samples` of a 2 kHz square wave, loud enough to be speech.
+    fn voice(samples: usize) -> impl Iterator<Item = i16> {
+        (0..samples).map(|i| if i % 8 < 4 { 8000 } else { -8000 })
+    }
+
+    /// `samples` of room noise: quiet, never exact zeros.
+    fn room_noise(samples: usize) -> impl Iterator<Item = i16> {
+        (0..samples).map(|i| [3, -2, 1, -3][i % 4])
+    }
+
+    /// A long batch dictation is cut where a recording is:
+    /// `phrase_silence_ms` is capped at 900 ms, so a 1 s pause ends a
+    /// phrase however long it is set.
+    #[test]
+    fn batch_windows_cap_phrase_silence() {
+        // 12 turns of 2 s of speech, each followed by 1 s of room noise.
+        let pause = SAMPLE_RATE;
+        let mut audio: Vec<i16> = Vec::new();
+        for _ in 0..12 {
+            audio.extend(voice(2 * SAMPLE_RATE));
+            audio.extend(room_noise(pause));
+        }
+        assert!(!fits_one_decode_window(audio.len()));
+        for silence_ms in [400, 900, 1000, 2000, 5000] {
+            let windows = batch_windows(&audio, silence_ms);
+            assert_eq!(
+                windows.iter().map(|w| w.phrases).sum::<usize>(),
+                12,
+                "phrase_silence_ms = {silence_ms}: {windows:?}"
+            );
+        }
+        // Uncapped, 2 s of silence would run the turns together.
+        let mut uncapped = PhraseSplitter::new(SAMPLE_RATE, SILENCE_THRESHOLD, 2000);
+        let mut phrases = uncapped.feed(&audio);
+        phrases.extend(uncapped.flush());
+        assert!(phrases.len() < 12, "{} phrase(s)", phrases.len());
+        assert!(
+            super::super::RECORDING_PHRASE_SILENCE_MAX_MS < (pause * 1000 / SAMPLE_RATE) as u64,
+            "the cap must stay under the pause"
+        );
+    }
+
+    /// The batch path feeds the splitter a second at a time, where a
+    /// recording feeds it a whole chunk in one call: the phrases are the
+    /// same, forced cuts and the tail flushed at the end included.
+    #[test]
+    fn batch_phrases_match_a_single_feed() {
+        // 35 s without a pause (forced cuts), turns, then speech that stops
+        // inside a frame.
+        let mut audio: Vec<i16> = voice(35 * SAMPLE_RATE).collect();
+        for _ in 0..6 {
+            audio.extend(room_noise(3 * SAMPLE_RATE / 2));
+            audio.extend(voice(5 * SAMPLE_RATE / 2));
+        }
+        audio.extend(room_noise(SAMPLE_RATE));
+        audio.extend(voice(SAMPLE_RATE + 777));
+
+        let whole = capped_phrases(&audio, 400, None);
+        assert!(whole.iter().any(|p| p.continuation), "no forced cut");
+        assert_eq!(capped_phrases(&audio, 400, Some(SAMPLE_RATE)), whole);
+    }
+
+    /// Each window reaches the decoder on its own, a short one padded with
+    /// silence to `MIN_DECODE_SAMPLES`, and a window that fails fails the
+    /// whole call, so the daemon keeps the audio rather than type a
+    /// transcript with a hole in it.
+    #[test]
+    fn batch_windows_decode_one_at_a_time_and_fail_together() {
+        let samples: Vec<f32> = (0..5 * SAMPLE_RATE)
+            .map(|i| 0.1 + (i % 7) as f32 / 10.0)
+            .collect();
+        let window = |from: usize, to: usize| DecodeWindow {
+            range: from..to,
+            continuation: false,
+            phrases: 1,
+        };
+        let half = SAMPLE_RATE / 2;
+        let windows = [
+            window(0, half),
+            window(2 * half, 5 * half),
+            window(6 * half, 9 * half),
+        ];
+
+        let mut seen: Vec<Vec<f32>> = Vec::new();
+        let text = decode_each_window(&samples, &windows, None, |buf| {
+            seen.push(buf.to_vec());
+            Ok(format!("Window {}.", seen.len()))
+        })
+        .expect("every window decodes");
+        assert_eq!(text, "Window 1. Window 2. Window 3.");
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].len(), MIN_DECODE_SAMPLES);
+        assert_eq!(seen[0][..half], samples[..half]);
+        assert!(seen[0][half..].iter().all(|&s| s == 0.0));
+        assert_eq!(seen[1], samples[windows[1].range.clone()]);
+        assert_eq!(seen[2], samples[windows[2].range.clone()]);
+
+        let mut calls = 0;
+        let err = decode_each_window(&samples, &windows, None, |_| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("window 2 failed");
+            }
+            Ok("Fine.".to_string())
+        })
+        .expect_err("a failed window fails the call");
+        assert!(err.to_string().contains("window 2 failed"), "{err}");
+        assert_eq!(calls, 2, "no decode after the failed window");
+    }
+
+    /// A long dictation's windows join into one transcript: blank windows add
+    /// nothing, a window that starts at a forced cut continues the sentence,
+    /// and a window that echoes the prompt is dropped, unless it is too short
+    /// to tell from a phrase in the prompt's vocabulary.
+    #[test]
+    fn batch_window_texts_join_into_one_transcript() {
+        let window = |start_secs: usize, continuation: bool| DecodeWindow {
+            range: start_secs * SAMPLE_RATE..(start_secs + 20) * SAMPLE_RATE,
+            continuation,
+            phrases: 1,
+        };
+        let windows = [
+            window(0, false),
+            window(20, true),
+            window(40, false),
+            window(60, false),
+            window(80, true),
+            window(100, false),
+            window(120, false),
+        ];
+        // The prompt of scripts/check-issue208.sh, typo included.
+        let prompt = "make sure to spell out words like 'slash', 'question mark', etc, \
+                      as pancuation marks, like '!', '/', etc, rather than actual text. \
+                      whisrs, nvim, hyprland, claude code";
+        const REGURGITATED: &str = "Make sure to spell out words like 'slash', \
+                                    'question mark', etc, as pancuation marks, like '!', \
+                                    '/', etc, rather than actual text.";
+        const VOCABULARY: &str = "Whisrs, nvim, Hyprland, Claude Code.";
+        // Both echo the prompt by the crate's measure; only the long one goes.
+        assert!(is_prompt_echo(REGURGITATED, prompt));
+        assert!(is_prompt_echo(VOCABULARY, prompt));
+        let texts = || {
+            [
+                "Open the config.",
+                "Then save it.",
+                "  ",
+                "Spell out words like 'slash', 'question mark'.",
+                "I think so.",
+                REGURGITATED,
+                VOCABULARY,
+            ]
+            .map(String::from)
+            .to_vec()
+        };
+
+        assert_eq!(
+            join_window_texts(&windows, texts(), Some(prompt)),
+            "Open the config. then save it. I think so. Whisrs, nvim, Hyprland, Claude Code."
+        );
+        let kept = format!(
+            "Open the config. then save it. \
+             Spell out words like 'slash', 'question mark'. I think so. {REGURGITATED} {VOCABULARY}"
+        );
+        assert_eq!(join_window_texts(&windows, texts(), None), kept);
+        assert_eq!(join_window_texts(&windows, texts(), Some("")), kept);
+        assert_eq!(join_window_texts(&[], Vec::new(), Some(prompt)), "");
     }
 
     #[test]

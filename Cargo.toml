@@ -38,6 +38,10 @@ path = "src/daemon/main.rs"
 name = "issue55_stream_check"
 required-features = ["local-whisper"]
 
+[[example]]
+name = "issue208_batch_check"
+required-features = ["local-whisper"]
+
 [features]
 default = ["local-whisper", "tray", "overlay", "hooks", "recording", "mcp"]
 local-whisper = ["dep:whisper-rs"]

@@ -172,6 +172,8 @@ scripts/
 ├── dev-install.sh          # Build + install + restart daemon (the dev loop)
 ├── check-issue55.sh        # Scripted local-whisper repetition + coverage gate
 ├── gen-issue55-fixture.sh  # Synthesize WAV fixtures (espeak-ng + ffmpeg)
+├── check-issue208.sh       # Scripted segmentation "none" loop + coverage gate (large-v3-turbo)
+├── gen-issue208-fixture.sh # Synthesize the long-dictation fixture (espeak-ng + ffmpeg)
 ├── check-no-avx512.sh      # Fail if a release binary needs AVX-512 (#150, run by CI)
 └── verify-injection.sh     # Injection smoke check
 ```

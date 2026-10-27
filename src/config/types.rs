@@ -476,6 +476,9 @@ pub struct GeneralConfig {
     /// Free-form prompt prepended to the vocabulary list before being sent to
     /// the transcription backend. Use this for sentence-style context (style,
     /// register, language hints) that doesn't fit a single-term vocabulary.
+    /// Local whisper sends it with every dictation phrase or window it
+    /// decodes, so it belongs in the language you dictate in: a prompt in
+    /// another language pulls the transcript toward that language.
     #[serde(default)]
     pub prompt: Option<String>,
     /// Enable system tray icon.
@@ -838,11 +841,15 @@ pub struct LocalWhisperConfig {
     /// into phrases at natural pauses and decodes each exactly once;
     /// `"window"` is the legacy overlapping sliding window with text dedup;
     /// `"none"` turns streaming off, so nothing is typed until recording
-    /// stops and the whole recording is decoded at once.
+    /// stops and the whole recording is decoded then. Past 28 s that, like
+    /// every batch call (command mode and `[[llm_commands]]` in every mode),
+    /// is decoded in windows of at most 28 s, cut at pauses (or at 28 s in
+    /// continuous speech).
     #[serde(default = "default_local_whisper_segmentation")]
     pub segmentation: String,
     /// Milliseconds of continuous silence that ends a phrase in `"silence"`
-    /// segmentation mode.
+    /// segmentation mode. Recordings and batch calls past 28 s are cut with
+    /// it too, capped at 900 ms.
     #[serde(default = "default_phrase_silence_ms")]
     pub phrase_silence_ms: u64,
     /// Turn on whisper.cpp flash attention when the model loads. Off by
