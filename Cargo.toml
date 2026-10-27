@@ -39,6 +39,10 @@ name = "issue55_stream_check"
 required-features = ["local-whisper"]
 
 [[example]]
+name = "issue208_batch_check"
+required-features = ["local-whisper"]
+
+[[example]]
 name = "agent_overlay_frames"
 required-features = ["overlay"]
 

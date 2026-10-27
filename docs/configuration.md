@@ -41,6 +41,10 @@ prompt = "Speech is in English or Spanish. Transcribe in the language spoken; ne
                             # that discards it. `whisrs config` warns the same on save.
                             # Recordings (whisrs recording) never send the prompt,
                             # only the vocabulary (and with local-whisper, neither).
+                            # local-whisper sends it with every dictation phrase or
+                            # window it decodes, so write it in the language you
+                            # dictate in: a prompt in another language pulls the
+                            # transcript toward that language.
 tray = true                 # system tray icon (requires SNI host like waybar)
 overlay = false             # on-screen dictation overlay (Hyprland/Sway, GNOME extension)
 
@@ -310,20 +314,24 @@ model_path = "~/.local/share/whisrs/models/ggml-base.en.bin"
 #   text. Continuous speech is force-split at the first silent moment after
 #   20 s (hard ceiling 28 s) so it still emits.
 # - "window": legacy 8s/2s overlapping sliding window with text-based dedup.
-# - "none": no splitting, no streaming. Nothing is typed while you talk;
-#   when you stop, the whole dictation is transcribed in one pass and typed
-#   at once. Use it for long dictation you don't want split into phrases.
+# - "none": no streaming. Nothing is typed while you talk; when you stop,
+#   the whole dictation is transcribed and typed at once. Use it for long
+#   dictation you don't want split into phrases.
 #   The wait after stopping grows with the dictation (a few seconds per
 #   minute of speech with large-v3-turbo on a GPU, longer on CPU). It also
 #   makes [general] llm_post_process and [input] paste apply to dictation.
-#   A very long dictation is still a single decode, not reset per phrase
-#   like "silence". The recording feature (whisrs recording) ignores this
+#   Past 28 s the dictation is decoded in windows of at most 28 s, cut at
+#   pauses (or at 28 s in continuous speech) and each given the prompt, so a
+#   long dictation does not fall into whisper's repetition loop (issue #208).
+#   Command mode and [[llm_commands]] always take this batch path, whatever
+#   segmentation says. The recording feature (whisrs recording) ignores this
 #   setting and always decodes in phrases.
 # segmentation = "silence"
 # phrase_silence_ms: continuous silence (ms) that ends a phrase in "silence"
-# mode (ignored by "window" and "none" for dictation; the recording feature
-# always uses it, capped at 900 ms so every gap between the speech it sends ends
-# a phrase).
+# mode; "window" streaming ignores it. In every mode it also finds the pauses
+# where a batch call over 28 s is cut ("none" dictation, command mode,
+# [[llm_commands]]) and where a recording is cut, capped at 900 ms for both
+# (for a recording, so every gap between the speech it sends ends a phrase).
 # Lower = snappier output, higher = fewer mid-sentence splits.
 # phrase_silence_ms = 400
 # flash_attn: enable whisper.cpp flash attention (default false). It can cut
