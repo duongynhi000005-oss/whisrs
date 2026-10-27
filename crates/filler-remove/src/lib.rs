@@ -98,7 +98,7 @@ impl FillerFilter {
     pub fn new<S: AsRef<str>>(custom_words: &[S]) -> Result<Self, regex::Error> {
         let mut custom = Vec::with_capacity(custom_words.len());
         for word in custom_words {
-            let pattern_str = format!(r"(?i)\b{},?\s*", regex::escape(word.as_ref()));
+            let pattern_str = format!(r"(?i)\b{}\b,?\s*", regex::escape(word.as_ref()));
             custom.push(Regex::new(&pattern_str)?);
         }
         Ok(Self { custom })
@@ -354,6 +354,25 @@ mod tests {
     }
 
     #[test]
+    fn custom_words_preserve_longer_words_with_same_prefix() {
+        // Issue #195: custom filler word "um" should NOT strip the "um" prefix
+        // from words like "umbrella" or "umpire".
+        let custom = vec!["um".to_string()];
+        assert_eq!(
+            remove_filler_words("an umbrella and an umpire", &custom),
+            "an umbrella and an umpire"
+        );
+        assert_eq!(
+            remove_filler_words("um an umbrella", &custom),
+            "an umbrella"
+        );
+        assert_eq!(
+            remove_filler_words("an umbrella um indeed", &custom),
+            "an umbrella indeed"
+        );
+    }
+
+    #[test]
     fn trims_result() {
         assert_eq!(remove_filler_words("  um hello  ", &[]), "hello");
     }
@@ -538,7 +557,7 @@ mod tests {
         // step, so the malformed character class reaches the compiler
         // unaltered.
         let unclosed_class: String = ['[', 'a', 'b', 'c'].iter().collect();
-        let wrapped = format!(r"(?i)\b{unclosed_class},?\s*");
+        let wrapped = format!(r"(?i)\b{unclosed_class}\b,?\s*");
         let bad_wrapped = Regex::new(&wrapped);
         assert!(
             matches!(bad_wrapped, Err(regex::Error::Syntax(_))),
