@@ -596,6 +596,11 @@ fn run_whisper_inference(
     Ok(text.trim().to_string())
 }
 
+fn decoder_language(language: &str) -> Option<&str> {
+    let language = language.trim();
+    (!language.is_empty() && !language.eq_ignore_ascii_case("auto")).then_some(language)
+}
+
 /// Decode parameters shared by every whisper call, dictation and recordings
 /// alike, so the invariants below cannot drift between the two.
 fn full_params<'a>(language: &'a str, prompt: Option<&str>) -> whisper_rs::FullParams<'a, 'a> {
@@ -608,9 +613,7 @@ fn full_params<'a>(language: &'a str, prompt: Option<&str>) -> whisper_rs::FullP
     // the returned state.
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-    if language != "auto" {
-        params.set_language(Some(language));
-    }
+    params.set_language(decoder_language(language));
 
     // Static vocabulary/context hint (config `prompt` + `vocabulary`).
     if let Some(prompt) = prompt {
@@ -1042,6 +1045,13 @@ mod tests {
                 || msg.contains("not found"),
             "unexpected error: {msg}"
         );
+    }
+    #[test]
+    fn auto_language_is_left_to_whisper() {
+        assert_eq!(decoder_language("auto"), None);
+        assert_eq!(decoder_language("AUTO"), None);
+        assert_eq!(decoder_language(""), None);
+        assert_eq!(decoder_language(" de "), Some("de"));
     }
 
     #[test]
