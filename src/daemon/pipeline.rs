@@ -23,7 +23,7 @@ use whisrs::window::WindowTracker;
 use whisrs::{Config, State};
 use xkb_type::ClipboardBackend;
 
-use crate::context::{DaemonContext, DaemonState, StateBus};
+use crate::context::{DaemonContext, DaemonState};
 use crate::factory::get_model_for_backend;
 use crate::injection::{
     deliver_streaming_delta, fold_line_breaks_at_terminal, inject_text, is_terminal_window,
@@ -54,7 +54,7 @@ pub(crate) struct StreamingPipelineParams {
     pub(crate) backend: Arc<dyn TranscriptionBackend>,
     pub(crate) daemon_state: Arc<Mutex<DaemonState>>,
     pub(crate) window_tracker: Arc<dyn WindowTracker>,
-    pub(crate) state_tx: StateBus,
+    pub(crate) state_tx: tokio::sync::watch::Sender<State>,
     pub(crate) cancel_flag: Arc<AtomicBool>,
 
     // Per-session values captured when recording started.
@@ -266,35 +266,40 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     });
 
     // Forward audio from capture to backend, with auto-stop detection.
-    let mut auto_stop =
-        AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
+    // When silence_timeout_ms == 0, auto-stop is disabled; skip the detector so
+    // it does not clamp to 1 sample and trigger prematurely (issue #178).
+    let mut auto_stop = (silence_timeout_ms > 0).then(|| {
+        AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE)
+    });
 
     while let Some(chunk) = audio_rx.recv().await {
         // Check for auto-stop.
-        if auto_stop.feed(&chunk) {
-            info!("silence auto-stop triggered after {silence_timeout_ms}ms");
-            if notify_state {
-                send_notification("whisrs", "Auto-stopped (silence detected)");
-            }
+        if let Some(ref mut detector) = auto_stop {
+            if detector.feed(&chunk) {
+                info!("silence auto-stop triggered after {silence_timeout_ms}ms");
+                if notify_state {
+                    send_notification("whisrs", "Auto-stopped (silence detected)");
+                }
 
-            // Trigger stop: signal the daemon state machine.
-            // We stop the audio capture by closing the forwarding channel.
-            // The daemon state will be updated when the streaming task finishes.
-            let mut ds = daemon_state.lock().await;
-            if ds.state_machine.state() == State::Recording {
-                // Stop the audio capture.
-                if let Some(mut capture) = ds.audio_capture.take() {
-                    capture.stop();
-                    tokio::task::spawn_blocking(move || drop(capture));
+                // Trigger stop: signal the daemon state machine.
+                // We stop the audio capture by closing the forwarding channel.
+                // The daemon state will be updated when the streaming task finishes.
+                let mut ds = daemon_state.lock().await;
+                if ds.state_machine.state() == State::Recording {
+                    // Stop the audio capture.
+                    if let Some(mut capture) = ds.audio_capture.take() {
+                        capture.stop();
+                        tokio::task::spawn_blocking(move || drop(capture));
+                    }
+                    // Transition to transcribing (pipeline is draining).
+                    if let Err(e) = ds.state_machine.transition(Action::Toggle) {
+                        warn!("auto-stop state transition failed: {e}");
+                    } else {
+                        let _ = state_tx.send(ds.state_machine.state());
+                    }
                 }
-                // Transition to transcribing (pipeline is draining).
-                if let Err(e) = ds.state_machine.transition(Action::Toggle) {
-                    warn!("auto-stop state transition failed: {e}");
-                } else {
-                    state_tx.publish(&ds);
-                }
+                break;
             }
-            break;
         }
 
         // Forward to backend.
@@ -432,7 +437,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         // Auto-stop ends the session without a stop-toggle — clear the
         // session language so it can't leak into the next recording.
         ds.session_language = None;
-        state_tx.publish(&ds);
+        let _ = state_tx.send(ds.state_machine.state());
         if audio_feedback && !cancelled {
             feedback::play_done(audio_feedback_volume);
         }
@@ -620,8 +625,6 @@ pub(crate) enum BatchOrigin<'a> {
     /// A named `[[llm_commands]]` hotkey. Carries the command name for
     /// toasts/logs — runtime config data, hence not a `&'static str` label.
     LlmCommand { name: &'a str },
-    /// An agent's voice turn (`[[agents]]`). Carries the agent name.
-    Agent { name: &'a str },
 }
 
 impl BatchOrigin<'_> {
@@ -634,9 +637,6 @@ impl BatchOrigin<'_> {
                 format!("Skipped: the audio was {label}")
             }
             BatchOrigin::CommandMode => format!("Command mode: the audio was {label}"),
-            BatchOrigin::Agent { name } => {
-                format!("Agent '{name}': the audio was {label}, nothing was sent")
-            }
         }
     }
 
@@ -647,7 +647,6 @@ impl BatchOrigin<'_> {
             BatchOrigin::Dictation => None,
             BatchOrigin::CommandMode => Some("Processing command...".to_string()),
             BatchOrigin::LlmCommand { name } => Some(format!("Processing '{name}'...")),
-            BatchOrigin::Agent { name } => Some(format!("Sending to '{name}'...")),
         }
     }
 
@@ -658,9 +657,6 @@ impl BatchOrigin<'_> {
             BatchOrigin::Dictation => None,
             BatchOrigin::CommandMode => Some("Could not understand instruction — try again"),
             BatchOrigin::LlmCommand { .. } => Some("Could not understand speech — try again"),
-            BatchOrigin::Agent { .. } => {
-                Some("Could not understand the instruction, nothing was sent. Try again.")
-            }
         }
     }
 }
@@ -733,22 +729,6 @@ impl<'a> BatchOptions<'a> {
             apply_filler: false,
             apply_replacements: false,
             origin: BatchOrigin::LlmCommand { name },
-        }
-    }
-
-    /// An agent's voice turn: the transcript is the agent's instruction.
-    /// Prompted (project vocabulary helps) and echo-checked like an
-    /// llm-command, with `[replacements]` applied, since a word fix-up the
-    /// user configured matters as much to the agent as on screen. No
-    /// recovery save or filler removal.
-    pub(crate) fn agent(name: &'a str) -> BatchOptions<'a> {
-        BatchOptions {
-            use_prompt: true,
-            save_recovery: false,
-            check_prompt_echo: true,
-            apply_filler: false,
-            apply_replacements: true,
-            origin: BatchOrigin::Agent { name },
         }
     }
 
@@ -826,28 +806,14 @@ pub(crate) async fn transcribe_batch_audio(
                     send_notification("whisrs", &opts.origin.gate_skip_message(label));
                 }
             }
-            BatchOrigin::Agent { name } => {
-                info!(
-                    "agent '{name}': skipping (recording was {label}, {} samples)",
-                    samples.len()
-                );
-                if context.notify_error() {
-                    send_notification("whisrs", &opts.origin.gate_skip_message(label));
-                }
-            }
         }
         return Ok(String::new());
     }
 
     // Progress toast for the command flows — after the gate, so a silent
-    // recording only surfaces the skip toast above. An agent's is left out
-    // only while an agent overlay shows (the pill never shows agent mode).
+    // recording only surfaces the skip toast above.
     if let Some(msg) = opts.origin.processing_message() {
-        let notify = match opts.origin {
-            BatchOrigin::Agent { .. } => context.notify_agent_state(),
-            _ => context.notify_state(),
-        };
-        if notify {
+        if context.notify_state() {
             send_notification("whisrs", &msg);
         }
     }
@@ -2082,14 +2048,11 @@ mod tests {
             window_tracker: Arc::new(whisrs::window::NoopTracker),
             transcription_backend: Arc::new(backend),
             notify: false,
-            state_tx: StateBus::new(),
+            state_tx: tokio::sync::watch::channel(State::Idle).0,
             overlay_level_tx: None,
             overlay_enabled: false,
             #[cfg(feature = "recording")]
             recording: crate::recording::RecordingRuntime::new().0,
-            agents: crate::agent::AgentRuntime::disabled(),
-            agent_board: tokio::sync::watch::channel(Vec::new()).0,
-            agent_overlay_shown: AtomicBool::new(false),
         }
     }
 
